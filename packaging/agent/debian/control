@@ -1,0 +1,14 @@
+Source: pier-agent
+Section: admin
+Priority: optional
+Maintainer: Pier maintainers <pier@localhost>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: pier-agent
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd, passwd, libc-bin
+Description: Pier deployment agent and application supervisor
+ Receives encrypted deployments from pier-controller and supervises applications
+ under individual system accounts. Run sudo pier-agent init after installation.

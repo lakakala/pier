@@ -1,0 +1,8 @@
+target/
+dist/
+__pycache__/
+node_modules/
+playwright-report/
+test-results/
+!crates/pier-controller/web/dist/
+!crates/pier-controller/web/dist/**

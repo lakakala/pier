@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_configure:
+override_dh_auto_build:
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -D -m 0755 prebuilt/pier-agent debian/pier-agent/usr/bin/pier-agent
+	install -D -m 0644 prebuilt/pier-agent-upgrade.service debian/pier-agent/usr/lib/systemd/system/pier-agent-upgrade.service
+	install -D -m 0644 prebuilt/README.md debian/pier-agent/usr/share/doc/pier-agent/README.md
+	install -D -m 0644 prebuilt/api.md debian/pier-agent/usr/share/doc/pier-agent/api.md
+	install -D -m 0644 prebuilt/agent.yml debian/pier-agent/usr/share/doc/pier-agent/examples/agent.yml
+	install -D -m 0644 prebuilt/LICENSE debian/pier-agent/usr/share/doc/pier-agent/copyright
+	install -D -m 0644 prebuilt/needrestart.conf debian/pier-agent/etc/needrestart/conf.d/pier-agent.conf
+	install -d -m 0755 debian/pier-agent/etc/pier
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --no-stop-on-upgrade
+
+# Keep relative Markdown links usable in the installed documentation.
+override_dh_compress:
+	dh_compress -XREADME.md -Xapi.md

@@ -1,0 +1,8 @@
+agent_id: replace-with-registered-agent-id
+token_file: agent.token
+controller_tcp: controller.example.com:7443
+state_dir: /var/lib/pier-agent
+heartbeat_seconds: 15
+runtime:
+  startup_grace_seconds: 10
+  stop_timeout_seconds: 30

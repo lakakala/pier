@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+# --no-start deliberately suppresses debhelper's stop hook as well. Stop only
+# on removal; an upgrade must leave the agent and its applications running.
+if [ "$1" = remove ]; then
+    if [ -d /run/systemd/system ]; then
+        deb-systemd-invoke stop pier-agent-upgrade.service pier-agent.service >/dev/null || true
+        systemctl disable pier-agent.service >/dev/null 2>&1 || true
+    fi
+    deb-systemd-helper disable pier-agent.service >/dev/null || true
+fi
+#DEBHELPER#

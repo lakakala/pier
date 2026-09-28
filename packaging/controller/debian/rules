@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_configure:
+override_dh_auto_build:
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -D -m 0755 prebuilt/pier-controller debian/pier-controller/usr/bin/pier-controller
+	install -d -m 0755 debian/pier-controller/usr/share/pier-controller
+	cp -R prebuilt/agent-releases debian/pier-controller/usr/share/pier-controller/
+	install -D -m 0755 prebuilt/setup-package.sh debian/pier-controller/usr/lib/pier-controller/setup-package
+	install -D -m 0644 prebuilt/controller.yml debian/pier-controller/usr/lib/pier-controller/controller.yml
+	install -D -m 0644 prebuilt/README.md debian/pier-controller/usr/share/doc/pier-controller/README.md
+	install -D -m 0644 prebuilt/api.md debian/pier-controller/usr/share/doc/pier-controller/api.md
+	install -D -m 0644 prebuilt/agent.yml debian/pier-controller/usr/share/doc/pier-controller/examples/agent.yml
+	install -D -m 0644 prebuilt/pier-blueprint.yml debian/pier-controller/usr/share/doc/pier-controller/examples/pier-blueprint.yml
+	install -D -m 0644 prebuilt/controller.yml debian/pier-controller/usr/share/doc/pier-controller/examples/controller.yml
+	install -D -m 0644 prebuilt/controller.nginx.conf debian/pier-controller/usr/share/doc/pier-controller/examples/controller.nginx.conf
+	install -D -m 0644 prebuilt/LICENSE debian/pier-controller/usr/share/doc/pier-controller/copyright
+	install -D -m 0644 prebuilt/needrestart.conf debian/pier-controller/etc/needrestart/conf.d/pier-controller.conf
+	install -d -m 0755 debian/pier-controller/etc/pier
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --no-stop-on-upgrade
+
+# Keep relative Markdown links usable in the installed documentation.
+override_dh_compress:
+	dh_compress -XREADME.md -Xapi.md

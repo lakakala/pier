@@ -1,0 +1,17 @@
+schema: 1
+name: web-server
+variables:
+  DB_HOST: {}
+  API_PORT: {default: "8080"}
+  WORKER_PORT: {default: "8081"}
+apps:
+  - id: api
+    app: examples/recipes/rust/1.0.0
+    variables:
+      DB_HOST: "{{ DB_HOST }}"
+      PORT: "{{ API_PORT }}"
+  - id: worker
+    app: examples/recipes/go/1.0.0
+    variables:
+      DB_HOST: "{{ DB_HOST }}"
+      PORT: "{{ WORKER_PORT }}"

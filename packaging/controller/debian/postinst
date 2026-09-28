@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then /usr/lib/pier-controller/setup-package; fi
+#DEBHELPER#
+if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+# --no-start deliberately suppresses debhelper's stop hook as well. Stop only
+# on removal; an upgrade must leave the controller and its builds running.
+if [ "$1" = remove ]; then
+    if [ -d /run/systemd/system ]; then
+        deb-systemd-invoke stop pier-controller.service >/dev/null || true
+        systemctl disable pier-controller.service >/dev/null 2>&1 || true
+    fi
+    deb-systemd-helper disable pier-controller.service >/dev/null || true
+fi
+#DEBHELPER#

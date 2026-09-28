@@ -1,0 +1,24 @@
+[Unit]
+Description=Pier deployment agent
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/pier/agent.yml
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+ExecStart=/usr/bin/pier-agent run --config /etc/pier/agent.yml
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=600s
+TimeoutStopSec=900s
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pier-agent
+
+[Install]
+WantedBy=multi-user.target

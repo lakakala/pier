@@ -1,0 +1,28 @@
+[Unit]
+Description=Pier deployment controller
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/pier/controller.yml
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pier-controller
+Group=pier-controller
+WorkingDirectory=/var/lib/pier-controller
+Environment=HOME=/var/lib/pier-controller
+Environment=TMPDIR=/var/lib/pier-controller/tmp
+UMask=0077
+ExecStartPre=/usr/bin/mkdir -p /var/lib/pier-controller/tmp
+ExecStart=/usr/bin/pier-controller --config /etc/pier/controller.yml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=900s
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pier-controller
+
+[Install]
+WantedBy=multi-user.target

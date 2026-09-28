@@ -1,0 +1,20 @@
+schema: 2
+name: demo-binary
+version: "{{ VERSION }}"
+variables:
+  VERSION: {default: "1.0.0"}
+  DB_HOST: {}
+  PORT: {default: "8080"}
+proxy:
+  enabled: false
+source:
+  type: binary
+  url: https://example.com/releases/demo-binary/{{ VERSION }}/linux-{{ PIER_ARCH }}.tar.gz
+  format: tar.gz
+files:
+  - from: demo-binary-{{ PIER_ARCH }}/demo-binary
+    to: bin/demo-binary
+    executable: true
+service:
+  command: [bin/demo-binary, --config, configs/app.toml]
+  working_dir: .

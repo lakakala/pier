@@ -1,0 +1,25 @@
+schema: 2
+name: demo-rust
+version: "{{ VERSION }}"
+variables:
+  VERSION: {default: "1.1.0"}
+  DB_HOST: {}
+  PORT: {default: "8080"}
+proxy:
+  enabled: false
+source:
+  type: git
+  repo: https://example.com/your/demo-rust.git
+  ref: "v{{ VERSION }}"
+build:
+  language: rust
+  commands:
+    - cargo build --release --locked
+    - cp target/$PIER_RUST_TARGET/release/demo-rust /output/demo-rust
+files:
+  - from: demo-rust
+    to: bin/demo-rust
+    executable: true
+service:
+  command: [bin/demo-rust, --config, configs/app.toml]
+  working_dir: .

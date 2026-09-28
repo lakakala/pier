@@ -1,0 +1,30 @@
+[package]
+name = "pier-pkg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Build and package Linux services from directory recipes"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "pier_pkg"
+path = "src/lib.rs"
+
+[dependencies]
+flate2 = "1"
+goblin = "0.10"
+minijinja = { version = "2.24", features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
+tracing = "0.1"
+url = "2"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+rustix = { version = "1", features = ["process"] }
+
+[dev-dependencies]
+serde_json = "1"

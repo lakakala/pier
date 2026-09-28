@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+#DEBHELPER#
+if [ "$1" = configure ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    echo 'pier-agent installed. First setup: sudo pier-agent init'
+    echo 'Package scripts leave the running agent unchanged. Automatic upgrades restart it through pier-agent-upgrade.service.'
+    echo 'After a manual installation: sudo systemctl restart pier-agent'
+fi

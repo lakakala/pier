@@ -1,0 +1,12 @@
+[Unit]
+Description=Pier agent native package upgrade
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/pier-agent __apply-upgrade
+TimeoutStartSec=2700
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077

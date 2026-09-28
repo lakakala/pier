@@ -1,0 +1,14 @@
+Source: pier-controller
+Section: admin
+Priority: optional
+Maintainer: Pier maintainers <pier@localhost>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: pier-controller
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd, passwd, git, ca-certificates
+Description: Pier deployment controller and web console
+ Manages Git service definitions, builds packages and deploys to Pier agents.
+ Start pier-controller.service and open /init over HTTPS for first setup.

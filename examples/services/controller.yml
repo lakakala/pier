@@ -1,0 +1,4 @@
+# Startup settings only. Configure the repository, agent listener, public
+# addresses, build concurrency and proxies in the web console at /init.
+http_listen: 127.0.0.1:8080
+state_dir: /var/lib/pier-controller

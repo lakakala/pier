@@ -1,0 +1,219 @@
+name: Packages
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-master
+  queue: max
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Push access is needed to include draft Releases in version allocation.
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      revision: ${{ steps.version.outputs.revision }}
+      upgrade_revision: ${{ steps.version.outputs.upgrade_revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/release.py resolve
+
+  checks:
+    needs: metadata
+    uses: ./.github/workflows/ci.yml
+
+  agent:
+    needs: [metadata, checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      PIER_ARCH: ${{ matrix.arch }}
+      PACKAGE_REVISION: ${{ needs.metadata.outputs.revision }}
+      UPGRADE_REVISION: ${{ needs.metadata.outputs.upgrade_revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/package-environment
+        with:
+          arch: ${{ matrix.arch }}
+          service: agent
+      - name: Build agent packages and upgrade fixtures
+        run: |
+          mkdir -p target/ci-logs
+          bash scripts/package-agent.sh --image pier-builder-rust:almalinux8 --arch "$PIER_ARCH" \
+            --revision "$PACKAGE_REVISION" --output target/release/agent 2>&1 | tee target/ci-logs/agent.log
+          bash scripts/prepare-upgrade-fixtures.sh agent "$PIER_ARCH" "$UPGRADE_REVISION" \
+            target/fixtures/agent 2>&1 | tee target/ci-logs/agent-fixtures.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: packages-agent-${{ matrix.arch }}
+          path: |
+            target/release/agent/*.deb
+            target/release/agent/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fixtures-agent-${{ matrix.arch }}
+          path: |
+            target/fixtures/agent/*.deb
+            target/fixtures/agent/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+      - name: Save packaging logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: logs-agent-${{ matrix.arch }}
+          path: target/ci-logs/
+          retention-days: 7
+
+  controller:
+    needs: [metadata, agent]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      PIER_ARCH: ${{ matrix.arch }}
+      PACKAGE_REVISION: ${{ needs.metadata.outputs.revision }}
+      UPGRADE_REVISION: ${{ needs.metadata.outputs.upgrade_revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/package-environment
+        with:
+          arch: ${{ matrix.arch }}
+          service: controller
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: packages-agent-*
+          path: target/release/agent
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: fixtures-agent-*
+          path: target/fixtures/agent
+          merge-multiple: true
+      - name: Build controller packages and upgrade fixtures
+        run: |
+          mkdir -p target/ci-logs
+          bash scripts/package-controller.sh --image pier-builder-rust:almalinux8 --arch "$PIER_ARCH" \
+            --revision "$PACKAGE_REVISION" --agent-packages target/release/agent \
+            --output target/release/controller 2>&1 | tee target/ci-logs/controller.log
+          bash scripts/prepare-upgrade-fixtures.sh controller "$PIER_ARCH" "$UPGRADE_REVISION" \
+            "target/fixtures/controller/$PIER_ARCH" target/fixtures/agent 2>&1 | tee target/ci-logs/controller-fixtures.log
+      - name: Test native installation and automatic upgrade
+        run: |
+          mkdir -p target/native-packages
+          cp target/release/agent/*.deb target/release/agent/*.rpm target/native-packages/
+          cp target/release/controller/*.deb target/release/controller/*.rpm target/native-packages/
+          bash scripts/test-agent-auto-upgrade.sh "$PIER_ARCH" --revision "$PACKAGE_REVISION" \
+            --packages target/native-packages --fixtures target/fixtures/controller \
+            --logs target/ci-logs 2>&1 | tee target/ci-logs/native.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: packages-controller-${{ matrix.arch }}
+          path: |
+            target/release/controller/*.deb
+            target/release/controller/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+      - name: Save packaging and systemd logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: logs-controller-${{ matrix.arch }}
+          path: target/ci-logs/
+          retention-days: 7
+
+  assemble:
+    needs: [metadata, controller]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PACKAGE_REVISION: ${{ needs.metadata.outputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5
+        with:
+          version: v29.7.2
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: packages-*
+          path: target/release-input
+          merge-multiple: true
+      - name: Verify native metadata, embedded bundles and checksums
+        run: |
+          python3 scripts/release.py assemble --revision "$PACKAGE_REVISION" \
+            --input target/release-input --output target/release-assets
+          cd target/release-assets
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pier-packages
+          path: target/release-assets/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: [metadata, assemble]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pier-packages
+          path: release-assets
+      - name: Publish complete release
+        run: |
+          python3 scripts/release.py publish --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" --input release-assets
