@@ -1,7 +1,9 @@
 # Build with --platform linux/amd64 or linux/arm64.
 # Tools run natively in the target architecture, using QEMU when necessary.
 FROM almalinux:8.10
-RUN dnf install -q -y ca-certificates curl gcc gcc-c++ glibc-devel make git tar gzip xz binutils \
+RUN dnf clean all \
+    && dnf --refresh makecache \
+    && dnf install -q -y ca-certificates curl gcc gcc-c++ glibc-devel make git tar gzip xz binutils \
     && dnf clean all
 
 ARG RUST_VERSION=1.98.1
