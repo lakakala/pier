@@ -14,6 +14,8 @@ import tarfile
 import tempfile
 import tomllib
 
+from native_packages import ARCHITECTURES, SYSTEMS, filename_system, tool_image
+
 ROOT = Path(__file__).resolve().parent.parent
 NUMBER = r'(?:0|[1-9][0-9]*)'
 VERSION = rf'{NUMBER}\.{NUMBER}\.{NUMBER}'
@@ -92,11 +94,13 @@ def expected_packages(meta):
         name = 'pier-' + service
         version = meta[service + '_version']
         revision = meta['revision']
-        for arch, rpm_arch in (('amd64', 'x86_64'), ('arm64', 'aarch64')):
-            result[f'{name}_{version}-{revision}_{arch}.deb'] = (
-                name, f'{version}-{revision}', arch)
-            result[f'{name}-{version}-{revision}.el8.{rpm_arch}.rpm'] = (
-                name, f'{version}-{revision}.el8', rpm_arch, '0')
+        for arch, rpm_arch in ARCHITECTURES.items():
+            for fmt, suffix, _ in SYSTEMS.values():
+                native = f'{version}-{revision}{suffix}'
+                if fmt == 'deb':
+                    result[f'{name}_{native}_{arch}.deb'] = (name, native, arch)
+                else:
+                    result[f'{name}-{native}.{rpm_arch}.rpm'] = (name, native, rpm_arch, '0')
     return result
 
 
@@ -104,7 +108,7 @@ def package_command(package, command, host):
     return subprocess.check_output([
         'docker', 'run', '--rm', '--pull=never', '--network=none',
         '--platform', 'linux/' + host, '-v', str(package.resolve()) + ':/package:ro',
-        'pier-agent-package-' + package.suffix[1:] + ':' + host, *command,
+        tool_image(filename_system(package), host), *command,
     ])
 
 
@@ -146,7 +150,7 @@ def verify_controller(package, expected_identity, expected_manifest, host):
 def assemble(source, destination, meta):
     expected = expected_packages(meta)
     if {file.name for file in source.iterdir()} != expected.keys():
-        raise ValueError('release input must contain exactly the eight expected DEB/RPM packages')
+        raise ValueError('release input must contain exactly the twelve expected DEB/RPM packages')
     for file in source.iterdir():
         if file.is_symlink() or not file.is_file() or file.stat().st_size == 0:
             raise ValueError('invalid release input: ' + file.name)
@@ -168,7 +172,8 @@ def assemble(source, destination, meta):
                 continue
             entry = by_digest[hashlib.sha256((source / name).read_bytes()).hexdigest()]
             arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(identity[2], identity[2])
-            if entry['architecture'] != arch or entry['format'] != Path(name).suffix[1:]:
+            if (entry['architecture'] != arch or entry['format'] != Path(name).suffix[1:]
+                    or entry['system'] != filename_system(Path(name))):
                 raise ValueError('agent filename does not match its native platform: ' + name)
         host = subprocess.check_output(['docker', 'info', '--format', '{{.Architecture}}'], text=True).strip()
         host = {'x86_64': 'amd64', 'aarch64': 'arm64', 'amd64': 'amd64', 'arm64': 'arm64'}[host]
@@ -191,7 +196,7 @@ def publish(source, meta, repository, commit):
     source = source.resolve()
     names = sorted(expected_packages(meta))
     if {file.name for file in source.iterdir()} != set(names) | {'SHA256SUMS'}:
-        raise ValueError('publish input must contain exactly eight packages and SHA256SUMS')
+        raise ValueError('publish input must contain exactly twelve packages and SHA256SUMS')
     for name in [*names, 'SHA256SUMS']:
         file = source / name
         if file.is_symlink() or not file.is_file() or file.stat().st_size == 0:

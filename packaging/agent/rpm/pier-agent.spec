@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 Name: pier-agent
 Version: %{pier_version}
-Release: %{pier_release}.el8
+Release: %{pier_release}%{pier_dist}
 Summary: Pier deployment agent and application supervisor
 License: MIT
 Source0: pier-agent

@@ -16,16 +16,18 @@ pier_bundle=$(mktemp -d "$pier_root/target/upgrade-bundle.XXXXXX")
 trap 'rm -rf -- "$pier_bundle"' EXIT
 pier_mounts=()
 if [ "$pier_service" = controller ]; then
-  python3 "$pier_root/scripts/bundle-agent-packages.py" "${5:?four upgraded agent packages are required}" "$pier_bundle"
+  python3 "$pier_root/scripts/bundle-agent-packages.py" "${5:?six upgraded agent packages are required}" "$pier_bundle"
   pier_mounts=(-v "$pier_bundle:/agent-releases:ro")
 fi
-for pier_format in deb rpm; do
-  docker build --platform "linux/$pier_arch" -f "$pier_root/docker/$pier_service-$pier_format.Dockerfile" \
-    -t "pier-$pier_service-package-$pier_format:$pier_arch" \
+source "$pier_root/scripts/package-target.sh"
+for pier_system in ubuntu24.04 almalinux8 almalinux9; do
+  pier_package_target "$pier_system"
+  docker build --platform "linux/$pier_arch" -f "$pier_root/docker/$pier_service-$pier_packager.Dockerfile" \
+    -t "pier-$pier_service-package-$pier_packager:$pier_arch" \
     --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg NO_PROXY "$pier_root"
   docker run --rm --pull=never --platform "linux/$pier_arch" \
     -v "$pier_root:/src:ro" -v "$pier_root/target/$pier_service-packages-$pier_arch/release:/binary:ro" \
     -v "$pier_output:/out" "${pier_mounts[@]}" \
-    "pier-$pier_service-package-$pier_format:$pier_arch" \
-    bash "/src/scripts/package-$pier_service-inner.sh" "$pier_format" "$pier_version" "$pier_revision" "$pier_arch"
+    "pier-$pier_service-package-$pier_packager:$pier_arch" \
+    bash "/src/scripts/package-$pier_service-inner.sh" "$pier_system" "$pier_version" "$pier_revision" "$pier_arch"
 done

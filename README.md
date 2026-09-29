@@ -2,9 +2,9 @@
 
 本仓库现为 Rust workspace：`pier-pkg` 保持为打包库，新增 `pier-controller` 和 `pier-agent` 两个服务。controller 从 Git 读取 app/blueprint，通过 React + Ant Design 控制台和 API 管理部署；agent 使用独立系统用户运行 app，自行守护进程并处理整组回退。controller 和 agent 均提供 DEB/RPM。controller 的 YAML 只保留 Web 监听地址和数据目录；首次访问 `/init` 创建管理员，配置仓库、agent 通信和构建参数，立即生效。后续在控制器设置页修改运行参数并手动重启，定义仓库仅手动同步。管理 API 使用 Cookie 会话。配置和运行说明见 [服务部署文档](docs/services.md)，HTTP 接口见 [controller API 文档](docs/api.md)。
 
-agent/controller 共用根 `Cargo.toml` 的 `[workspace.package].version`。每次推送 `master`，GitHub Actions 自动构建八个 DEB/RPM 包及 `SHA256SUMS`，验证后创建标签并发布 GitHub Release，无需手动打标签。相同 Cargo 版本依次发布为 `vX.Y.Z`、`vX.Y.Z-r1`、`vX.Y.Z-r2`，对应安装包修订号 `1`、`2`、`3`。详见 [构建与发布说明](docs/services.md#github-actions-构建与发布)。
+agent/controller 共用根 `Cargo.toml` 的 `[workspace.package].version`。每次推送 `master`，GitHub Actions 自动构建十二个 DEB/RPM 包及 `SHA256SUMS`，验证后创建标签并发布 GitHub Release，无需手动打标签。相同 Cargo 版本依次发布为 `vX.Y.Z`、`vX.Y.Z-r1`、`vX.Y.Z-r2`，对应安装包修订号 `1`、`2`、`3`。详见 [构建与发布说明](docs/services.md#github-actions-构建与发布)。
 
-`pier-agent` 提供 Ubuntu 24.04 的 DEB 包和 AlmaLinux 8 的 RPM 包，支持两种架构。安装后执行 `sudo pier-agent init`，按交互向导在 controller 网页授权，完成后自动启用 systemd 服务。agent 在握手时检查 controller 内置的原生包，自动下载并在部署空闲后升级、重启；只升级更高版本，失败后暂停该目标并手动恢复。通信与安装包下载使用 Noise 加密，重启时应用会短暂中断。旧 agent 需手动安装一次带更新器的包并重启。
+`pier-agent` 提供 Ubuntu 24.04 的 DEB 包和 AlmaLinux 8/9 的 RPM 包，支持两种架构。安装后执行 `sudo pier-agent init`，按交互向导在 controller 网页授权，完成后自动启用 systemd 服务。agent 在握手时检查 controller 内置的原生包，自动下载并在部署空闲后升级、重启；只升级更高版本，失败后暂停该目标并手动恢复。通信与安装包下载使用 Noise 加密，重启时应用会短暂中断。旧 Ubuntu agent 需手动安装一次带 `.ubuntu24.04` 版本后缀的新包并重启，随后继续自动升级。EL8/EL9 包分别使用 `.el8`/`.el9`；服务安装包及其安装验证全部由 GitHub Actions 生成和执行。
 
 Rust 同步库：从服务目录读取 `pier-pkg.yml`，获取 Git 源码并在 Docker 中编译，或下载上游二进制，渲染配置后生成 `tar.gz`。没有 `pier-pkg` 命令行程序。
 

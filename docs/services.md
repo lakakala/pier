@@ -1,6 +1,6 @@
 # controller 与 agent
 
-`pier-controller` 和 `pier-agent` 是两个可执行服务，同时提供可嵌入的 `run(Config)` Rust API。`pier-pkg` 继续保持库形式。服务支持 Linux `amd64`、`arm64`，目标运行环境为 AlmaLinux 8 和 Ubuntu 24.04。
+`pier-controller` 和 `pier-agent` 是两个可执行服务，同时提供可嵌入的 `run(Config)` Rust API。`pier-pkg` 继续保持库形式。服务支持 Linux `amd64`、`arm64`，目标运行环境为 AlmaLinux 8、AlmaLinux 9 和 Ubuntu 24.04。
 
 ```text
 Git 定义仓库 → controller → pier-pkg → tar.gz
@@ -12,13 +12,15 @@ controller 使用本地 SQLite 和产物目录，第一版运行单实例；agen
 
 ## 安装与交互初始化
 
-agent 提供 Ubuntu 24.04 的 DEB 包和 AlmaLinux 8 的 RPM 包，两者均支持 amd64/arm64。DEB 架构名称为 `amd64`、`arm64`，RPM 对应 `x86_64`、`aarch64`。
+agent 提供 Ubuntu 24.04 的 DEB 包和 AlmaLinux 8/9 的 RPM 包，两者均支持 amd64/arm64。DEB 架构名称为 `amd64`、`arm64`，RPM 对应 `x86_64`、`aarch64`。
 
 ```sh
 # Ubuntu 24.04
-sudo apt install ./pier-agent_0.1.0-1_amd64.deb
+sudo apt install ./pier-agent_0.1.0-1.ubuntu24.04_amd64.deb
 # AlmaLinux 8
 sudo dnf install ./pier-agent-0.1.0-1.el8.x86_64.rpm
+# AlmaLinux 9
+sudo dnf install ./pier-agent-0.1.0-1.el9.x86_64.rpm
 
 sudo pier-agent init
 ```
@@ -40,7 +42,7 @@ systemd 以 root 运行 agent，以便创建 app 专属用户和切换身份。a
 
 agent 与 controller 握手时报告运行版本、已安装包版本、发行版和自动升级能力。controller 内置对应平台的新包时，agent 自动下载，在部署空闲后安装并重启；其管理的 app 会短暂中断并从本地状态恢复。仅升级，不自动降级；版本按数字 `x.y.z`、修订号比较，重新构建同版本同修订号不会触发升级。
 
-下载使用独立的认证加密 TCP 连接，不占用心跳连接。安装前验证长度、SHA256、包名、架构和原生包版本。安装由独立的 `pier-agent-upgrade.service` 完成，使用本地 `dpkg --install` 或 `rpm --upgrade`，不自动下载额外依赖。安装和重启期间拒绝新部署，新进程恢复本地服务并通知 systemd 就绪后才算成功；确认不依赖 controller 在线。配置、token、SQLite 和 app 数据保留。
+下载使用独立的认证加密 TCP 连接，不占用心跳连接。安装前验证长度、SHA256、包名、架构、发行版标识和原生包版本。EL8 与 EL9 的 RPM 不能互相作为自动升级目标。安装由独立的 `pier-agent-upgrade.service` 完成，使用本地 `dpkg --install` 或 `rpm --upgrade`，不自动下载额外依赖。安装和重启期间拒绝新部署，新进程恢复本地服务并通知 systemd 就绪后才算成功；确认不依赖 controller 在线。配置、token、SQLite 和 app 数据保留。
 
 下载中断会退避重试。校验、安装、启动失败或安装被重启打断后，暂停同一目标版本，需要手动恢复，不自动回滚。服务器详情显示失败原因。排查并手动安装正确的软件包、重启 agent；成功运行到目标或更新版本后恢复状态。事务及下载包位于 `/var/lib/pier-agent-upgrade/`（root、0700），不要在升级单元运行时删除或修改。日志命令：
 
@@ -52,7 +54,15 @@ sudo systemctl reset-failed pier-agent
 sudo systemctl restart pier-agent
 ```
 
-旧版 agent 没有更新器，需先升级 controller，再手动安装一次新版 agent 包并重启。旧 agent 仍可连接和部署，页面提示需手动升级一次。直接运行开发二进制、非 systemd 实例和非受支持发行版不自动升级。
+旧版 Ubuntu agent 无法识别新增的 `.ubuntu24.04` 原生版本后缀，需要从 GitHub Release 下载对应架构的新 DEB，手动安装一次并重启。建议先迁移 Ubuntu agent，再升级 controller，避免旧 agent 尝试新包后进入失败暂停；后续版本恢复自动升级。已有配置、token 和部署数据保留，不需要再次执行 `init`。新 agent 能读取旧式数字 DEB 修订号，但新发布的升级包必须包含正确的发行版标识。EL8 原生版本格式不变，可继续自动升级。
+
+```sh
+# 使用本次 Release 的实际版本、修订号和架构替换文件名
+sudo dpkg --force-confold --install ./pier-agent_0.1.0-2.ubuntu24.04_amd64.deb
+sudo systemctl restart pier-agent
+```
+
+更早、没有更新器的 agent 同样需要手动安装一次新版包并重启。直接运行开发二进制、非 systemd 实例和非受支持发行版不自动升级。
 
 手动执行包管理器安装仍不会在安装脚本中重启 agent；需要执行 `systemctl restart pier-agent`。DEB 附带仅针对本服务的 needrestart 设置。卸载停止两个单元并禁用主服务，保留配置、token、app 用户、部署数据与升级记录；DEB purge 同样保留这些运行数据。
 
@@ -62,9 +72,11 @@ controller 同样提供 DEB/RPM 和 amd64/arm64 两种架构，无需 `pier-cont
 
 ```sh
 # Ubuntu 24.04
-sudo apt install ./pier-controller_0.1.0-1_amd64.deb
+sudo apt install ./pier-controller_0.1.0-1.ubuntu24.04_amd64.deb
 # AlmaLinux 8
 sudo dnf install ./pier-controller-0.1.0-1.el8.x86_64.rpm
+# AlmaLinux 9
+sudo dnf install ./pier-controller-0.1.0-1.el9.x86_64.rpm
 
 # 配置自己的 HTTPS 反向代理后启动
 sudo systemctl enable --now pier-controller
@@ -121,7 +133,7 @@ sudo systemctl enable --now pier-controller
 
 | 触发方式 | 行为 |
 | --- | --- |
-| 推送 `master` | 自动分配发布版本，执行 CI，构建并验证八个安装包，创建标签并发布 GitHub Release |
+| 推送 `master` | 自动分配发布版本，执行 CI，构建并验证十二个安装包，创建标签并发布 GitHub Release |
 | 其他分支提交、PR | 独立执行 CI：Rust 格式、Clippy、工作区测试、工作流及发布脚本检查，Web 类型、构建一致性与浏览器测试 |
 
 两个服务共用根 `Cargo.toml` 的 `[workspace.package].version`，各自通过 `version.workspace = true` 继承。升级软件版本时只修改根版本，然后运行 `cargo check --workspace` 更新 `Cargo.lock`，将两者一起提交并推送 `master`。`pier-pkg` 和 `pier-protocol` 的 crate 版本仍独立维护，通信协议版本不随软件版本自动变化。
@@ -141,15 +153,15 @@ version = "0.1.0"
 | `0.1.0` | 第三次 | `v0.1.0-r2` | `3` |
 | `0.2.0` | 首次 | `v0.2.0` | `1` |
 
-`-rN` 是发布标签的重打包后缀，原生包修订号为 `N + 1`。例如 `v0.1.0-r1` 包含 `pier-agent_0.1.0-2_amd64.deb` 和 `pier-agent-0.1.0-2.el8.x86_64.rpm`，controller 使用相同基础版本和修订号。`--version` 仍显示 Cargo 基础版本；agent 通过原生包版本和修订号识别升级。
+`-rN` 是发布标签的重打包后缀，原生包修订号为 `N + 1`。例如 `v0.1.0-r1` 包含 `pier-agent_0.1.0-2.ubuntu24.04_amd64.deb` 和 `pier-agent-0.1.0-2.el8.x86_64.rpm`，controller 使用相同基础版本和修订号。`--version` 仍显示 Cargo 基础版本；agent 通过原生包版本和修订号识别升级。
 
 版本分配分页查询所有 Release（包括草稿）和 Git 标签，以当前基础版本的最大已用后缀递增，不补空缺。其他基础版本和非标准名称不参与编号。查询失败或超出范围时停止；基础版本只接受无前导零的 `X.Y.Z`，修订号上限为 `2^64 - 3`，为升级测试预留两个后续修订。
 
 整个发布流程使用固定并发组串行执行，`queue: max` 保留最多 100 个等待运行的任务，避免后续推送取消已排队构建。超出队列容量时 GitHub 会取消新增等待任务；执行顺序以进入并发队列的顺序为准，不保证提交顺序。每次发布始终使用该次触发提交的 SHA，标签不会指向构建期间后来推送的提交。相关机制见 [GitHub 并发队列说明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)。当前 actionlint 版本尚不识别 `queue`，检查脚本仅忽略这一条语法诊断，其他检查正常执行。
 
-流程先构建两种架构的四个 agent 包，再交给两个 controller 任务制作内嵌升级 bundle。每个 controller 任务在 Ubuntu、AlmaLinux 的临时 systemd 容器内验证安装、部署、重启及自动升级；测试包使用下一修订号，与正式包分开保存。汇总任务校验八个包的原生元数据、controller 内嵌包与正式 agent 包的一致性，最后生成统一的 `SHA256SUMS`。
+流程先构建两种架构的六个 agent 包，再交给两个 controller 任务制作内嵌升级 bundle。每个 controller 任务在 Ubuntu 24.04、AlmaLinux 8、AlmaLinux 9 的临时 systemd 容器内验证安装、部署、重启及自动升级；测试包使用下一修订号，与正式包分开保存。汇总任务校验十二个包的原生元数据、controller 内嵌包与正式 agent 包的一致性，最后生成统一的 `SHA256SUMS`。
 
-构建完成后，可在运行页面下载 **pier-packages** artifact（保留 30 天）。发布任务再次校验附件和版本占用情况，原子创建指向触发提交的标签，将八个 DEB/RPM 和校验文件上传到同名草稿 Release，附件齐全后才公开并设为 Latest（包括 `-rN` 发布）。已有标签、Release 或草稿均不覆盖。
+构建完成后，可在运行页面下载 **pier-packages** artifact（保留 30 天）。发布任务再次校验附件和版本占用情况，原子创建指向触发提交的标签，将十二个 DEB/RPM 和校验文件上传到同名草稿 Release，附件齐全后才公开并设为 Latest（包括 `-rN` 发布）。已有标签、Release 或草稿均不覆盖。
 
 发布失败时保留已创建的标签及草稿。选择 **Re-run all jobs** 会重新查询远端并分配可用版本；已有草稿或标签会占用对应编号。仅重跑失败任务沿用原先分配的版本，遇到占用时会失败，不能给已构建的包临时换号。创建标签前失败的构建尚未占用版本，完整重跑时可再次使用该编号。
 
@@ -162,34 +174,17 @@ sha256sum --check SHA256SUMS
 
 版本分配任务和发布任务使用 `GITHUB_TOKEN` 的 `contents: write` 权限，分别用于读取完整草稿历史和创建标签、Release；其余任务只读。默认使用 `master` 作为发布分支，仓库需允许执行 Actions 和使用此令牌创建标签及 Release。app 的源码/二进制 tar.gz 打包仍由 `pier-pkg` 与 controller 执行。
 
-## 本地构建与调试
+## Actions 构建与内嵌升级包
 
-本地脚本保留供调试与复现。先准备相应编译镜像；在单一架构主机上验证两种架构时还需 QEMU/binfmt。打包、测试包准备及发布辅助脚本在宿主机上需要 Python 3.11 及以上，统一通过 `python3 scripts/release.py version` 读取共享服务版本。
+服务安装包的编译、打包与安装验证全部在 GitHub Actions 执行，安装包从 Release 或 `pier-packages` artifact 获取。仓库中的打包、测试夹具和发布脚本是工作流内部组件，不需要在本地准备 Docker、QEMU 或安装包。
 
-```sh
-cargo fetch --locked
-bash scripts/package-agent.sh --image pier-builder-rust:almalinux8 --arch amd64
-bash scripts/package-agent.sh --image pier-builder-rust:almalinux8 --arch arm64
-bash scripts/package-controller.sh --image pier-builder-rust:almalinux8 --arch amd64
-bash scripts/package-controller.sh --image pier-builder-rust:almalinux8 --arch arm64
-```
+Actions 为 amd64、arm64 分别使用原生 runner，每种架构在 AlmaLinux 8 Rust 镜像内编译一次，再使用 Ubuntu 24.04、AlmaLinux 8、AlmaLinux 9 的独立 Dockerfile 生成三个原生包。EL9 打包与测试镜像使用 `almalinux:9.8`。安装镜像依赖前刷新软件源索引；编译缓存按服务、架构及实际镜像 ID 隔离。ELF 校验要求 GLIBC 不超过 EL8 的 2.28、EL9 的 2.34、Ubuntu 24.04 的 2.39，原生打包工具同时生成动态库依赖。
 
-controller 打包前必须准备同版本、同修订号的四个 agent 包（两个系统 × 两种架构）。`--agent-packages DIR` 指定输入目录，默认 `dist/`；缺包、重复平台或版本不一致会中止打包。脚本通过 Docker 中的原生工具读取包元数据并计算 SHA256，将 manifest 和四个包安装到 `/usr/share/pier-controller/agent-releases/`。controller 启动时验证并复制到自身数据目录的不可变缓存；运行期间不切换目标，安装新 controller 包后重启才发布新目标。bundle 缺失或校验失败只停用自动升级，Web 和普通部署继续工作。
+Ubuntu 包的 `Version` 为 `X.Y.Z-N.ubuntu24.04`，RPM 的 `Version` 为 `X.Y.Z`、`Release` 为 `N.el8` 或 `N.el9`，文件名同步反映这些字段。发行版标识不进入 Cargo 版本或 Release 标签，也不参与 agent 的基础版本与数字修订号比较。本次支持 AlmaLinux 8/9 和 Ubuntu 24.04，未扩展到 Rocky Linux、RHEL 或其他 Ubuntu 版本。
 
-例如本地复现同一软件版本的新修订包，先为两种架构运行 agent 打包命令并指定 `--revision 2 --output target/agent-release-2`，再给 controller 打包命令传入 `--revision 2 --agent-packages target/agent-release-2`。
+controller 打包前必须取得同版本、同修订号的六个 agent 包（三个系统 × 两种架构）。工作流通过原生工具读取元数据并计算 SHA256；缺包、重复平台、发行版标识或版本不一致都会中止打包。manifest 和六个包安装到 `/usr/share/pier-controller/agent-releases/`。controller 启动时验证并复制到自身数据目录的不可变缓存；安装新 controller 包后重启才发布新升级目标。bundle 缺失或校验失败只停用自动升级，Web 和普通部署继续工作。
 
-构建镜像和架构必须显式传入。默认同时生成 DEB/RPM，可用 `--format deb|rpm|all`、`--revision N` 和 `--output DIR` 调整，默认输出 `dist/`，两个服务均读取根 Cargo 共享版本，本地修订号默认 1，不查询 GitHub。当前原生包版本要求 `x.y.z`。Docker 需支持 `docker image inspect --platform`，以识别选中架构的实际镜像。脚本用 Docker 在目标架构运行 Rust，异架构通过 QEMU，不使用 Zig；构建依赖由宿主 Cargo 缓存提供，先执行 `cargo fetch --locked`。controller 打包脚本同时刷新输出目录中的 SHA256SUMS（包含已有 agent 包）。DEB/RPM 工具镜像使用各自 Dockerfile，分别运行 debhelper/rpmbuild。
-
-推荐用 AlmaLinux 8 Rust 镜像同时构建两种安装包。编译缓存按目标架构及实际镜像 ID 隔离，切换镜像或更新同名镜像后重新编译，避免复用其他 libc 环境的产物。打包前校验 ELF 架构和 GLIBC 版本要求，RPM 不得超过 2.28，Ubuntu 24.04 DEB 不得超过 2.39；原生打包工具同时生成动态库依赖。Docker 拉取镜像的代理仍由 daemon 配置，镜像内安装依赖通过显式 build args 使用宿主代理，不修改 daemon 配置。
-
-controller 也可直接通过二进制前台调试；`pier-pkg` 继续保持库形式，app 产物仍是 tar.gz。
-
-```sh
-cargo build --release --workspace --locked
-target/release/pier-controller --config /etc/pier/controller.yml
-# 前台调试 agent；不要同时运行同一数据目录的 systemd 实例
-sudo target/release/pier-agent run --config /etc/pier/agent.yml
-```
+## 命令行与运行接口
 
 命令行由 clap 解析。agent 使用 `init` 或 `run` 子命令，`run` 省略 `--config` 时读取 `/etc/pier/agent.yml`；根级 `pier-agent --config PATH` 已移除。controller 的 `--config PATH` 必填。两个服务均支持 `-h/--help`、`-V/--version`，agent 可通过 `pier-agent init --help`、`pier-agent run --help` 查看子命令帮助。显式帮助和版本查询退出码为 0，参数错误和 agent 未指定子命令时退出码为 2；参数解析完成后才读取配置或执行初始化。
 
@@ -335,44 +330,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-准备好两个 Rust 构建镜像和 QEMU 后，可用脚本重复完整的发行版测试。脚本从本地 Cargo 缓存离线编译，因此先执行一次 `cargo fetch --locked`：
+Rust、前端与发布辅助脚本测试由 CI 执行。原生安装包和 systemd 验证由 Packages 工作流执行，在三种系统、两种架构上覆盖安装、配置与身份保留、真实部署、服务重启、修订号 `N → N+1` 自动升级、禁止降级、失败暂停及手动恢复。测试只使用 Actions 中的临时特权容器，不挂载宿主 cgroup 或 Docker socket。
 
-```sh
-cargo fetch --locked
-bash scripts/test-services.sh amd64
-bash scripts/test-services.sh arm64
-```
+Ubuntu 的迁移测试先安装带旧式数字修订号的测试 DEB，部署 app，再手动安装带 `.ubuntu24.04` 的正式包，验证配置、token 和服务恢复，并继续验证下一修订号自动升级。此夹具复用本次构建的二进制，只模拟旧式包元数据；它与正式产物隔离，不进入 bundle 或 Release。工作流保留打包与 systemd 日志，实际支持验证以对应提交的 Actions 结果为准。
 
-真实生命周期测试为 `crates/pier-agent/tests/lifecycle.rs`，默认忽略；必须在一次性 Docker 容器中以 root 运行，并设置 `PIER_PRIVILEGED_TESTS=1`、`PIER_CONTROLLER_BIN`、`PIER_AGENT_BIN`。容器需要 `git`、`useradd`、`getent`、`runuser`。测试使用临时 Git 仓库和本地下载源，覆盖独立用户、变量、服务升级、自动重启、整组回退、控制端重启、agent 崩溃恢复、移除 app 及离线恢复。
-
-在目标架构镜像中先运行 `cargo build --workspace` 和 `cargo test -p pier-agent --test lifecycle --no-run`，再将输出挂载到一次性运行容器，设置上述环境变量并执行生成的 `lifecycle-*` 测试二进制，参数为 `--ignored --nocapture`。不要在真实服务器上启用此特权测试。
-
-`pier-pkg` 新增 `inspect(service_dir)`、`PackageManifest` 与 `unpack(package, destination, sha256, architecture)`。`inspect` 只读取未渲染的声明；`unpack` 只向不存在的新目录发布已验证的内容，失败时不留下目标目录。原有 `pack()` 和 `validate()` 调用方式保持不变。
-
-原生软件包和 systemd 验证：
-
-```sh
-# 先构建对应架构的正式包并执行 test-services.sh，准备 controller 测试二进制
-bash scripts/test-agent-packages.sh amd64
-bash scripts/test-agent-packages.sh arm64
-# controller 包及对应架构的 agent 正式包准备好后
-bash scripts/test-controller-packages.sh amd64
-bash scripts/test-controller-packages.sh arm64
-# 已构建全部八个修订号 1 原生包后，分别准备下一修订号的测试包
-for arch in amd64 arm64; do
-  bash scripts/prepare-upgrade-fixtures.sh agent "$arch" 2 target/agent-upgrade-fixtures
-done
-for arch in amd64 arm64; do
-  bash scripts/prepare-upgrade-fixtures.sh controller "$arch" 2 \
-    "target/controller-package-upgrade-fixtures/$arch" target/agent-upgrade-fixtures
-done
-# 验证两系统、两架构的自动升级及失败暂停
-bash scripts/test-agent-auto-upgrade.sh
-```
-
-自动升级测试的准备与执行相互独立，可在各架构机器准备包后传递给测试任务。`test-agent-auto-upgrade.sh amd64|arm64|all` 支持 `--revision N`、`--packages DIR`、`--fixtures DIR`、`--logs DIR`；正式包默认为 `dist/` 中的修订号 1，controller 升级测试包放在 fixture 目录的 `<arch>/` 子目录且修订号必须为 `N+1`。重新准备时使用空目录，避免混入旧版本。日志默认保存在 `target/native-test-logs/`。旧的单独 agent/controller 生命周期脚本仍使用固定修订号 1、2。
-
-测试仅在临时 Docker 容器中进行，使用私有 PID/cgroup 命名空间，以 systemd 为 PID 1，需 Docker 特权容器支持；不挂载宿主 cgroup 或修改宿主 systemd。覆盖伪终端交互、无回显和 Ctrl+C 恢复、HTTPS 反向代理授权、安装后不自启、初始化后自启、崩溃拉起、升级进程 PID 不变、needrestart 策略、手动重启、容器重启后离线恢复、卸载数据保留。
+`pier-pkg` 的应用 tar.gz 打包、`inspect(service_dir)` 与 `unpack(package, destination, sha256, architecture)` 仍供运行中的 controller 或库调用方使用，不依赖 GitHub Actions。
 
 原生包初始实现（2026-09-27）验证结果：`cargo fmt --all --check`、Clippy（`-D warnings`）和当时的 34 项默认测试通过。另在以下 Docker 环境中执行了真实服务生命周期和原生包测试，ARM64 使用 QEMU：
 
@@ -385,4 +347,4 @@ bash scripts/test-agent-auto-upgrade.sh
 
 Web 初始化与运行设置改造（2026-09-27）验证：49 项 Rust 默认测试（含文档测试）、格式检查、Clippy（`-D warnings`）通过；前端格式、TypeScript 和内嵌资源重建一致性检查通过。5 项 Chromium HTTPS 测试覆盖首次初始化、运行设置立即生效与保存后待重启、Cookie/CSRF、退出、仓库同步、变量保留与修改、部署冲突重试与进度、接入链接登录与配对、改密、会话失效及手机尺寸页面，且无 CSP 违规或未捕获脚本错误。Rust 回归另覆盖初始化端口冲突无部分提交、监听失败后修复、旧 YAML 单次迁移及重启后设置生效。部署表单的在线 agent 和任务进度使用浏览器测试替身，真实部署由独立系统测试覆盖。
 
-Controller 包测试使用独立 systemd 容器，内部启动测试专用 Docker daemon，不挂载宿主 Docker socket 或 cgroup。Docker 静态二进制仅安装到测试镜像（[官方安装说明](https://docs.docker.com/engine/install/binaries/)）。覆盖专用用户、仅两个启动字段的默认配置、初始化前无 agent 监听、网页初始化立即启用通信、运行设置保存后手动重启生效、端口冲突时 Web 可用与修复、仅手动同步、真实二进制部署，以及 Git 源码 app 在内层 Docker 中执行构建命令后的部署；源码夹具使用复制脚本的最小构建命令，验证权限和挂载，不依赖额外语言工具链。测试还验证升级 PID 不变、Cookie/数据重启恢复、崩溃拉起和卸载保留；升级修订号 2 包放在 `target/controller-package-upgrade-fixtures/`，正式修订号 1 保留在 `dist/`。
+Controller 包测试使用独立 systemd 容器，内部启动测试专用 Docker daemon，不挂载宿主 Docker socket 或 cgroup。Docker 静态二进制仅安装到测试镜像（[官方安装说明](https://docs.docker.com/engine/install/binaries/)）。覆盖专用用户、仅两个启动字段的默认配置、初始化前无 agent 监听、网页初始化立即启用通信、运行设置保存后手动重启生效、端口冲突时 Web 可用与修复、仅手动同步、真实二进制部署，以及 Git 源码 app 在内层 Docker 中执行构建命令后的部署；源码夹具使用复制脚本的最小构建命令，验证权限和挂载，不依赖额外语言工具链。测试还验证升级 PID 不变、Cookie/数据重启恢复、崩溃拉起和卸载保留；升级夹具使用当前发布修订号的下一值，与正式产物分别存储。

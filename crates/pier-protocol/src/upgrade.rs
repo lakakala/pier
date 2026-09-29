@@ -60,13 +60,15 @@ impl Version {
     pub fn newer_than(&self, other: &Self) -> Result<bool> {
         Ok(self.key()? > other.key()?)
     }
-    pub fn native(&self, format: Format) -> String {
-        format!(
-            "{}-{}{}",
-            self.version,
-            self.revision,
-            if format == Format::Rpm { ".el8" } else { "" }
-        )
+    pub fn native(&self, system: &str) -> Result<String> {
+        self.key()?;
+        let suffix = match system {
+            "ubuntu24.04" => ".ubuntu24.04",
+            "almalinux8" => ".el8",
+            "almalinux9" => ".el9",
+            _ => anyhow::bail!("unsupported package system"),
+        };
+        Ok(format!("{}-{}{suffix}", self.version, self.revision))
     }
 }
 
@@ -86,7 +88,7 @@ impl Release {
         ensure!(
             matches!(
                 (self.system.as_str(), self.format),
-                ("ubuntu24.04", Format::Deb) | ("almalinux8", Format::Rpm)
+                ("ubuntu24.04", Format::Deb) | ("almalinux8" | "almalinux9", Format::Rpm)
             ),
             "unsupported release system"
         );
@@ -128,8 +130,8 @@ pub struct Bundle {
 impl Bundle {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.schema == 1 && self.releases.len() == 4,
-            "four agent packages are required"
+            self.schema == 1 && self.releases.len() == 6,
+            "six agent packages are required"
         );
         let mut platforms = std::collections::BTreeSet::new();
         for release in &self.releases {
@@ -174,9 +176,18 @@ impl Software {
         ensure!(
             self.system
                 .as_ref()
-                .is_none_or(|v| matches!(v.as_str(), "ubuntu24.04" | "almalinux8")),
+                .is_none_or(|v| matches!(v.as_str(), "ubuntu24.04" | "almalinux8" | "almalinux9")),
             "unsupported system"
         );
+        if let (Some(system), Some(format)) = (&self.system, self.format) {
+            ensure!(
+                matches!(
+                    (system.as_str(), format),
+                    ("ubuntu24.04", Format::Deb) | ("almalinux8" | "almalinux9", Format::Rpm)
+                ),
+                "software system and package format differ"
+            );
+        }
         ensure!(
             !self.supported
                 || (self.package.is_some() && self.system.is_some() && self.format.is_some()),
@@ -269,6 +280,9 @@ pub fn system(value: &str) -> Option<(&'static str, Format)> {
         (Some("almalinux"), Some(v)) if v == "8" || v.starts_with("8.") => {
             Some(("almalinux8", Format::Rpm))
         }
+        (Some("almalinux"), Some(v)) if v == "9" || v.starts_with("9.") => {
+            Some(("almalinux9", Format::Rpm))
+        }
         _ => None,
     }
 }
@@ -334,10 +348,18 @@ mod tests {
             system("ID=almalinux\nVERSION_ID=\"8.10\""),
             Some(("almalinux8", Format::Rpm))
         );
+        for v in ["9", "9.0", "9.8"] {
+            assert_eq!(
+                system(&format!("ID=almalinux\nVERSION_ID={v}")),
+                Some(("almalinux9", Format::Rpm))
+            );
+        }
         for s in [
             "ID=ubuntu\nVERSION_ID=22.04",
-            "ID=almalinux\nVERSION_ID=9.0",
+            "ID=almalinux\nVERSION_ID=10.0",
             "ID=rocky\nID_LIKE=almalinux\nVERSION_ID=8.10",
+            "ID=rocky\nID_LIKE=almalinux\nVERSION_ID=9.0",
+            "ID=rhel\nVERSION_ID=9.0",
         ] {
             assert!(system(s).is_none());
         }
@@ -395,6 +417,17 @@ mod tests {
         release.system = "almalinux8".into();
         release.format = Format::Rpm;
         assert!(!software.accepts(&release).unwrap());
+        software.system = Some("almalinux9".into());
+        software.format = Some(Format::Rpm);
+        software.version = "1.2.3".into();
+        software.package = Some(version("1.2.3", 1));
+        assert!(!software.accepts(&release).unwrap());
+        release.system = "almalinux9".into();
+        assert!(software.accepts(&release).unwrap());
+        release.format = Format::Deb;
+        assert!(release.validate().is_err());
+        software.format = Some(Format::Deb);
+        assert!(software.validate().is_err());
     }
     #[test]
     fn legacy_welcome_omits_new_fields() {

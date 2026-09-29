@@ -38,7 +38,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(meta['agent_version'], '2.0.0')
         self.assertEqual(meta['controller_version'], '2.0.0')
         self.assertEqual(meta['release_tag'], 'v2.0.0')
-        self.assertIn('pier-agent_2.0.0-1_amd64.deb', release.expected_packages(meta))
+        self.assertIn('pier-agent_2.0.0-1.ubuntu24.04_amd64.deb', release.expected_packages(meta))
         self.assertIn('pier-controller-2.0.0-1.el8.aarch64.rpm', release.expected_packages(meta))
 
     def test_reject_invalid_tags(self):
@@ -216,11 +216,11 @@ class ReleaseTests(unittest.TestCase):
         extra = source / 'test-fixture.deb'
         extra.write_bytes(b'not a formal package')
         with patch.object(release, 'github_tags') as gh:
-            with self.assertRaisesRegex(ValueError, 'exactly eight'):
+            with self.assertRaisesRegex(ValueError, 'exactly twelve'):
                 release.publish(source, meta, 'owner/repo', 'a' * 40)
             extra.unlink()
             (source / 'SHA256SUMS').unlink()
-            with self.assertRaisesRegex(ValueError, 'exactly eight'):
+            with self.assertRaisesRegex(ValueError, 'exactly twelve'):
                 release.publish(source, meta, 'owner/repo', 'a' * 40)
             gh.assert_not_called()
 
@@ -229,14 +229,16 @@ class ReleaseTests(unittest.TestCase):
         source.mkdir()
         meta = release.metadata(self.root)
         expected = release.expected_packages(meta)
-        self.assertEqual(len(expected), 8)
+        self.assertEqual(len(expected), 12)
         self.assertIn('pier-agent-1.2.3-1.el8.aarch64.rpm', expected)
-        with self.assertRaisesRegex(ValueError, 'exactly the eight'):
+        self.assertIn('pier-agent-1.2.3-1.el9.aarch64.rpm', expected)
+        self.assertIn('pier-controller_1.2.3-1.ubuntu24.04_arm64.deb', expected)
+        with self.assertRaisesRegex(ValueError, 'exactly the twelve'):
             release.assemble(source, self.root / 'output', meta)
         for name in expected:
             (source / name).write_bytes(b'package')
-        (source / 'pier-agent_1.2.3-2_amd64.deb').write_bytes(b'test fixture')
-        with self.assertRaisesRegex(ValueError, 'exactly the eight'):
+        (source / 'pier-agent_1.2.3-2.ubuntu24.04_amd64.deb').write_bytes(b'test fixture')
+        with self.assertRaisesRegex(ValueError, 'exactly the twelve'):
             release.assemble(source, self.root / 'output', meta)
 
     def make_bundle_archive(self, corrupt=False, duplicate=False, wrong_manifest=False):
@@ -260,10 +262,10 @@ class ReleaseTests(unittest.TestCase):
 
     def test_controller_bundle_and_native_identity(self):
         archive, manifest = self.make_bundle_archive()
-        identity = ('pier-controller', '1.2.3-1', 'amd64')
+        identity = ('pier-controller', '1.2.3-1.ubuntu24.04', 'amd64')
         with patch.object(release, 'package_command', side_effect=[b'\n'.join(v.encode() for v in identity), archive]):
             release.verify_controller(Path('controller.deb'), identity, manifest, 'amd64')
-        with patch.object(release, 'package_command', return_value=b'pier-controller\n1.2.3-2\namd64'):
+        with patch.object(release, 'package_command', return_value=b'pier-controller\n1.2.3-2.ubuntu24.04\namd64'):
             with self.assertRaisesRegex(ValueError, 'identity'):
                 release.verify_controller(Path('controller.deb'), identity, manifest, 'amd64')
 
@@ -271,9 +273,9 @@ class ReleaseTests(unittest.TestCase):
         for mutation in ('corrupt', 'duplicate', 'wrong_manifest'):
             archive, manifest = self.make_bundle_archive(**{mutation: True})
             with self.subTest(mutation=mutation):
-                with patch.object(release, 'package_command', side_effect=[b'pier-controller\n1.2.3-1\namd64', archive]):
+                with patch.object(release, 'package_command', side_effect=[b'pier-controller\n1.2.3-1.ubuntu24.04\namd64', archive]):
                     with self.assertRaises(ValueError):
-                        release.verify_controller(Path('controller.deb'), ('pier-controller', '1.2.3-1', 'amd64'), manifest, 'amd64')
+                        release.verify_controller(Path('controller.deb'), ('pier-controller', '1.2.3-1.ubuntu24.04', 'amd64'), manifest, 'amd64')
 
 
 if __name__ == '__main__':

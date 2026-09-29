@@ -108,7 +108,7 @@ fn detect() -> Software {
     {
         software.system = Some(system.into());
         software.format = Some(format);
-        software.package = package::installed(format).ok();
+        software.package = package::installed(system, format).ok();
         software.supported = software.package.is_some() && package::managed();
         if software.supported {
             software.reason = None;
@@ -472,7 +472,7 @@ fn install(job: &mut Transaction) -> Result<()> {
     let release = &job.status.release;
     let path = PathBuf::from(ROOT).join(release.filename());
     package::inspect(&path, release)?;
-    let current = package::installed(release.format)?;
+    let current = package::installed(&release.system, release.format)?;
     ensure!(!current.newer_than(&release.package)?, "refusing downgrade");
     match release.format {
         Format::Deb => package::bounded(
@@ -489,7 +489,7 @@ fn install(job: &mut Transaction) -> Result<()> {
         )?,
     }
     ensure!(
-        package::installed(release.format)? == release.package,
+        package::installed(&release.system, release.format)? == release.package,
         "installed package version mismatch"
     );
     save(job, Phase::Restarting, None)?;

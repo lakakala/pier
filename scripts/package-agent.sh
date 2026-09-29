@@ -39,13 +39,15 @@ docker run --rm --pull=never --platform "linux/$pier_arch" --user "$(id -u):$(id
   -e CARGO_HOME=/cache -e CARGO_TARGET_DIR=/out -e CARGO_BUILD_JOBS=4 \
   -v "$pier_repository:/src:ro" -v "$pier_target:/out" -v "$pier_cache:/cache" -v "$pier_registry:/cache/registry:ro" \
   -w /src "$pier_image_ref" cargo build -p pier-agent --release --offline --locked
-for pier_package in deb rpm; do
+source "$pier_repository/scripts/package-target.sh"
+for pier_system in ubuntu24.04 almalinux8 almalinux9; do
+  pier_package_target "$pier_system"
   if [ "$pier_format" != all ] && [ "$pier_format" != "$pier_package" ]; then continue; fi
-  docker build --platform "linux/$pier_arch" -f "$pier_repository/docker/agent-$pier_package.Dockerfile" \
-    -t "pier-agent-package-$pier_package:$pier_arch" --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg NO_PROXY "$pier_repository"
+  docker build --platform "linux/$pier_arch" -f "$pier_repository/docker/agent-$pier_packager.Dockerfile" \
+    -t "pier-agent-package-$pier_packager:$pier_arch" --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg NO_PROXY "$pier_repository"
   docker run --rm --pull=never --platform "linux/$pier_arch" \
     -v "$pier_repository:/src:ro" -v "$pier_target/release:/binary:ro" -v "$pier_output:/out" \
-    "pier-agent-package-$pier_package:$pier_arch" bash /src/scripts/package-agent-inner.sh "$pier_package" "$pier_version" "$pier_revision" "$pier_arch"
+    "pier-agent-package-$pier_packager:$pier_arch" bash /src/scripts/package-agent-inner.sh "$pier_system" "$pier_version" "$pier_revision" "$pier_arch"
 done
 # Stable location for the package lifecycle test fixtures, separate from caches.
 mkdir -p "$pier_repository/target/agent-packages-$pier_arch/release"

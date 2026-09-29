@@ -409,9 +409,14 @@ mod tests {
             schema: 1,
             releases: vec![],
         };
-        for format in [Format::Deb, Format::Rpm] {
+        for (system, format) in [
+            ("ubuntu24.04", Format::Deb),
+            ("almalinux8", Format::Rpm),
+            ("almalinux9", Format::Rpm),
+        ] {
             for arch in [Architecture::Amd64, Architecture::Arm64] {
-                let release = release(format, arch);
+                let mut release = release(format, arch);
+                release.system = system.into();
                 fs::write(source.path().join(release.filename()), "package").unwrap();
                 bundle.releases.push(release);
             }
@@ -431,6 +436,29 @@ mod tests {
         assert!(bundle.validate().is_err());
         bundle.releases.pop();
         assert!(bundle.validate().is_err());
+    }
+    #[test]
+    fn candidates_match_system_and_architecture() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = fixture(dir.path());
+        let mut el9_arm = release(Format::Rpm, Architecture::Arm64);
+        el9_arm.system = "almalinux9".into();
+        let mut el9_amd = el9_arm.clone();
+        el9_amd.architecture = Architecture::Amd64;
+        std::sync::Arc::get_mut(&mut state)
+            .unwrap()
+            .upgrades
+            .releases = vec![
+            release(Format::Rpm, Architecture::Amd64),
+            el9_arm,
+            el9_amd.clone(),
+        ];
+        let mut software: Software = state.store.get("agent_software", "agent").unwrap().unwrap();
+        assert!(state.candidate("agent").unwrap().is_none());
+        software.system = Some("almalinux9".into());
+        software.format = Some(Format::Rpm);
+        state.record_software("agent", Some(&software)).unwrap();
+        assert_eq!(state.upgrade_offer("agent").unwrap().release, Some(el9_amd));
     }
     #[test]
     fn reservation_waits_for_deployments_and_persists_across_restarts() {

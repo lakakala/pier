@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 Name: pier-controller
 Version: %{pier_version}
-Release: %{pier_release}.el8
+Release: %{pier_release}%{pier_dist}
 Summary: Pier deployment controller and web console
 License: MIT
 Source0: pier-controller

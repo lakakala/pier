@@ -26,8 +26,8 @@ jobs:
       - name: Validate workflows and release helpers
         run: |
           bash scripts/check-workflows.sh
-          python3 -m unittest discover -s scripts -p 'test_release.py' -v
-          bash -n scripts/package-agent.sh scripts/package-controller.sh scripts/prepare-upgrade-fixtures.sh scripts/test-agent-auto-upgrade.sh scripts/test-agent-packages.sh scripts/test-controller-packages.sh scripts/check-workflows.sh
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+          for script in scripts/*.sh; do bash -n "$script"; done
       - name: Check Rust
         run: |
           cargo fmt --all --check

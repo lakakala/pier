@@ -117,18 +117,23 @@ if '--after-boot' in sys.argv:
 wait('systemd', lambda: pathlib.Path('/run/systemd/system').exists())
 root.mkdir(mode=0o755)
 if distro == 'ubuntu2404':
-    suffix = '_*-%s_%s.deb' % (base_revision, arch)
-    upgrade = glob.glob(fixtures_dir + '/pier-controller_*-%s_%s.deb' % (upgrade_revision, arch))
+    suffix = '_*-%s.ubuntu24.04_%s.deb' % (base_revision, arch)
+    upgrade = glob.glob(fixtures_dir + '/pier-controller_*-%s.ubuntu24.04_%s.deb' % (upgrade_revision, arch))
     installer = ['apt-get', 'install', '-y']
 else:
     rpm_arch = {'amd64': 'x86_64', 'arm64': 'aarch64'}[arch]
-    suffix = '-*-%s.el8.%s.rpm' % (base_revision, rpm_arch)
-    upgrade = glob.glob(fixtures_dir + '/pier-controller-*-%s.el8.%s.rpm' % (upgrade_revision, rpm_arch))
+    rpm_dist = {'almalinux8': 'el8', 'almalinux9': 'el9'}[distro]
+    suffix = '-*-%s.%s.%s.rpm' % (base_revision, rpm_dist, rpm_arch)
+    upgrade = glob.glob(fixtures_dir + '/pier-controller-*-%s.%s.%s.rpm' % (upgrade_revision, rpm_dist, rpm_arch))
     installer = ['dnf', '--disablerepo=*', 'install', '-y']
 original = glob.glob(packages_dir + '/pier-controller' + suffix)
 agent_package = glob.glob(packages_dir + '/pier-agent' + suffix)
 assert len(original) == len(upgrade) == len(agent_package) == 1
-command(*(installer + original + agent_package))
+initial_agent = agent_package
+if auto_upgrade and distro == 'ubuntu2404':
+    initial_agent = glob.glob(os.environ['PIER_TEST_LEGACY_PACKAGES'] + '/pier-agent_*-%s_%s.deb' % (base_revision, arch))
+    assert len(initial_agent) == 1, 'one legacy Ubuntu fixture is required'
+command(*(installer + original + initial_agent))
 if auto_upgrade:
     shutil.copytree('/usr/share/pier-controller/agent-releases', str(root / 'original-agent-bundle'))
     dropin = pathlib.Path('/etc/systemd/system/pier-agent-upgrade.service.d')
@@ -206,6 +211,29 @@ def deploy(images=None):
     return job
 
 job = deploy()
+if auto_upgrade and distro == 'ubuntu2404':
+    # The legacy fixture uses this build's binary with the old native version.
+    # Verify the one-time manual migration before exercising automatic updates.
+    legacy_version = command('dpkg-query', '-W', '-f=${Version}', 'pier-agent')
+    assert legacy_version.endswith('-%s' % base_revision)
+    agent_config_before = checksum('/etc/pier/agent.yml')
+    token_before = checksum('/etc/pier/agent.token')
+    agent_pid_before = command('systemctl', 'show', '-p', 'MainPID', '--value', 'pier-agent')
+    command(*(['dpkg', '--force-confold', '--install'] + agent_package))
+    assert command('dpkg-query', '-W', '-f=${Version}', 'pier-agent') == legacy_version + '.ubuntu24.04'
+    assert command('systemctl', 'show', '-p', 'MainPID', '--value', 'pier-agent') == agent_pid_before
+    command('systemctl', 'restart', 'pier-agent')
+    def migrated():
+        view = api('GET', agent_path)
+        return (view['online'] and view['software']['supported']
+                and view['software']['system'] == 'ubuntu24.04'
+                and view['software']['package']['revision'] == base_revision
+                and view['report']['apps'] and all(a['state'] == 'running' for a in view['report']['apps'])
+                and command('systemctl', 'show', '-p', 'MainPID', '--value', 'pier-agent') not in ('0', agent_pid_before))
+    wait('manual Ubuntu migration and restored apps', migrated, seconds=180)
+    assert checksum('/etc/pier/agent.yml') == agent_config_before
+    assert checksum('/etc/pier/agent.token') == token_before
+    print('PASS %s/%s: manual migration from numeric DEB revision preserves configuration and identity' % (distro, arch), flush=True)
 old_pid = pid()
 config_hash = checksum('/etc/pier/controller.yml')
 command(*(installer + upgrade))
@@ -262,9 +290,9 @@ if auto_upgrade:
     assert journal.stat().st_uid == 0 and journal.stat().st_mode & 0o777 == 0o600
     assert json.loads(journal.read_text())['status']['phase'] == 'succeeded'
     if distro == 'ubuntu2404':
-        assert command('dpkg-query', '-W', '-f=${Version}', 'pier-agent').endswith('-%s' % upgrade_revision)
+        assert command('dpkg-query', '-W', '-f=${Version}', 'pier-agent').endswith('-%s.ubuntu24.04' % upgrade_revision)
     else:
-        assert command('rpm', '-q', '--qf', '%{RELEASE}', 'pier-agent') == '%s.el8' % upgrade_revision
+        assert command('rpm', '-q', '--qf', '%{RELEASE}', 'pier-agent') == '%s.%s' % (upgrade_revision, rpm_dist)
     # A lower controller bundle cannot downgrade or restart the agent.
     bundle_path = pathlib.Path('/usr/share/pier-controller/agent-releases')
     manifest = (bundle_path / 'manifest.json').read_bytes()

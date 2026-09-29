@@ -485,11 +485,13 @@ curl --fail-with-body "$CONTROLLER_URL/v1/agents/$AGENT_ID" \
 | --- | --- |
 | `software.version` | 当前进程的 Cargo 版本，例如 `0.1.0` |
 | `software.package` | 已安装原生包 `{ "version": "0.1.0", "revision": 2 }`，无法识别时为 `null` |
-| `software.system` / `format` | `ubuntu24.04` / `deb` 或 `almalinux8` / `rpm`，未识别时为 `null` |
+| `software.system` / `format` | `ubuntu24.04` / `deb`、`almalinux8` / `rpm` 或 `almalinux9` / `rpm`，未识别时为 `null` |
 | `software.supported` / `reason` | 是否支持自动升级及不可用原因 |
 | `upgrade.target` | 当前 controller 内置的匹配发行包，或 `null` |
 | `upgrade.status` | 最近一次升级记录，或 `null` |
 | `upgrade.reason` | 未提供升级的原因，正常时为 `null` |
+
+发行版后缀仅用于原生包元数据和文件名，`software.package` 仍使用基础版本与数字修订号。旧版 Ubuntu agent 需要手动安装一次带 `.ubuntu24.04` 的新包并重启，之后恢复自动升级。
 
 发行包对象含 `package`（版本与修订号）、`system`、`format`、`architecture`（`amd64` / `arm64`）、`sha256`、`size`（字节数）。状态对象含 `release`（发行包）、`phase`、`error`（可空的简短原因）、`updated_at`（Unix 秒）。HTTP 不暴露升级授权凭据，也不提供手动上传或触发升级接口。
 

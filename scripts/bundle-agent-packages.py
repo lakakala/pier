@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""Validate four native packages using Docker and prepare an immutable bundle."""
+"""Validate six native packages using Docker and prepare an immutable bundle."""
 import hashlib
 import json
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
+
+from native_packages import ARCHITECTURES, SYSTEMS, filename_system, parse_version, tool_image
 
 
 def bundle(source, destination):
     source, destination = source.resolve(), destination.resolve()
     packages = sorted([*source.glob('pier-agent_*.deb'), *source.glob('pier-agent-*.rpm')])
-    if len(packages) != 4:
-        raise ValueError('exactly four pier-agent packages are required (both OSes and architectures)')
+    expected_platforms = {(system, arch) for system in SYSTEMS for arch in ARCHITECTURES}
+    if len(packages) != len(expected_platforms):
+        raise ValueError('exactly six pier-agent packages are required (three OSes and both architectures)')
     root = pathlib.Path(__file__).resolve().parent.parent
     host = subprocess.check_output(['docker', 'info', '--format', '{{.Architecture}}'], text=True).strip()
     architecture = {'x86_64': 'amd64', 'aarch64': 'arm64', 'amd64': 'amd64', 'arm64': 'arm64'}[host]
-    for fmt in ('deb', 'rpm'):
+    for system, (_, _, packager) in SYSTEMS.items():
         subprocess.run(['docker', 'build', '--platform', 'linux/' + architecture,
-                        '-f', str(root / ('docker/agent-' + fmt + '.Dockerfile')),
-                        '-t', 'pier-agent-package-' + fmt + ':' + architecture,
+                        '-f', str(root / ('docker/agent-' + packager + '.Dockerfile')),
+                        '-t', tool_image(system, architecture),
                         '--build-arg', 'http_proxy', '--build-arg', 'https_proxy',
                         '--build-arg', 'no_proxy', '--build-arg', 'NO_PROXY', str(root)], check=True)
     releases, platforms = [], set()
@@ -28,28 +30,28 @@ def bundle(source, destination):
         if package.is_symlink() or not package.is_file() or not 0 < package.stat().st_size <= 256 * 1024 * 1024:
             raise ValueError('invalid package file: ' + package.name)
         fmt = package.suffix[1:]
+        expected_system = filename_system(package)
         query = (['dpkg-deb', '-W', '--showformat=${Package}\n${Version}\n${Architecture}', '/packages/' + package.name]
                  if fmt == 'deb' else ['rpm', '-qp', '--qf', '%{NAME}\n%{VERSION}-%{RELEASE}\n%{ARCH}\n%{EPOCHNUM}', '/packages/' + package.name])
         fields = subprocess.check_output(['docker', 'run', '--rm', '--pull=never', '--network=none',
                                           '--platform', 'linux/' + architecture, '-v', str(source) + ':/packages:ro',
-                                          'pier-agent-package-' + fmt + ':' + architecture, *query], text=True, timeout=120).strip().splitlines()
+                                          tool_image(expected_system, architecture), *query], text=True, timeout=120).strip().splitlines()
         if len(fields) != (3 if fmt == 'deb' else 4) or fields[0] != 'pier-agent' or (fmt == 'rpm' and fields[3] != '0'):
             raise ValueError('incorrect package identity or epoch: ' + package.name)
-        version = re.fullmatch(r'((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))-([1-9][0-9]*)' + (r'\.el8' if fmt == 'rpm' else ''), fields[1])
+        version, system = parse_version(fields[1], fmt)
         arch = ({'amd64': 'amd64', 'arm64': 'arm64'} if fmt == 'deb' else {'x86_64': 'amd64', 'aarch64': 'arm64'}).get(fields[2])
-        if version is None or arch is None:
+        if arch is None or system != expected_system:
             raise ValueError('unsupported package version or architecture: ' + package.name)
-        if len(version[1]) > 64 or any(int(v) > 2**64 - 1 for v in [*version[1].split('.'), version[2]]):
-            raise ValueError('package version is out of range: ' + package.name)
-        system = 'ubuntu24.04' if fmt == 'deb' else 'almalinux8'
         if (system, arch) in platforms:
             raise ValueError('duplicate agent platform')
         platforms.add((system, arch))
         digest = hashlib.sha256(package.read_bytes()).hexdigest()
-        releases.append({'package': {'version': version[1], 'revision': int(version[2])}, 'format': fmt,
+        releases.append({'package': version, 'format': fmt,
                          'architecture': arch, 'system': system, 'sha256': digest, 'size': package.stat().st_size})
+    if platforms != expected_platforms:
+        raise ValueError('incomplete agent platform set')
     if any(r['package'] != releases[0]['package'] for r in releases):
-        raise ValueError('all four agent packages must have the same version and revision')
+        raise ValueError('all six agent packages must have the same version and revision')
     destination.mkdir(parents=True, exist_ok=True)
     destination.chmod(0o755)
     if any(destination.iterdir()):

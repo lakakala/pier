@@ -42,20 +42,20 @@ fn query(command: &mut Command) -> Result<String> {
     output.read_to_string(&mut text)?;
     Ok(text.trim().to_string())
 }
-pub(super) fn version(value: &str, format: Format) -> Result<Version> {
+pub(super) fn version(value: &str, system: &str, allow_legacy: bool) -> Result<Version> {
     let (version, revision) = value.rsplit_once('-').context("missing package revision")?;
-    let revision = match format {
-        Format::Deb => revision,
-        Format::Rpm => revision
-            .strip_suffix(".el8")
-            .context("unsupported RPM release")?,
-    };
-    let value = Version {
+    let package = Version {
         version: version.into(),
-        revision: revision.parse()?,
+        revision: revision.split('.').next().unwrap_or_default().parse()?,
     };
-    value.key()?;
-    Ok(value)
+    ensure!(
+        value == package.native(system)?
+            || (allow_legacy
+                && system == "ubuntu24.04"
+                && value == format!("{}-{}", package.version, package.revision)),
+        "native package version does not match target system"
+    );
+    Ok(package)
 }
 fn arch(value: &str, format: Format) -> Result<()> {
     let expected = match (crate::architecture()?, format) {
@@ -67,7 +67,7 @@ fn arch(value: &str, format: Format) -> Result<()> {
     ensure!(value == expected, "package architecture mismatch");
     Ok(())
 }
-pub(super) fn installed(format: Format) -> Result<Version> {
+pub(super) fn installed(system: &str, format: Format) -> Result<Version> {
     let text = match format {
         Format::Deb => query(Command::new("dpkg-query").args([
             "-W",
@@ -93,7 +93,7 @@ pub(super) fn installed(format: Format) -> Result<Version> {
         "package not fully installed or unsupported epoch"
     );
     arch(lines[2], format)?;
-    version(lines[1], format)
+    version(lines[1], system, true)
 }
 pub(super) fn inspect(path: &Path, release: &Release) -> Result<()> {
     release.verify(path)?;
@@ -119,7 +119,7 @@ pub(super) fn inspect(path: &Path, release: &Release) -> Result<()> {
         "invalid update package metadata"
     );
     ensure!(
-        lines[0] == "pier-agent" && version(lines[1], release.format)? == release.package,
+        lines[0] == "pier-agent" && version(lines[1], &release.system, false)? == release.package,
         "update package name or version mismatch"
     );
     arch(lines[2], release.format)?;
@@ -192,15 +192,30 @@ mod tests {
     use super::*;
     #[test]
     fn native_versions_reject_epochs_foreign_releases_and_invalid_revisions() {
-        assert_eq!(version("1.2.3-12.el8", Format::Rpm).unwrap().revision, 12);
-        assert_eq!(version("1.2.3-2", Format::Deb).unwrap().version, "1.2.3");
-        for (s, f) in [
-            ("1:1.2.3-1", Format::Deb),
-            ("1.2.3-1.el9", Format::Rpm),
-            ("1.2.3-0", Format::Deb),
-            ("1.2.3-foo", Format::Deb),
+        for (s, system) in [
+            ("1.2.3-12.el8", "almalinux8"),
+            ("1.2.3-12.el9", "almalinux9"),
+            ("1.2.3-12.ubuntu24.04", "ubuntu24.04"),
         ] {
-            assert!(version(s, f).is_err());
+            assert_eq!(version(s, system, false).unwrap().revision, 12);
+        }
+        assert_eq!(
+            version("1.2.3-2", "ubuntu24.04", true).unwrap().version,
+            "1.2.3"
+        );
+        assert!(version("1.2.3-2", "ubuntu24.04", false).is_err());
+        for (s, system) in [
+            ("1:1.2.3-1", "ubuntu24.04"),
+            ("1.2.3-1.el9", "almalinux8"),
+            ("1.2.3-1.el8", "almalinux9"),
+            ("1.2.3-1.ubuntu22.04", "ubuntu24.04"),
+            ("1.2.3-1.el9", "ubuntu24.04"),
+            ("1.2.3-0", "ubuntu24.04"),
+            ("1.2.3-foo", "ubuntu24.04"),
+            ("1.2.3-01.el9", "almalinux9"),
+            ("1.2.3-18446744073709551616.el9", "almalinux9"),
+        ] {
+            assert!(version(s, system, true).is_err());
         }
     }
 }

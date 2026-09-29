@@ -52,7 +52,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       PIER_ARCH: ${{ matrix.arch }}
       PACKAGE_REVISION: ${{ needs.metadata.outputs.revision }}
@@ -72,6 +72,15 @@ jobs:
             --revision "$PACKAGE_REVISION" --output target/release/agent 2>&1 | tee target/ci-logs/agent.log
           bash scripts/prepare-upgrade-fixtures.sh agent "$PIER_ARCH" "$UPGRADE_REVISION" \
             target/fixtures/agent 2>&1 | tee target/ci-logs/agent-fixtures.log
+      - name: Prepare Ubuntu legacy version migration fixture
+        run: |
+          mkdir -p target/fixtures/legacy-agent
+          version=$(python3 scripts/release.py version)
+          docker run --rm --pull=never --network=none --platform "linux/$PIER_ARCH" \
+            -v "$PWD:/src:ro" -v "$PWD/target/fixtures/legacy-agent:/out" \
+            "pier-agent-package-deb:$PIER_ARCH" python3 /src/scripts/prepare-legacy-agent-fixture.py \
+            "/src/target/release/agent/pier-agent_${version}-${PACKAGE_REVISION}.ubuntu24.04_${PIER_ARCH}.deb" /out \
+            2>&1 | tee target/ci-logs/agent-migration-fixture.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: packages-agent-${{ matrix.arch }}
@@ -86,6 +95,12 @@ jobs:
           path: |
             target/fixtures/agent/*.deb
             target/fixtures/agent/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fixtures-legacy-agent-${{ matrix.arch }}
+          path: target/fixtures/legacy-agent/*.deb
           if-no-files-found: error
           retention-days: 7
       - name: Save packaging logs
@@ -107,7 +122,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       PIER_ARCH: ${{ matrix.arch }}
       PACKAGE_REVISION: ${{ needs.metadata.outputs.revision }}
@@ -130,6 +145,10 @@ jobs:
           pattern: fixtures-agent-*
           path: target/fixtures/agent
           merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fixtures-legacy-agent-${{ matrix.arch }}
+          path: target/fixtures/legacy-agent
       - name: Build controller packages and upgrade fixtures
         run: |
           mkdir -p target/ci-logs
@@ -145,6 +164,7 @@ jobs:
           cp target/release/controller/*.deb target/release/controller/*.rpm target/native-packages/
           bash scripts/test-agent-auto-upgrade.sh "$PIER_ARCH" --revision "$PACKAGE_REVISION" \
             --packages target/native-packages --fixtures target/fixtures/controller \
+            --legacy-packages target/fixtures/legacy-agent \
             --logs target/ci-logs 2>&1 | tee target/ci-logs/native.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -165,7 +185,7 @@ jobs:
   assemble:
     needs: [metadata, controller]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       PACKAGE_REVISION: ${{ needs.metadata.outputs.revision }}
     steps:

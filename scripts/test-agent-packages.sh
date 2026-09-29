@@ -5,18 +5,13 @@ case "$pier_arch" in amd64|arm64) ;; *) exit 2 ;; esac
 pier_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 pier_controller="$pier_root/target/services-$pier_arch/debug/pier-controller"
 [ -f "$pier_controller" ] || { echo 'Run scripts/test-services.sh for this architecture first.' >&2; exit 2; }
-pier_version=$(python3 "$pier_root/scripts/release.py" version)
 pier_fixtures="$pier_root/target/package-upgrade-fixtures/$pier_arch"
 mkdir -p "$pier_fixtures"
-for pier_format in deb rpm; do
-  docker run --rm --pull=never --platform "linux/$pier_arch" \
-    -v "$pier_root:/src:ro" -v "$pier_root/target/agent-packages-$pier_arch/release:/binary:ro" -v "$pier_fixtures:/out" \
-    "pier-agent-package-$pier_format:$pier_arch" bash /src/scripts/package-agent-inner.sh "$pier_format" "$pier_version" 2 "$pier_arch"
-done
+bash "$pier_root/scripts/prepare-upgrade-fixtures.sh" agent "$pier_arch" 2 "$pier_fixtures"
 pier_container=
 cleanup() { if [ -n "$pier_container" ]; then docker rm -f "$pier_container" >/dev/null; fi; }
 trap cleanup EXIT
-for pier_distro in ubuntu2404 almalinux8; do
+for pier_distro in ubuntu2404 almalinux8 almalinux9; do
   docker build --platform "linux/$pier_arch" -f "$pier_root/docker/agent-test-$pier_distro.Dockerfile" \
     -t "pier-agent-test-$pier_distro:$pier_arch" --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg NO_PROXY "$pier_root"
   # Private PID and cgroup namespaces; no host data or host cgroup bind mounts.

@@ -89,13 +89,14 @@ if '--after-boot' in sys.argv:
 wait('systemd boot', lambda: pathlib.Path('/run/systemd/system').exists())
 assert not pathlib.Path('/usr/sbin/policy-rc.d').exists(), 'test image must allow normal package service hooks'
 if distro == 'ubuntu2404':
-    original = glob.glob('/src/dist/pier-agent_*-1_%s.deb' % arch)
-    upgrade = glob.glob('/src/target/package-upgrade-fixtures/%s/pier-agent_*-2_%s.deb' % (arch, arch))
+    original = glob.glob('/src/dist/pier-agent_*-1.ubuntu24.04_%s.deb' % arch)
+    upgrade = glob.glob('/src/target/package-upgrade-fixtures/%s/pier-agent_*-2.ubuntu24.04_%s.deb' % (arch, arch))
     installer = ['apt-get', 'install', '-y']
 else:
     rpm_arch = {'amd64':'x86_64', 'arm64':'aarch64'}[arch]
-    original = glob.glob('/src/dist/pier-agent-*-1.el8.%s.rpm' % rpm_arch)
-    upgrade = glob.glob('/src/target/package-upgrade-fixtures/%s/pier-agent-*-2.el8.%s.rpm' % (arch, rpm_arch))
+    rpm_dist = {'almalinux8': 'el8', 'almalinux9': 'el9'}[distro]
+    original = glob.glob('/src/dist/pier-agent-*-1.%s.%s.rpm' % (rpm_dist, rpm_arch))
+    upgrade = glob.glob('/src/target/package-upgrade-fixtures/%s/pier-agent-*-2.%s.%s.rpm' % (arch, rpm_dist, rpm_arch))
     # Runtime dependencies are installed by the test image; test the local RPM
     # without refreshing remote repository metadata on every container boot.
     installer = ['dnf', '--disablerepo=*', 'install', '-y']
