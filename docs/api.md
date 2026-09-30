@@ -22,7 +22,7 @@ COOKIE_JAR=$(mktemp)
 
 有 JSON 请求体时须发送 `Content-Type: application/json`。请求对象拒绝未知字段；绑定和镜像映射拒绝重复键。绑定变量通常为字符串，PATCH 绑定允许用 `null` 移除已保存值。
 
-业务接口成功返回 **HTTP 200**，包括创建部署；退出和修改密码返回 **204**。除制品下载和 204 外，成功响应为 JSON。响应设置 `Cache-Control: no-store` 与 `X-Content-Type-Options: nosniff`。
+业务接口成功返回 **HTTP 200**，包括创建部署和终端；退出和修改密码返回 **204**，终端 WebSocket 握手返回 **101**。除制品下载、WebSocket 和 204 外，成功响应为 JSON。响应设置 `Cache-Control: no-store` 与 `X-Content-Type-Options: nosniff`。
 
 时间戳为 UTC Unix 秒数；可空字段返回 `null`。架构为 `amd64` 或 `arm64`，列表接口没有分页参数。示例中的 ID、commit、凭据和摘要需替换为实际值；示例源码地址也需按实际项目配置。
 
@@ -41,7 +41,7 @@ COOKIE_JAR=$(mktemp)
 | `403` | Origin 缺失/错误或 CSRF 错误，返回 `invalid origin` / `invalid csrf token` |
 | `404` | agent、绑定、部署、授权记录或制品不存在，返回 JSON 错误 |
 | `409` | 当前状态不允许操作，例如目录不可用、agent 离线或已有活动部署，返回 JSON 错误 |
-| `429` | 登录、初始化或改密达到限流，返回 `too many authentication attempts; retry later` |
+| `429` | 认证限流返回 `too many authentication attempts; retry later`；终端数量超限返回 `terminal limit reached` |
 | `500` | 内部操作失败，通常返回 `{"error":"internal operation failed"}`；同步工作线程失败返回 `{"error":"sync worker failed"}` |
 
 JSON 语法、字段类型、Content-Type、查询参数解码或请求体大小等错误由 Axum 拒绝，状态码及响应体采用框架格式，不能假定它们都有 `error` 字段。客户端应先检查状态码和 Content-Type。
@@ -67,6 +67,8 @@ JSON 语法、字段类型、Content-Type、查询参数解码或请求体大小
 | POST | `/v1/agents` | 管理员 Cookie | 手动注册 agent |
 | GET | `/v1/agents` | 管理员 Cookie | agent 列表 |
 | GET | `/v1/agents/{id}` | 管理员 Cookie | agent 状态 |
+| POST | `/v1/agents/{id}/apps/{instance}/terminals` | 管理员 Cookie、Origin、CSRF | 创建应用终端连接资格 |
+| GET | `/v1/terminals/{id}/ws` | 创建者 Cookie、同源 Origin | 一次性 WebSocket 连接 |
 | PUT | `/v1/agents/{id}/binding` | 管理员 Cookie | 替换 blueprint 绑定 |
 | GET | `/v1/agents/{id}/binding` | 管理员 Cookie | 绑定概要 |
 | POST | `/v1/deployments` | 管理员 Cookie | 创建异步部署 |
@@ -77,6 +79,41 @@ JSON 语法、字段类型、Content-Type、查询参数解码或请求体大小
 | GET | `/v1/artifacts/{deployment}/{app}` | 目标 agent | 下载部署包 |
 
 以下各节列出业务错误；公共鉴权错误和内部错误见上表。
+
+## 应用 Bash 终端
+
+### POST /v1/agents/{id}/apps/{instance}/terminals
+
+`instance` 使用 `report.apps[].instance`，不是应用显示名。请求体为 `{"cols":100,"rows":30}`，行列数均须为 1–500。agent 必须在线且声明 `report.capabilities` 包含 `app_terminal_v1`，旧 agent 可省略此字段。账户由 agent 根据实际安装状态验证，不接受指定用户名、命令、目录或环境变量。
+
+```json
+{
+  "id": "terminal-uuid",
+  "websocket_url": "/v1/terminals/terminal-uuid/ws",
+  "expires_at": 1790000030
+}
+```
+
+连接资格绑定创建时的 Web 登录会话、agent 控制连接和 app 实例，最长 30 秒有效，仅可使用一次；创建资格不会启动 Bash。每个 agent 最多 8 个终端，controller 最多 64 个，待连接资格也计入限额。应用不存在返回 `404`；离线、能力不支持或正在部署/升级返回 `409`；超限返回 `429`。
+
+### GET /v1/terminals/{id}/ws
+
+浏览器将相对地址转为同源 `wss://` URL，Cookie 自动携带，握手必须提供匹配公开地址的 `Origin`。此 GET 不需要 CSRF header，使用前一步经过 CSRF 校验的一次性资格；其他登录会话不能使用它。过期或重复连接返回 `409`，不同拥有者返回 `404`。握手后 agent 连接和 Bash 初始化分别有 10 秒超时。
+
+| 方向 | 帧 | 内容 |
+| --- | --- | --- |
+| 服务端 → 浏览器 | JSON 文本 | `{"type":"ready","user":"pier_...","home":"/var/lib/pier-agent/apps/.../data"}`，收到后才可输入 |
+| 浏览器 → 服务端 | 二进制 | 原始输入字节，UTF-8 文本或 Ctrl+C 等控制字符，每帧 1–32768 字节 |
+| 服务端 → 浏览器 | 二进制 | 原始 PTY 输出，每帧最多 32768 字节；交给终端模拟器，不按帧独立解码 UTF-8 |
+| 浏览器 → 服务端 | JSON 文本 | `{"type":"resize","cols":120,"rows":40}` |
+| 浏览器 → 服务端 | JSON 文本 | `{"type":"ack","bytes":1024}`，确认终端完成渲染的输出字节数，不能确认未收到的数据 |
+| 服务端 → 浏览器 | JSON 文本 | `{"type":"exit","code":0,"reason":"shell_exited"}`，`code` 可为空或省略 |
+
+控制文本最多 4096 字节；未确认输出最多 256 KiB，达到窗口后暂停读取 PTY。标准 WebSocket Ping/Pong 每 15 秒检查连接，45 秒未响应关闭。终端独立使用现有 agent TCP 端口上的 Noise 连接，不占用控制通道的数据队列。
+
+Bash 使用 app 的 UID/GID，以 `bash -il` 进入账户主目录，提供基础 `HOME/USER/LOGNAME/PATH/SHELL/TERM/LANG` 环境；不继承 agent 或应用服务的变量，Bash 自身仍读取正常的登录启动文件。应用自动重启保留终端；重新部署、回滚、agent 升级/停止、控制连接断开、关闭网页或 Web 登录失效都会结束会话。重连必须重新 POST 创建新 Bash。
+
+退出原因包括 `shell_exited`、`deployment_started`、`agent_upgrading`、`agent_stopping`、`terminal_unavailable`、`connection_lost`、`login_expired`、`session_revoked_or_agent_disconnected` 和 `connection_closed`。关闭通知可重复，客户端应幂等处理。服务端只记录会话元数据与原因，不保存输入输出；Bash 历史由用户配置决定。
 
 ## 账号与会话
 

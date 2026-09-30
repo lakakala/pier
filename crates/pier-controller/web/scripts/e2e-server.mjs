@@ -96,6 +96,37 @@ const proxy = https.createServer(
   },
 );
 proxy.listen(8444, '127.0.0.1');
+proxy.on('upgrade', (req, socket, head) => {
+  const upstream = http.request({
+    host: '127.0.0.1',
+    port: 18084,
+    path: req.url,
+    method: req.method,
+    headers: req.headers,
+  });
+  upstream.on('upgrade', (response, peer, upstreamHead) => {
+    socket.write(
+      `HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\n` +
+        Object.entries(response.headers)
+          .map(([key, value]) => `${key}: ${value}\r\n`)
+          .join('') +
+        '\r\n',
+    );
+    if (head.length) peer.write(head);
+    if (upstreamHead.length) socket.write(upstreamHead);
+    socket.pipe(peer).pipe(socket);
+    socket.on('error', () => peer.destroy());
+    peer.on('error', () => socket.destroy());
+    socket.on('close', () => peer.destroy());
+    peer.on('close', () => socket.destroy());
+  });
+  upstream.on('response', (response) => {
+    response.resume();
+    socket.end(`HTTP/1.1 ${response.statusCode} Rejected\r\nConnection: close\r\n\r\n`);
+  });
+  upstream.on('error', () => socket.destroy());
+  upstream.end();
+});
 let stopping = false;
 function stop() {
   if (stopping) return;

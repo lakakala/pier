@@ -70,11 +70,11 @@ struct Admin {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct WebSession {
-    digest: String,
-    username: String,
+    pub(crate) digest: String,
+    pub(crate) username: String,
     generation: String,
     csrf_token: String,
-    expires_at: u64,
+    pub(crate) expires_at: u64,
 }
 impl WebSession {
     fn public(&self) -> Value {
@@ -391,6 +391,7 @@ async fn login(
     }
     // A successful login rotates the browser's existing session.
     if let Some(token) = cookie_value(&headers) {
+        state.terminals.revoke_owner(&pier_protocol::hash(token));
         state
             .store
             .delete("web_sessions", &pier_protocol::hash(token))?;
@@ -412,6 +413,7 @@ pub(crate) async fn logout(
     let _lock = state.auth.lock.lock().unwrap();
     let session = state.authenticate(&headers)?;
     state.store.delete("web_sessions", &session.digest)?;
+    state.terminals.revoke_owner(&session.digest);
     Ok(cleared())
 }
 pub(crate) async fn password(
@@ -450,6 +452,7 @@ pub(crate) async fn password(
             ..admin
         },
     )?;
+    state.terminals.revoke_all();
     Ok(cleared())
 }
 

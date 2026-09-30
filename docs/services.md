@@ -66,6 +66,18 @@ sudo systemctl restart pier-agent
 
 手动执行包管理器安装仍不会在安装脚本中重启 agent；需要执行 `systemctl restart pier-agent`。DEB 附带仅针对本服务的 needrestart 设置。卸载停止两个单元并禁用主服务，保留配置、token、app 用户、部署数据与升级记录；DEB purge 同样保留这些运行数据。
 
+## 在 Web 中打开应用终端
+
+登录 controller，进入“服务器 → 服务器详情”，在已部署应用所在行点击“终端”，即可打开 app 系统用户的交互式 Bash。终端可全屏，支持 Tab 补全、Ctrl+C、复制粘贴和窗口缩放；顶部显示实际用户名与主目录。
+
+默认进入 app 用户的主目录（应用数据目录），使用基础 Shell 环境，不自动加载 `service.env` 或 app 声明的变量。账户保留 `nologin`，由 agent 验证身份后通过 PTY 启动 Bash，无需 SSH 配置或新端口。安装包显式依赖 Bash，应用发布目录保持原有权限。
+
+应用崩溃并被自动拉起时，终端继续保留。关闭终端只结束该终端的 Bash 和会话内作业；部署、回滚、agent 升级/停止、控制连接丢失或 Web 登录失效会结束关联终端，并显示原因。网络中断最长 45 秒检测，重连创建新会话，不恢复旧 Bash。
+
+每个 agent 最多 8 个终端，controller 最多 64 个。浏览器使用同源 WSS，agent 主动建立独立 Noise 连接，复用现有通信监听端口。HTTPS 反向代理须支持 WebSocket Upgrade，见 [Nginx 示例](../examples/services/controller.nginx.conf)。服务端不记录终端输入输出；Bash 历史由账户配置决定。
+
+新 controller 与旧 agent 继续使用协议 v2，原部署和自动升级流程不变；agent 升级并上报 `app_terminal_v1` 能力后启用终端按钮。接口及帧格式见 [应用终端 API](api.md#应用-bash-终端)。GitHub Actions 的六个平台安装测试覆盖真实 PTY、账户环境、流控和进程清理。
+
 ## Controller 安装与网页初始化
 
 controller 同样提供 DEB/RPM 和 amd64/arm64 两种架构，无需 `pier-controller init` 命令。

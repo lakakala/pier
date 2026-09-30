@@ -43,6 +43,8 @@ pub async fn connect(
     });
     let mut delay = 1;
     loop {
+        let terminals = tokio_util::sync::CancellationToken::new();
+        let _terminal_guard = terminals.clone().drop_guard();
         let session: Result<()> = async {
             let stream = pier_protocol::secure::connect(&config.controller_tcp, pier_protocol::secure::Purpose::Control, &config.agent_id, &pier_protocol::secure::token_key(&token)).await?;
             let mut stream = pier_protocol::framed(stream);
@@ -66,6 +68,15 @@ pub async fn connect(
                                 // Bounded queue avoids blocking heartbeat processing on builds.
                                 jobs_tx.try_send(plan).context("deployment queue full")?;
                             }
+                            Message::TerminalOpen { id, instance, cols, rows } => {
+                                let runtime = runtime.clone();
+                                let cancelled = terminals.child_token();
+                                tokio::spawn(async move {
+                                    if crate::terminal::serve(runtime, crate::terminal::Request { id, instance, cols, rows }, cancelled).await.is_err() {
+                                        tracing::debug!("app terminal closed");
+                                    }
+                                });
+                            }
                             _ => anyhow::bail!("unexpected controller message"),
                         }
                     }
@@ -84,6 +95,7 @@ pub async fn connect(
                 }
             }
         }.await;
+        terminals.cancel();
         if session.is_err() {
             tracing::warn!(
                 retry_seconds = delay,

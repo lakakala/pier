@@ -27,6 +27,7 @@ pub enum Purpose {
     Enrollment,
     EnrollmentAck,
     Upgrade,
+    Terminal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

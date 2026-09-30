@@ -48,6 +48,7 @@ export interface Agent {
     reason: string | null;
   };
   report: {
+    capabilities?: string[];
     deployment_id: string | null;
     apps: {
       instance: string;

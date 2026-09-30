@@ -146,3 +146,10 @@ pre {
     flex-direction: column;
   }
 }
+.app-terminal {
+  height: calc(100dvh - 270px);
+  min-height: 280px;
+  padding: 12px;
+  background: #101828;
+  border-radius: 8px;
+}

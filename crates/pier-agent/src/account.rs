@@ -158,9 +158,18 @@ fn processes(uid: u32) -> Result<Vec<i32>> {
 }
 /// Accounts are exclusive to this agent, verified before every recovery cleanup.
 pub fn cleanup(account: &Account) -> Result<()> {
+    cleanup_preserving(account, &[])
+}
+pub(crate) fn cleanup_preserving(account: &Account, sessions: &[i32]) -> Result<()> {
     verify(account)?;
     for round in 0..20 {
-        let pids = processes(account.uid)?;
+        let pids: Vec<_> = processes(account.uid)?
+            .into_iter()
+            .filter(|pid| {
+                !crate::terminal::process_identity(*pid)
+                    .is_some_and(|(sid, _)| sessions.contains(&sid))
+            })
+            .collect();
         if pids.is_empty() {
             return Ok(());
         }

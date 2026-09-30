@@ -1,12 +1,15 @@
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{Request, State},
     http::{Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 
-pub(crate) async fn serve(request: Request) -> Response {
+pub(crate) async fn serve(
+    State(state): State<std::sync::Arc<crate::Controller>>,
+    request: Request,
+) -> Response {
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -58,7 +61,11 @@ pub(crate) async fn serve(request: Request) -> Response {
     )
         .into_response();
     if page {
-        response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, format!("default-src 'none'; script-src 'self'; style-src 'self' 'nonce-{nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'").parse().unwrap());
+        let websocket_origin = state
+            .public_url()
+            .map(|origin| origin.replacen("https://", "wss://", 1))
+            .unwrap_or_default();
+        response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, format!("default-src 'none'; script-src 'self'; style-src 'self' 'nonce-{nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' {websocket_origin}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'").parse().unwrap());
     }
     response
 }

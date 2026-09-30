@@ -6,6 +6,7 @@ mod connection;
 mod enrollment;
 mod runtime;
 mod settings;
+mod terminal;
 mod upgrades;
 mod web;
 pub use runtime::RuntimeSettings;
@@ -131,8 +132,10 @@ impl Job {
 struct Session {
     id: String,
     sender: mpsc::Sender<Message>,
+    terminal: bool,
 }
 pub struct Controller {
+    terminals: terminal::Registry,
     _lock: fs::File,
     config: Config,
     store: Store,
@@ -176,6 +179,7 @@ impl Controller {
             }
         }
         Ok(Arc::new(Self {
+            terminals: terminal::Registry::default(),
             _lock: lock,
             upgrades: upgrades::Catalog::open(&config.state_dir),
             config,

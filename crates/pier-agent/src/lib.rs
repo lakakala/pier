@@ -7,6 +7,7 @@ pub mod init;
 mod network;
 mod supervisor;
 mod systemd;
+mod terminal;
 pub mod upgrade;
 
 use account::Account;
@@ -98,6 +99,7 @@ struct Completed {
 }
 
 pub struct Runtime {
+    terminals: Arc<terminal::Manager>,
     _lock: fs::File,
     config: Config,
     store: Store,
@@ -157,6 +159,7 @@ impl Runtime {
         );
         store.put("identity", "agent_id", &config.agent_id)?;
         let state = Arc::new(Self {
+            terminals: Arc::new(terminal::Manager::default()),
             _lock: lock,
             config,
             store,
@@ -229,7 +232,12 @@ impl Runtime {
     fn start(&self, installed: Installed, observe: bool) -> Result<()> {
         self.stopped()?;
         let instance = installed.instance.clone();
-        let supervisor = Supervisor::start(installed, self.config.runtime.clone(), observe);
+        let supervisor = Supervisor::start(
+            installed,
+            self.config.runtime.clone(),
+            observe,
+            self.terminals.clone(),
+        );
         self.active
             .lock()
             .unwrap()
@@ -290,6 +298,7 @@ impl Runtime {
             .map(|s| s.status.lock().unwrap().clone())
             .collect();
         Ok(AgentReport {
+            capabilities: vec![pier_protocol::terminal::CAPABILITY.into()],
             deployment_id: durable.snapshot.deployment_id,
             apps,
             result: durable.result,
@@ -297,6 +306,7 @@ impl Runtime {
     }
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.terminals.close_all("agent_stopping");
         // Stop running apps even if a deployment is waiting on a network read.
         self.stop_all();
         let _guard = self.operation.lock().unwrap();
@@ -319,6 +329,7 @@ impl Runtime {
             return Ok(false);
         }
         self.maintenance.store(true, Ordering::SeqCst);
+        self.terminals.close_all("agent_upgrading");
         Ok(true)
     }
 
@@ -367,6 +378,7 @@ impl Runtime {
                 "invalid artifact metadata"
             );
         }
+        self.terminals.close_all("deployment_started");
         let _ = self.events.send(Message::Progress {
             id: plan.id.clone(),
             phase: "downloading".into(),

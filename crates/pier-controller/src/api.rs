@@ -78,6 +78,11 @@ pub fn router(state: Arc<Controller>) -> Router {
         .route("/v1/agents", post(register).get(agents))
         .route("/v1/agents/{id}", get(agent))
         .route(
+            "/v1/agents/{id}/apps/{instance}/terminals",
+            post(crate::terminal::create),
+        )
+        .route("/v1/terminals/{id}/ws", get(crate::terminal::websocket))
+        .route(
             "/v1/agents/{id}/binding",
             put(bind).get(binding).patch(patch_binding),
         )

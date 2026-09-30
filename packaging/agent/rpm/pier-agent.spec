@@ -12,7 +12,7 @@ Source4: agent.yml
 Source5: api.md
 Source6: pier-agent-upgrade.service
 BuildRequires: systemd
-Requires: systemd, shadow-utils, glibc-common
+Requires: systemd, shadow-utils, glibc-common, bash
 %{?systemd_requires}
 
 %description

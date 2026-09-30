@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 const password = 'browser-password-123';
 async function login(page: Page, value = password) {
@@ -133,6 +133,93 @@ test.describe.serial('controller console over HTTPS', () => {
       page.getByText('installation failed; manual recovery required', { exact: true }),
     ).toBeVisible();
     await expect(page.getByRole('button', { name: '创建部署', exact: true })).toBeEnabled();
+  });
+  test('app terminal capability, input, resize, CSP and session disposal', async ({ page }) => {
+    await login(page);
+    let online = false;
+    let supported = false;
+    let active: WebSocketRoute | undefined;
+    let opened = 0;
+    let closed = 0;
+    const controls: { type: string; bytes?: number }[] = [];
+    const input: Buffer[] = [];
+    await page.route('**/v1/agents/terminal-test', (route) =>
+      route.fulfill({
+        json: {
+          id: 'terminal-test',
+          name: 'terminal-server',
+          online,
+          last_seen: null,
+          info: { hostname: 'terminal-host', architecture: 'amd64', os_release: 'Ubuntu 24.04' },
+          report: {
+            capabilities: supported ? ['app_terminal_v1'] : [],
+            deployment_id: null,
+            result: null,
+            apps: [
+              {
+                id: 'demo',
+                instance: 'demo-instance',
+                state: 'running',
+                pid: 123,
+                restarts: 0,
+                exit_code: null,
+              },
+            ],
+          },
+        },
+      }),
+    );
+    await page.route('**/v1/agents/terminal-test/apps/demo-instance/terminals', (route) => {
+      expect(route.request().headers()['x-csrf-token']).toBeTruthy();
+      expect(route.request().postDataJSON().cols).toBeGreaterThan(0);
+      return route.fulfill({ json: { websocket_url: `/v1/terminals/terminal-${opened}/ws` } });
+    });
+    await page.routeWebSocket('**/v1/terminals/*/ws', (socket) => {
+      active = socket;
+      opened++;
+      socket.onClose(() => closed++);
+      socket.onMessage((message) => {
+        if (typeof message === 'string') controls.push(JSON.parse(message));
+        else input.push(message);
+      });
+      socket.send(
+        JSON.stringify({
+          type: 'ready',
+          user: 'pier_demo',
+          home: '/var/lib/pier-agent/apps/demo/data',
+        }),
+      );
+      socket.send(Buffer.from('hello terminal\r\n'));
+    });
+    await page.goto('/agents/terminal-test');
+    await expect(page.getByRole('button', { name: '终端', exact: true })).toBeDisabled();
+    online = true;
+    await page.reload();
+    await expect(page.getByRole('button', { name: '终端', exact: true })).toBeDisabled();
+    supported = true;
+    await page.reload();
+    await page.getByRole('button', { name: '终端', exact: true }).click();
+    await expect(page.getByText('已连接', { exact: true })).toBeVisible();
+    await expect(page.getByText('pier_demo · /var/lib/pier-agent/apps/demo/data')).toBeVisible();
+    await page.locator('.xterm-helper-textarea').pressSequentially('echo test');
+    await page.locator('.xterm-helper-textarea').press('Enter');
+    await expect.poll(() => Buffer.concat(input).toString()).toContain('echo test\r');
+    await page.getByRole('button', { name: '全屏', exact: true }).click();
+    await expect.poll(() => controls.some((c) => c.type === 'resize')).toBe(true);
+    await expect.poll(() => controls.some((c) => c.type === 'ack' && c.bytes === 16)).toBe(true);
+    active!.send(JSON.stringify({ type: 'exit', reason: 'deployment_started' }));
+    active!.close();
+    await expect(page.getByText('开始重新部署，终端已关闭')).toBeVisible();
+    await page.getByRole('button', { name: '重新连接', exact: true }).click();
+    await expect.poll(() => opened).toBe(2);
+    await expect(page.getByText('已连接', { exact: true })).toBeVisible();
+    const before = closed;
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: /close|关闭/i })
+      .click();
+    await expect.poll(() => closed).toBeGreaterThan(before);
+    await expect(page.locator('.app-terminal')).toHaveCount(0);
   });
   test('repository, declarations, binding edits and deployment flow', async ({
     page,

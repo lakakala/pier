@@ -24,7 +24,12 @@ pub struct Supervisor {
     worker: Option<JoinHandle<()>>,
 }
 impl Supervisor {
-    pub fn start(installed: Installed, options: RuntimeOptions, observe: bool) -> Self {
+    pub fn start(
+        installed: Installed,
+        options: RuntimeOptions,
+        observe: bool,
+        terminals: Arc<crate::terminal::Manager>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(AppStatus {
             instance: installed.instance.clone(),
@@ -49,6 +54,7 @@ impl Supervisor {
                     &worker_stop,
                     &worker_status,
                     &worker_ready,
+                    &terminals,
                 );
                 if let Err(error) = &outcome {
                     tracing::warn!(instance=%installed.id, %error, "app process operation failed");
@@ -112,10 +118,11 @@ fn run_child(
     stop: &AtomicBool,
     status: &Mutex<AppStatus>,
     ready: &AtomicBool,
+    terminals: &crate::terminal::Manager,
 ) -> Result<Option<i32>> {
     account::verify(&installed.account)?;
     // Remove orphaned descendants before each restart as well as after agent crashes.
-    account::cleanup(&installed.account)?;
+    terminals.cleanup(&installed.account)?;
     let service = &installed.manifest.service;
     let mut command = Command::new(installed.release.join(&service.command[0]));
     command
@@ -182,7 +189,7 @@ fn run_child(
         }
         thread::sleep(Duration::from_millis(50));
     };
-    let _ = account::cleanup(&installed.account);
+    let _ = terminals.cleanup(&installed.account);
     output_stop.store(true, Ordering::SeqCst);
     let _ = out.join();
     let _ = err.join();

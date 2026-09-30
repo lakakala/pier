@@ -36,6 +36,7 @@ import {
 } from './api';
 import { ErrorBox, Heading, Loading, StateTag, useLoad, Variables } from './components';
 import type { RuntimeView } from './runtime-settings';
+import { AppTerminal } from './terminal';
 
 type RepositoryInfo = {
   repository: { url: string; reference: string } | null;
@@ -759,6 +760,12 @@ export function AgentDetail() {
             { title: 'PID', dataIndex: 'pid' },
             { title: '重启次数', dataIndex: 'restarts' },
             { title: '退出码', dataIndex: 'exit_code' },
+            {
+              title: '操作',
+              render: (_, app) => (
+                <AppTerminal agent={value} instance={app.instance} name={app.id} />
+              ),
+            },
           ]}
         />
         {value.report.result && (

@@ -8,7 +8,7 @@ Rules-Requires-Root: no
 
 Package: pier-agent
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, systemd, passwd, libc-bin
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd, passwd, libc-bin, bash
 Description: Pier deployment agent and application supervisor
  Receives encrypted deployments from pier-controller and supervises applications
  under individual system accounts. Run sudo pier-agent init after installation.

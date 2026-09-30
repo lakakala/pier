@@ -150,7 +150,7 @@ assert pathlib.Path('/etc/pier/controller.yml').stat().st_gid == account.pw_gid
 command('systemd-analyze', 'verify', '/usr/lib/systemd/system/pier-controller.service')
 command('openssl', 'req', '-x509', '-nodes', '-newkey', 'rsa:2048', '-days', '1', '-subj', '/CN=localhost',
     '-addext', 'subjectAltName=DNS:localhost', '-keyout', str(root / 'key.pem'), '-out', str(root / 'cert.pem'))
-pathlib.Path('/etc/nginx/conf.d/pier-controller-test.conf').write_text('server { listen 8443 ssl; server_name localhost; ssl_certificate %s/cert.pem; ssl_certificate_key %s/key.pem; location / { proxy_pass http://127.0.0.1:8080; proxy_set_header Host $http_host; } }\n' % (root, root))
+pathlib.Path('/etc/nginx/conf.d/pier-controller-test.conf').write_text('server { listen 8443 ssl; server_name localhost; ssl_certificate %s/cert.pem; ssl_certificate_key %s/key.pem; location / { proxy_pass http://127.0.0.1:8080; proxy_set_header Host $http_host; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; } }\n' % (root, root))
 command('systemctl', 'enable', '--now', 'nginx', 'pier-controller')
 # Base images can already have Nginx enabled when PID 1 starts. Apply the
 # freshly written HTTPS test configuration even when the service is running.
@@ -175,7 +175,7 @@ repo = root / 'repository'
 (repo / 'apps/demo').mkdir(parents=True)
 (repo / 'blueprints/demo').mkdir(parents=True)
 recipe = repo / 'apps/demo/pier-pkg.yml'
-recipe.write_text('schema: 2\nname: demo\nversion: "1"\nsource: {type: binary, url: "http://127.0.0.1:%s/program", format: raw}\nfiles: [{from: download, to: bin/demo, executable: true}]\nservice: {command: [bin/demo]}\n' % source.server_port)
+recipe.write_text('schema: 2\nname: demo\nversion: "1"\nsource: {type: binary, url: "http://127.0.0.1:%s/program", format: raw}\nfiles: [{from: download, to: bin/demo, executable: true}]\nservice: {command: [bin/demo], env: {TERMINAL_TEST_SECRET: app-only}}\n' % source.server_port)
 (repo / 'blueprints/demo/pier-blueprint.yml').write_text('schema: 1\nname: demo\napps: [{id: demo, app: apps/demo}]\n')
 git(repo, 'init', '-q', '-b', 'main'); commit(repo)
 command('chown', '-R', 'pier-controller:pier-controller', str(repo))
@@ -234,6 +234,9 @@ if auto_upgrade and distro == 'ubuntu2404':
     assert checksum('/etc/pier/agent.yml') == agent_config_before
     assert checksum('/etc/pier/agent.token') == token_before
     print('PASS %s/%s: manual migration from numeric DEB revision preserves configuration and identity' % (distro, arch), flush=True)
+from terminal_package_checks import run_terminal_checks
+job, csrf = run_terminal_checks(api, jar, root, agent_path, wait, deploy)
+jar.save(ignore_discard=True)
 old_pid = pid()
 config_hash = checksum('/etc/pier/controller.yml')
 command(*(installer + upgrade))
@@ -418,7 +421,7 @@ source_repo = root / 'source'
 source_repo.mkdir(); (source_repo / 'program.sh').write_bytes(program)
 git(source_repo, 'init', '-q', '-b', 'main'); commit(source_repo)
 command('chown', '-R', 'pier-controller:pier-controller', str(source_repo))
-recipe.write_text('schema: 2\nname: demo\nversion: "2"\nsource: {type: git, repo: "%s", ref: main}\nbuild: {language: rust, commands: ["cp program.sh /output/demo"]}\nfiles: [{from: demo, to: bin/demo, executable: true}]\nservice: {command: [bin/demo]}\n' % source_repo)
+recipe.write_text('schema: 2\nname: demo\nversion: "2"\nsource: {type: git, repo: "%s", ref: main}\nbuild: {language: rust, commands: ["cp program.sh /output/demo"]}\nfiles: [{from: demo, to: bin/demo, executable: true}]\nservice: {command: [bin/demo], env: {TERMINAL_TEST_SECRET: app-only}}\n' % source_repo)
 commit(repo)
 assert api('GET', '/v1/repository')['commit'] == head
 api('POST', '/v1/repository/sync', {})

@@ -1,6 +1,7 @@
 pub mod enrollment;
 pub mod secure;
 pub mod store;
+pub mod terminal;
 pub mod upgrade;
 
 use anyhow::{Result, bail};
@@ -60,6 +61,8 @@ pub struct AppStatus {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentReport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     pub deployment_id: Option<String>,
     pub apps: Vec<AppStatus>,
     pub result: Option<DeploymentResult>,
@@ -101,6 +104,12 @@ pub enum Message {
     },
     Ping,
     Pong,
+    TerminalOpen {
+        id: String,
+        instance: String,
+        cols: u16,
+        rows: u16,
+    },
     Deploy {
         plan: DeploymentPlan,
     },

@@ -134,6 +134,9 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
             .await?;
         }
         Purpose::Control => (),
+        Purpose::Terminal => {
+            return crate::terminal::attach(&state, &prelude.id, stream).await;
+        }
     }
     let Message::Hello {
         version,
@@ -178,6 +181,10 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
     else {
         anyhow::bail!("initial report required");
     };
+    let terminal = initial
+        .capabilities
+        .iter()
+        .any(|v| v == pier_protocol::terminal::CAPABILITY);
     report(&state, &agent_id, initial)?;
     let session_id = pier_protocol::new_id();
     let (sender, mut receiver) = mpsc::channel(8);
@@ -189,6 +196,7 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
             Session {
                 id: session_id.clone(),
                 sender,
+                terminal,
             },
         );
     }
@@ -228,6 +236,7 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
         }
         #[allow(unreachable_code)] Ok::<(),anyhow::Error>(())
     }.await;
+    state.terminals.disconnect_agent(&agent_id, &session_id);
     let mut sessions = state.sessions.lock().unwrap();
     if sessions.get(&agent_id).is_some_and(|s| s.id == session_id) {
         sessions.remove(&agent_id);
