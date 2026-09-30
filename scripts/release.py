@@ -14,7 +14,7 @@ import tarfile
 import tempfile
 import tomllib
 
-from native_packages import ARCHITECTURES, SYSTEMS, filename_system, tool_image
+from native_packages import ARCHITECTURES, SYSTEMS, build_matrix, filename_system, tool_image
 
 ROOT = Path(__file__).resolve().parent.parent
 NUMBER = r'(?:0|[1-9][0-9]*)'
@@ -232,7 +232,7 @@ def publish(source, meta, repository, commit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['version', 'metadata', 'resolve', 'assemble', 'publish'])
+    parser.add_argument('command', choices=['version', 'matrix', 'metadata', 'resolve', 'assemble', 'publish'])
     version_args = parser.add_mutually_exclusive_group()
     version_args.add_argument('--tag', default='')
     version_args.add_argument('--revision', default='1')
@@ -242,6 +242,13 @@ def main():
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     try:
+        if args.command == 'matrix':
+            value = json.dumps(build_matrix(), separators=(',', ':'))
+            print(value)
+            if os.environ.get('GITHUB_OUTPUT'):
+                with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                    output.write('matrix=' + value + '\n')
+            return
         if args.command == 'version':
             print(service_version(ROOT))
             return

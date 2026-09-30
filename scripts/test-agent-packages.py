@@ -22,6 +22,7 @@ import urllib.request
 assert os.geteuid() == 0 and pathlib.Path('/.dockerenv').exists(), 'disposable root container required'
 assert pathlib.Path('/proc/1/comm').read_text().strip() == 'systemd', 'systemd must be PID 1'
 distro, arch = sys.argv[1:3]
+fixtures_dir = os.environ['PIER_TEST_FIXTURES']
 os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
 META = pathlib.Path('/var/lib/pier-package-test.json')
 
@@ -90,13 +91,13 @@ wait('systemd boot', lambda: pathlib.Path('/run/systemd/system').exists())
 assert not pathlib.Path('/usr/sbin/policy-rc.d').exists(), 'test image must allow normal package service hooks'
 if distro == 'ubuntu2404':
     original = glob.glob('/src/dist/pier-agent_*-1.ubuntu24.04_%s.deb' % arch)
-    upgrade = glob.glob('/src/target/package-upgrade-fixtures/%s/pier-agent_*-2.ubuntu24.04_%s.deb' % (arch, arch))
+    upgrade = glob.glob(fixtures_dir + '/pier-agent_*-2.ubuntu24.04_%s.deb' % arch)
     installer = ['apt-get', 'install', '-y']
 else:
     rpm_arch = {'amd64':'x86_64', 'arm64':'aarch64'}[arch]
     rpm_dist = {'almalinux8': 'el8', 'almalinux9': 'el9'}[distro]
     original = glob.glob('/src/dist/pier-agent-*-1.%s.%s.rpm' % (rpm_dist, rpm_arch))
-    upgrade = glob.glob('/src/target/package-upgrade-fixtures/%s/pier-agent-*-2.%s.%s.rpm' % (arch, rpm_dist, rpm_arch))
+    upgrade = glob.glob(fixtures_dir + '/pier-agent-*-2.%s.%s.rpm' % (rpm_dist, rpm_arch))
     # Runtime dependencies are installed by the test image; test the local RPM
     # without refreshing remote repository metadata on every container boot.
     installer = ['dnf', '--disablerepo=*', 'install', '-y']

@@ -12,4 +12,4 @@ versions = subprocess.check_output(['readelf', '--version-info', binary], univer
 limit = {'almalinux8': (2, 28), 'almalinux9': (2, 34), 'ubuntu24.04': (2, 39)}[system]
 for version in re.findall(r'\bGLIBC_(\d+(?:\.\d+)+)\b', versions):
     if tuple(map(int, version.split('.'))) > limit:
-        sys.exit('ELF requires GLIBC_%s; %s requires <= %s. Use the AlmaLinux 8 Rust builder for all supported systems.' % (version, system, '.'.join(map(str, limit))))
+        sys.exit('ELF requires GLIBC_%s; %s requires <= %s. Use a Rust builder matching the requested target system.' % (version, system, '.'.join(map(str, limit))))

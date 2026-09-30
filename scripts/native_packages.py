@@ -11,6 +11,15 @@ NUMBER = r'(?:0|[1-9][0-9]*)'
 NATIVE_VERSION = re.compile(rf'({NUMBER}\.{NUMBER}\.{NUMBER})-([1-9][0-9]*)(\.ubuntu24\.04|\.el8|\.el9)')
 
 
+def build_matrix():
+    """One native build per release system and architecture on GitHub runners."""
+    return {'include': [
+        {'system': system, 'arch': arch, 'format': target[0],
+         'runner': 'ubuntu-24.04' if arch == 'amd64' else 'ubuntu-24.04-arm'}
+        for system, target in SYSTEMS.items() for arch in ARCHITECTURES
+    ]}
+
+
 def parse_version(value, fmt):
     match = NATIVE_VERSION.fullmatch(value)
     if match is None:

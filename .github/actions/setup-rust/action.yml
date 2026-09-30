@@ -8,6 +8,12 @@ runs:
       run: |
         version=$(sed -n 's/^ARG RUST_VERSION=//p' docker/rust-almalinux8.Dockerfile)
         [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+        for dockerfile in docker/rust-almalinux9.Dockerfile docker/rust-ubuntu2404.Dockerfile; do
+          [ "$(sed -n 's/^ARG RUST_VERSION=//p' "$dockerfile")" = "$version" ] || {
+            echo "Rust version differs in $dockerfile" >&2
+            exit 1
+          }
+        done
         rustup toolchain install "$version" --profile minimal --component rustfmt --component clippy
         echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"

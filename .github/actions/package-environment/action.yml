@@ -1,15 +1,35 @@
 name: Set up native package build
-description: Prepare Docker, the AlmaLinux builder and architecture-specific Cargo caches
+description: Prepare Docker, the target system builder and isolated Cargo caches
 inputs:
+  system:
+    description: Target system (ubuntu24.04, almalinux8 or almalinux9)
+    required: true
   arch:
     description: Target architecture (amd64 or arm64)
     required: true
   service:
     description: Service being compiled (agent or controller)
     required: true
+outputs:
+  image:
+    description: Rust builder image for the selected target system
+    value: ${{ steps.target.outputs.image }}
 runs:
   using: composite
   steps:
+    - id: target
+      shell: bash
+      env:
+        PIER_SYSTEM: ${{ inputs.system }}
+        PIER_ARCH: ${{ inputs.arch }}
+        PIER_SERVICE: ${{ inputs.service }}
+      run: |
+        case "$PIER_ARCH" in amd64|arm64) ;; *) exit 2 ;; esac
+        case "$PIER_SERVICE" in agent|controller) ;; *) exit 2 ;; esac
+        source scripts/package-target.sh
+        pier_package_target "$PIER_SYSTEM"
+        echo "image=$pier_builder_image" >> "$GITHUB_OUTPUT"
+        echo "dockerfile=$pier_builder_dockerfile" >> "$GITHUB_OUTPUT"
     - uses: ./.github/actions/setup-rust
     - uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5
       with:
@@ -19,27 +39,29 @@ runs:
     - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
       with:
         context: .
-        file: docker/rust-almalinux8.Dockerfile
+        file: ${{ steps.target.outputs.dockerfile }}
         platforms: linux/${{ inputs.arch }}
-        tags: pier-builder-rust:almalinux8
+        tags: ${{ steps.target.outputs.image }}
         load: true
         provenance: false
-        cache-from: type=gha,scope=pier-rust-almalinux8-${{ inputs.arch }}
-        cache-to: type=gha,mode=max,scope=pier-rust-almalinux8-${{ inputs.arch }}
+        cache-from: type=gha,scope=pier-rust-${{ inputs.system }}-${{ inputs.arch }}
+        cache-to: type=gha,mode=max,scope=pier-rust-${{ inputs.system }}-${{ inputs.arch }}
     - id: image
       shell: bash
       env:
         PIER_ARCH: ${{ inputs.arch }}
+        PIER_IMAGE: ${{ steps.target.outputs.image }}
       run: |
-        image_id=$(docker image inspect --platform "linux/$PIER_ARCH" --format '{{.Id}}' pier-builder-rust:almalinux8)
+        image_id=$(docker image inspect --platform "linux/$PIER_ARCH" --format '{{.Id}}' "$PIER_IMAGE")
+        [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
         echo "id=${image_id#sha256:}" >> "$GITHUB_OUTPUT"
     - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
       with:
         path: |
-          target/${{ inputs.service }}-builds/${{ inputs.arch }}
-          target/${{ inputs.service }}-packages-cache-${{ inputs.arch }}
-        key: native-${{ inputs.service }}-${{ inputs.arch }}-${{ steps.image.outputs.id }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          target/${{ inputs.service }}-builds/${{ inputs.system }}/${{ inputs.arch }}/${{ steps.image.outputs.id }}
+          target/${{ inputs.service }}-packages-cache/${{ inputs.system }}/${{ inputs.arch }}/${{ steps.image.outputs.id }}
+        key: native-${{ inputs.service }}-${{ inputs.system }}-${{ inputs.arch }}-${{ steps.image.outputs.id }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
         restore-keys: |
-          native-${{ inputs.service }}-${{ inputs.arch }}-${{ steps.image.outputs.id }}-${{ hashFiles('Cargo.lock') }}-
+          native-${{ inputs.service }}-${{ inputs.system }}-${{ inputs.arch }}-${{ steps.image.outputs.id }}-${{ hashFiles('Cargo.lock') }}-
     - shell: bash
       run: cargo fetch --locked

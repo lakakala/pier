@@ -2,7 +2,7 @@
 
 本仓库现为 Rust workspace：`pier-pkg` 保持为打包库，新增 `pier-controller` 和 `pier-agent` 两个服务。controller 从 Git 读取 app/blueprint，通过 React + Ant Design 控制台和 API 管理部署；agent 使用独立系统用户运行 app，自行守护进程并处理整组回退。controller 和 agent 均提供 DEB/RPM。controller 的 YAML 只保留 Web 监听地址和数据目录；首次访问 `/init` 创建管理员，配置仓库、agent 通信和构建参数，立即生效。后续在控制器设置页修改运行参数并手动重启，定义仓库仅手动同步。管理 API 使用 Cookie 会话。配置和运行说明见 [服务部署文档](docs/services.md)，HTTP 接口见 [controller API 文档](docs/api.md)。
 
-agent/controller 共用根 `Cargo.toml` 的 `[workspace.package].version`。每次推送 `master`，GitHub Actions 自动构建十二个 DEB/RPM 包及 `SHA256SUMS`，验证后创建标签并发布 GitHub Release，无需手动打标签。相同 Cargo 版本依次发布为 `vX.Y.Z`、`vX.Y.Z-r1`、`vX.Y.Z-r2`，对应安装包修订号 `1`、`2`、`3`。详见 [构建与发布说明](docs/services.md#github-actions-构建与发布)。
+agent/controller 共用根 `Cargo.toml` 的 `[workspace.package].version`。每次推送 `master`，GitHub Actions 自动构建十二个 DEB/RPM 包及 `SHA256SUMS`，agent、controller 各按三个系统和两种架构展开六个独立任务，在对应系统容器中编译和测试，验证后创建标签并发布 GitHub Release，无需手动打标签。相同 Cargo 版本依次发布为 `vX.Y.Z`、`vX.Y.Z-r1`、`vX.Y.Z-r2`，对应安装包修订号 `1`、`2`、`3`。详见 [构建与发布说明](docs/services.md#github-actions-构建与发布)。
 
 `pier-agent` 提供 Ubuntu 24.04 的 DEB 包和 AlmaLinux 8/9 的 RPM 包，支持两种架构。安装后执行 `sudo pier-agent init`，按交互向导在 controller 网页授权，完成后自动启用 systemd 服务。agent 在握手时检查 controller 内置的原生包，自动下载并在部署空闲后升级、重启；只升级更高版本，失败后暂停该目标并手动恢复。通信与安装包下载使用 Noise 加密，重启时应用会短暂中断。旧 Ubuntu agent 需手动安装一次带 `.ubuntu24.04` 版本后缀的新包并重启，随后继续自动升级。EL8/EL9 包分别使用 `.el8`/`.el9`；服务安装包及其安装验证全部由 GitHub Actions 生成和执行。
 
@@ -166,7 +166,7 @@ database_host = {{ DB_HOST | tojson }}
 
 ## 构建镜像与 QEMU
 
-基础镜像是 `almalinux:8.10` 和 `ubuntu:24.04`。按语言和发行版提供四个**独立 Dockerfile**，每个文件直接声明基础镜像、系统依赖和工具链安装步骤。没有 Bake 配置或共享安装模板。镜像内使用**目标架构的原生 GCC/系统库**。默认 Rust `1.98.1`、Go `1.27.1`，通过构建参数可更改。自定义服务可以使用自己的兼容镜像；发布时建议固定镜像 digest。
+基础镜像为 `almalinux:8.10`、`almalinux:9.8` 和 `ubuntu:24.04`。Rust 提供三个系统的编译镜像，Go 提供 AlmaLinux 8、Ubuntu 24.04 编译镜像，共五个**独立 Dockerfile**，每个文件直接声明基础镜像、系统依赖和工具链安装步骤。没有 Bake 配置或共享安装模板。镜像内使用**目标架构的原生 GCC/系统库**。默认 Rust `1.98.1`、Go `1.27.1`，通过构建参数可更改。自定义服务可以使用自己的兼容镜像；发布时建议固定镜像 digest。
 
 Linux Docker Engine 执行异架构容器需要 QEMU/binfmt。管理员可参照 [Docker 官方文档](https://docs.docker.com/build/building/multi-platform/) 安装，例如在 amd64 上启用 arm64：
 
@@ -181,6 +181,7 @@ docker run --rm --platform linux/arm64 ubuntu:24.04 uname -m
 
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64 -f docker/rust-almalinux8.Dockerfile -t pier-builder-rust:almalinux8 --load .
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/rust-almalinux9.Dockerfile -t pier-builder-rust:almalinux9 --load .
 docker buildx build --platform linux/amd64,linux/arm64 -f docker/rust-ubuntu2404.Dockerfile -t pier-builder-rust:ubuntu24.04 --load .
 docker buildx build --platform linux/amd64,linux/arm64 -f docker/go-almalinux8.Dockerfile -t pier-builder-go:almalinux8 --load .
 docker buildx build --platform linux/amd64,linux/arm64 -f docker/go-ubuntu2404.Dockerfile -t pier-builder-go:ubuntu24.04 --load .
@@ -188,7 +189,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -f docker/go-ubuntu2404.D
 
 此命令需要支持多平台镜像存储的 Docker（如启用 containerd image store）。若构建阶段需要调用方的代理，可按实际环境变量名称加 `--build-arg http_proxy --build-arg https_proxy --build-arg no_proxy`（使用大写变量时改为对应大写名称）。镜像拉取代理仍由 daemon 单独设置。修改 Go 版本时应一并更新 Dockerfile 中的两个官方 SHA-256 构建参数。
 
-镜像名：`pier-builder-rust:almalinux8`、`pier-builder-rust:ubuntu24.04`、`pier-builder-go:almalinux8`、`pier-builder-go:ubuntu24.04`。
+镜像名：`pier-builder-rust:almalinux8`、`pier-builder-rust:almalinux9`、`pier-builder-rust:ubuntu24.04`、`pier-builder-go:almalinux8`、`pier-builder-go:ubuntu24.04`。
 
 运行构建时，库选择 `--platform linux/amd64` 或 `linux/arm64`，校验容器 `uname -m`，以宿主 UID/GID 执行命令。源码挂载 `/src`，产物写 `/output`；命令在同一 `/bin/sh -ec` 中执行。提供 `PIER_ARCH`（如 `arm64`）、`PIER_TARGET`（如 `linux/arm64`）、`PIER_RUST_TARGET`、`PIER_OUTPUT`；Rust 配置 `CARGO_BUILD_TARGET`，Go 配置 `GOOS/GOARCH`、默认 `CGO_ENABLED=0`。这些变量为保留字段，不能通过 `build.env` 覆盖。
 

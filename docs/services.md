@@ -159,7 +159,7 @@ version = "0.1.0"
 
 整个发布流程使用固定并发组串行执行，`queue: max` 保留最多 100 个等待运行的任务，避免后续推送取消已排队构建。超出队列容量时 GitHub 会取消新增等待任务；执行顺序以进入并发队列的顺序为准，不保证提交顺序。每次发布始终使用该次触发提交的 SHA，标签不会指向构建期间后来推送的提交。相关机制见 [GitHub 并发队列说明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)。当前 actionlint 版本尚不识别 `queue`，检查脚本仅忽略这一条语法诊断，其他检查正常执行。
 
-流程先构建两种架构的六个 agent 包，再交给两个 controller 任务制作内嵌升级 bundle。每个 controller 任务在 Ubuntu 24.04、AlmaLinux 8、AlmaLinux 9 的临时 systemd 容器内验证安装、部署、重启及自动升级；测试包使用下一修订号，与正式包分开保存。汇总任务校验十二个包的原生元数据、controller 内嵌包与正式 agent 包的一致性，最后生成统一的 `SHA256SUMS`。
+流程先由六个 agent 任务分别编译、打包一个目标系统和架构，再交给六个 controller 任务制作内嵌升级 bundle。每个 controller 任务独立编译自身平台的二进制，并只在该系统、该架构的临时 systemd 容器内验证安装、部署、重启及自动升级；测试包使用下一修订号，与正式包分开保存。汇总任务校验十二个包的原生元数据、controller 内嵌包与正式 agent 包的一致性，最后生成统一的 `SHA256SUMS`。
 
 构建完成后，可在运行页面下载 **pier-packages** artifact（保留 30 天）。发布任务再次校验附件和版本占用情况，原子创建指向触发提交的标签，将十二个 DEB/RPM 和校验文件上传到同名草稿 Release，附件齐全后才公开并设为 Latest（包括 `-rN` 发布）。已有标签、Release 或草稿均不覆盖。
 
@@ -170,7 +170,7 @@ version = "0.1.0"
 sha256sum --check SHA256SUMS
 ```
 
-任一检查失败都会阻止正式发布。任务日志可在 Actions 查看，打包日志、systemd 日志与浏览器失败诊断会保留为独立 artifact（7 天）。前端资源仍纳管在 `web/dist`；构建一致性检查失败时，先在前端目录执行 `npm ci && npm run build`，提交更新后重试。Rust 工具链与构建 Dockerfile 保持一致，Cargo 和 npm 使用锁文件，原生编译缓存按服务、架构及实际镜像 ID 隔离。
+任一检查失败都会阻止正式发布。任务日志可在 Actions 查看，打包日志、systemd 日志与浏览器失败诊断会保留为独立 artifact（7 天）。前端资源仍纳管在 `web/dist`；构建一致性检查失败时，先在前端目录执行 `npm ci && npm run build`，提交更新后重试。Rust 工具链与构建 Dockerfile 保持一致，Cargo 和 npm 使用锁文件，原生编译缓存按服务、目标系统、架构及实际镜像 ID 隔离。
 
 版本分配任务和发布任务使用 `GITHUB_TOKEN` 的 `contents: write` 权限，分别用于读取完整草稿历史和创建标签、Release；其余任务只读。默认使用 `master` 作为发布分支，仓库需允许执行 Actions 和使用此令牌创建标签及 Release。app 的源码/二进制 tar.gz 打包仍由 `pier-pkg` 与 controller 执行。
 
@@ -178,7 +178,17 @@ sha256sum --check SHA256SUMS
 
 服务安装包的编译、打包与安装验证全部在 GitHub Actions 执行，安装包从 Release 或 `pier-packages` artifact 获取。仓库中的打包、测试夹具和发布脚本是工作流内部组件，不需要在本地准备 Docker、QEMU 或安装包。
 
-Actions 为 amd64、arm64 分别使用原生 runner，每种架构在 AlmaLinux 8 Rust 镜像内编译一次，再使用 Ubuntu 24.04、AlmaLinux 8、AlmaLinux 9 的独立 Dockerfile 生成三个原生包。EL9 打包与测试镜像使用 `almalinux:9.8`。安装镜像依赖前刷新软件源索引；编译缓存按服务、架构及实际镜像 ID 隔离。ELF 校验要求 GLIBC 不超过 EL8 的 2.28、EL9 的 2.34、Ubuntu 24.04 的 2.39，原生打包工具同时生成动态库依赖。
+Actions 按目标系统和架构拆分：agent、controller 各有六个任务，例如 `agent (almalinux8, amd64)`、`agent (almalinux9, arm64)`、`controller (ubuntu24.04, amd64)`。amd64 使用 GitHub 的 `ubuntu-24.04` runner，arm64 使用 `ubuntu-24.04-arm` runner；任务名称显示容器内实际编译、打包和测试的目标系统。
+
+| 目标系统 | Rust 编译镜像 | 安装包 |
+| --- | --- | --- |
+| Ubuntu 24.04 | `pier-builder-rust:ubuntu24.04`，基于 `ubuntu:24.04` | `.ubuntu24.04` DEB |
+| AlmaLinux 8 | `pier-builder-rust:almalinux8`，基于 `almalinux:8.10` | `.el8` RPM |
+| AlmaLinux 9 | `pier-builder-rust:almalinux9`，基于 `almalinux:9.8` | `.el9` RPM |
+
+三个系统分别编译自己的二进制，使用一致的固定 Rust 版本和独立 Dockerfile。每个任务只生成当前平台的一个正式包和一个下一修订号测试包。安装镜像依赖前刷新软件源索引；编译缓存和编译目录按服务、目标系统、架构及实际镜像 ID 隔离，测试夹具使用对应系统和架构的二进制副本。ELF 校验要求 GLIBC 不超过 EL8 的 2.28、EL9 的 2.34、Ubuntu 24.04 的 2.39，原生打包工具同时生成动态库依赖。
+
+矩阵由 `scripts/release.py matrix` 从受支持的平台集合生成，agent、controller 使用同一矩阵。工作流内部打包脚本必须传入 `--system ubuntu24.04|almalinux8|almalinux9`，以及编译镜像和架构；包格式由系统决定。升级夹具和自动升级测试也显式指定系统。Artifact 与日志名称包含服务、系统和架构，例如 `packages-agent-almalinux9-arm64`，不同任务不会覆盖产物。Ubuntu 旧式 DEB 迁移夹具只在 Ubuntu 任务中生成和使用。
 
 Ubuntu 包的 `Version` 为 `X.Y.Z-N.ubuntu24.04`，RPM 的 `Version` 为 `X.Y.Z`、`Release` 为 `N.el8` 或 `N.el9`，文件名同步反映这些字段。发行版标识不进入 Cargo 版本或 Release 标签，也不参与 agent 的基础版本与数字修订号比较。本次支持 AlmaLinux 8/9 和 Ubuntu 24.04，未扩展到 Rocky Linux、RHEL 或其他 Ubuntu 版本。
 

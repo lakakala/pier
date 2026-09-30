@@ -27,6 +27,7 @@ jobs:
       release_tag: ${{ steps.version.outputs.release_tag }}
       revision: ${{ steps.version.outputs.revision }}
       upgrade_revision: ${{ steps.version.outputs.upgrade_revision }}
+      matrix: ${{ steps.targets.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -36,25 +37,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: python3 scripts/release.py resolve
+      - id: targets
+        run: python3 scripts/release.py matrix
 
   checks:
     needs: metadata
     uses: ./.github/workflows/ci.yml
 
   agent:
+    name: agent (${{ matrix.system }}, ${{ matrix.arch }})
     needs: [metadata, checks]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+      matrix: ${{ fromJSON(needs.metadata.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
       PIER_ARCH: ${{ matrix.arch }}
+      PIER_SYSTEM: ${{ matrix.system }}
+      PIER_FORMAT: ${{ matrix.format }}
       PACKAGE_REVISION: ${{ needs.metadata.outputs.revision }}
       UPGRADE_REVISION: ${{ needs.metadata.outputs.upgrade_revision }}
     steps:
@@ -62,17 +63,22 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/package-environment
+        id: environment
         with:
+          system: ${{ matrix.system }}
           arch: ${{ matrix.arch }}
           service: agent
-      - name: Build agent packages and upgrade fixtures
+      - name: Build agent package and upgrade fixture
+        env:
+          PIER_IMAGE: ${{ steps.environment.outputs.image }}
         run: |
           mkdir -p target/ci-logs
-          bash scripts/package-agent.sh --image pier-builder-rust:almalinux8 --arch "$PIER_ARCH" \
+          bash scripts/package-agent.sh --image "$PIER_IMAGE" --arch "$PIER_ARCH" --system "$PIER_SYSTEM" \
             --revision "$PACKAGE_REVISION" --output target/release/agent 2>&1 | tee target/ci-logs/agent.log
           bash scripts/prepare-upgrade-fixtures.sh agent "$PIER_ARCH" "$UPGRADE_REVISION" \
-            target/fixtures/agent 2>&1 | tee target/ci-logs/agent-fixtures.log
+            target/fixtures/agent --system "$PIER_SYSTEM" 2>&1 | tee target/ci-logs/agent-fixtures.log
       - name: Prepare Ubuntu legacy version migration fixture
+        if: matrix.system == 'ubuntu24.04'
         run: |
           mkdir -p target/fixtures/legacy-agent
           version=$(python3 scripts/release.py version)
@@ -83,23 +89,20 @@ jobs:
             2>&1 | tee target/ci-logs/agent-migration-fixture.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: packages-agent-${{ matrix.arch }}
-          path: |
-            target/release/agent/*.deb
-            target/release/agent/*.rpm
+          name: packages-agent-${{ matrix.system }}-${{ matrix.arch }}
+          path: target/release/agent/*.${{ matrix.format }}
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: fixtures-agent-${{ matrix.arch }}
-          path: |
-            target/fixtures/agent/*.deb
-            target/fixtures/agent/*.rpm
+          name: fixtures-agent-${{ matrix.system }}-${{ matrix.arch }}
+          path: target/fixtures/agent/*.${{ matrix.format }}
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: matrix.system == 'ubuntu24.04'
         with:
-          name: fixtures-legacy-agent-${{ matrix.arch }}
+          name: fixtures-legacy-agent-${{ matrix.system }}-${{ matrix.arch }}
           path: target/fixtures/legacy-agent/*.deb
           if-no-files-found: error
           retention-days: 7
@@ -107,24 +110,22 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: logs-agent-${{ matrix.arch }}
+          name: logs-agent-${{ matrix.system }}-${{ matrix.arch }}
           path: target/ci-logs/
           retention-days: 7
 
   controller:
+    name: controller (${{ matrix.system }}, ${{ matrix.arch }})
     needs: [metadata, agent]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+      matrix: ${{ fromJSON(needs.metadata.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
       PIER_ARCH: ${{ matrix.arch }}
+      PIER_SYSTEM: ${{ matrix.system }}
+      PIER_FORMAT: ${{ matrix.format }}
       PACKAGE_REVISION: ${{ needs.metadata.outputs.revision }}
       UPGRADE_REVISION: ${{ needs.metadata.outputs.upgrade_revision }}
     steps:
@@ -132,7 +133,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/package-environment
+        id: environment
         with:
+          system: ${{ matrix.system }}
           arch: ${{ matrix.arch }}
           service: controller
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -146,39 +149,41 @@ jobs:
           path: target/fixtures/agent
           merge-multiple: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: matrix.system == 'ubuntu24.04'
         with:
-          name: fixtures-legacy-agent-${{ matrix.arch }}
+          name: fixtures-legacy-agent-${{ matrix.system }}-${{ matrix.arch }}
           path: target/fixtures/legacy-agent
-      - name: Build controller packages and upgrade fixtures
+      - name: Build controller package and upgrade fixture
+        env:
+          PIER_IMAGE: ${{ steps.environment.outputs.image }}
         run: |
           mkdir -p target/ci-logs
-          bash scripts/package-controller.sh --image pier-builder-rust:almalinux8 --arch "$PIER_ARCH" \
+          bash scripts/package-controller.sh --image "$PIER_IMAGE" --arch "$PIER_ARCH" --system "$PIER_SYSTEM" \
             --revision "$PACKAGE_REVISION" --agent-packages target/release/agent \
             --output target/release/controller 2>&1 | tee target/ci-logs/controller.log
           bash scripts/prepare-upgrade-fixtures.sh controller "$PIER_ARCH" "$UPGRADE_REVISION" \
-            "target/fixtures/controller/$PIER_ARCH" target/fixtures/agent 2>&1 | tee target/ci-logs/controller-fixtures.log
+            "target/fixtures/controller/$PIER_SYSTEM/$PIER_ARCH" --system "$PIER_SYSTEM" \
+            --agent-packages target/fixtures/agent 2>&1 | tee target/ci-logs/controller-fixtures.log
       - name: Test native installation and automatic upgrade
         run: |
           mkdir -p target/native-packages
           cp target/release/agent/*.deb target/release/agent/*.rpm target/native-packages/
-          cp target/release/controller/*.deb target/release/controller/*.rpm target/native-packages/
-          bash scripts/test-agent-auto-upgrade.sh "$PIER_ARCH" --revision "$PACKAGE_REVISION" \
-            --packages target/native-packages --fixtures target/fixtures/controller \
+          cp target/release/controller/*."$PIER_FORMAT" target/native-packages/
+          bash scripts/test-agent-auto-upgrade.sh "$PIER_ARCH" --system "$PIER_SYSTEM" --revision "$PACKAGE_REVISION" \
+            --packages target/native-packages --fixtures "target/fixtures/controller/$PIER_SYSTEM" \
             --legacy-packages target/fixtures/legacy-agent \
             --logs target/ci-logs 2>&1 | tee target/ci-logs/native.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: packages-controller-${{ matrix.arch }}
-          path: |
-            target/release/controller/*.deb
-            target/release/controller/*.rpm
+          name: packages-controller-${{ matrix.system }}-${{ matrix.arch }}
+          path: target/release/controller/*.${{ matrix.format }}
           if-no-files-found: error
           retention-days: 7
       - name: Save packaging and systemd logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: logs-controller-${{ matrix.arch }}
+          name: logs-controller-${{ matrix.system }}-${{ matrix.arch }}
           path: target/ci-logs/
           retention-days: 7
 

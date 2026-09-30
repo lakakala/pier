@@ -29,7 +29,7 @@ upgrade_revision = base_revision + 1
 invalid_revision = base_revision + 2
 assert 1 <= base_revision <= 2**64 - 3
 packages_dir = os.environ.get('PIER_TEST_PACKAGES', '/src/dist')
-fixtures_dir = os.environ.get('PIER_TEST_FIXTURES', '/src/target/controller-package-upgrade-fixtures/' + arch)
+fixtures_dir = os.environ['PIER_TEST_FIXTURES']
 os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
 root = pathlib.Path('/var/lib/pier-controller-package-test')
 state = pathlib.Path('/var/lib/pier-controller')

@@ -2,20 +2,22 @@
 # Execute prepared packages; fixture generation can happen on separate runners.
 set -euo pipefail
 pier_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
-case "${1:-all}" in
-  amd64) pier_targets=amd64 ;;
-  arm64) pier_targets=arm64 ;;
-  all) pier_targets='amd64 arm64' ;;
-  *) echo 'Usage: test-agent-auto-upgrade.sh [amd64|arm64|all] [--revision N] [--packages DIR] [--fixtures DIR] [--legacy-packages DIR] [--logs DIR]' >&2; exit 2 ;;
+pier_targets='amd64 arm64'
+case "${1:-}" in
+  amd64|arm64) pier_targets=$1; shift ;;
+  all) shift ;;
+  ''|--*) ;;
+  *) echo 'Usage: test-agent-auto-upgrade.sh [amd64|arm64|all] --system SYSTEM [--revision N] [--packages DIR] [--fixtures DIR] [--legacy-packages DIR] [--logs DIR]' >&2; exit 2 ;;
 esac
-if [ "$#" -gt 0 ]; then shift; fi
 pier_revision=1
+pier_system=
 pier_packages="$pier_root/dist"
-pier_fixtures="$pier_root/target/controller-package-upgrade-fixtures"
+pier_fixtures=
 pier_legacy="$pier_root/target/fixtures/legacy-agent"
 pier_logs="$pier_root/target/native-test-logs"
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --system) pier_system=${2:?system}; shift 2 ;;
     --revision) pier_revision=${2:?revision}; shift 2 ;;
     --packages) pier_packages=${2:?package directory}; shift 2 ;;
     --fixtures) pier_fixtures=${2:?fixture directory}; shift 2 ;;
@@ -24,10 +26,17 @@ while [ "$#" -gt 0 ]; do
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+source "$pier_root/scripts/package-target.sh"
+pier_package_target "$pier_system"
+pier_fixtures=${pier_fixtures:-$pier_root/target/controller-package-upgrade-fixtures/$pier_system}
 python3 "$pier_root/scripts/release.py" metadata --revision "$pier_revision" >/dev/null
 pier_packages=$(cd -- "$pier_packages" && pwd)
 pier_fixtures=$(cd -- "$pier_fixtures" && pwd)
-pier_legacy=$(cd -- "$pier_legacy" && pwd)
+pier_legacy_mounts=()
+if [ "$pier_system" = ubuntu24.04 ]; then
+  pier_legacy=$(cd -- "$pier_legacy" && pwd)
+  pier_legacy_mounts=(-v "$pier_legacy:/legacy-packages:ro" -e PIER_TEST_LEGACY_PACKAGES=/legacy-packages)
+fi
 mkdir -p "$pier_logs"
 pier_logs=$(cd -- "$pier_logs" && pwd)
 pier_container=
@@ -47,20 +56,18 @@ cleanup() {
 trap cleanup EXIT
 for pier_arch in $pier_targets; do
   test -d "$pier_fixtures/$pier_arch"
-  for pier_distro in ubuntu2404 almalinux8 almalinux9; do
-    docker build --platform "linux/$pier_arch" -f "$pier_root/docker/controller-test-$pier_distro.Dockerfile" \
-      -t "pier-controller-test-$pier_distro:$pier_arch" --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg NO_PROXY "$pier_root"
-    pier_container=$(docker run -d --privileged --cgroupns=private --platform "linux/$pier_arch" \
-      --tmpfs /run --tmpfs /run/lock --tmpfs /tmp -v "$pier_root:/src:ro" \
-      -v "$pier_packages:/packages:ro" -v "$pier_fixtures/$pier_arch:/fixtures:ro" \
-      -v "$pier_legacy:/legacy-packages:ro" -e PIER_TEST_LEGACY_PACKAGES=/legacy-packages \
-      -e PIER_TEST_REVISION="$pier_revision" -e PIER_TEST_PACKAGES=/packages -e PIER_TEST_FIXTURES=/fixtures \
-      "pier-controller-test-$pier_distro:$pier_arch")
-    docker exec "$pier_container" python3 /src/scripts/test-controller-packages.py "$pier_distro" "$pier_arch" --auto-upgrade
-    docker restart -t 30 "$pier_container" >/dev/null
-    docker exec "$pier_container" python3 /src/scripts/test-controller-packages.py "$pier_distro" "$pier_arch" --after-boot
-    save_logs
-    docker rm -f "$pier_container" >/dev/null
-    pier_container=
-  done
+  docker build --platform "linux/$pier_arch" -f "$pier_root/docker/controller-test-$pier_distro.Dockerfile" \
+    -t "pier-controller-test-$pier_distro:$pier_arch" --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg NO_PROXY "$pier_root"
+  pier_container=$(docker run -d --privileged --cgroupns=private --platform "linux/$pier_arch" \
+    --tmpfs /run --tmpfs /run/lock --tmpfs /tmp -v "$pier_root:/src:ro" \
+    -v "$pier_packages:/packages:ro" -v "$pier_fixtures/$pier_arch:/fixtures:ro" \
+    "${pier_legacy_mounts[@]}" \
+    -e PIER_TEST_REVISION="$pier_revision" -e PIER_TEST_PACKAGES=/packages -e PIER_TEST_FIXTURES=/fixtures \
+    "pier-controller-test-$pier_distro:$pier_arch")
+  docker exec "$pier_container" python3 /src/scripts/test-controller-packages.py "$pier_distro" "$pier_arch" --auto-upgrade
+  docker restart -t 30 "$pier_container" >/dev/null
+  docker exec "$pier_container" python3 /src/scripts/test-controller-packages.py "$pier_distro" "$pier_arch" --after-boot
+  save_logs
+  docker rm -f "$pier_container" >/dev/null
+  pier_container=
 done
