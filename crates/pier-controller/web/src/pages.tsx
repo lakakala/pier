@@ -1026,6 +1026,11 @@ export function Enrollment() {
     };
   }, [grant]);
   const request = decoded.request;
+  const authorizationLabel = pairing
+    ? '更新代理并重试'
+    : state === 'expired'
+      ? '重新授权'
+      : '授权接入';
   return (
     <>
       <Heading title="接入服务器" subtitle="核对服务器信息，授权后回到终端完成配对。" />
@@ -1127,10 +1132,13 @@ export function Enrollment() {
                   <Space>
                     <Button
                       type="primary"
+                      aria-label={authorizationLabel}
+                      aria-busy={pending}
                       loading={pending}
                       disabled={
-                        request.connection_mode === 'controller_to_agent' &&
-                        (!endpoint.trim() || (proxyMode === 'set' && !proxy))
+                        pending ||
+                        (request.connection_mode === 'controller_to_agent' &&
+                          (!endpoint.trim() || (proxyMode === 'set' && !proxy)))
                       }
                       onClick={async () => {
                         setPending(true);
@@ -1162,7 +1170,7 @@ export function Enrollment() {
                         }
                       }}
                     >
-                      {pairing ? '更新代理并重试' : state === 'expired' ? '重新授权' : '授权接入'}
+                      {authorizationLabel}
                     </Button>
                     <Button onClick={() => setCancelled(true)}>取消</Button>
                   </Space>

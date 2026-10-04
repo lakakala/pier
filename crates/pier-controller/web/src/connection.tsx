@@ -121,8 +121,10 @@ export function AgentConnection({ agent, refresh }: { agent: Agent; refresh: () 
         <Button
           htmlType="submit"
           type="primary"
+          aria-label="保存并重连"
+          aria-busy={pending}
           loading={pending}
-          disabled={upgrading(agent) || (proxyMode === 'set' && !proxy)}
+          disabled={pending || upgrading(agent) || (proxyMode === 'set' && !proxy)}
         >
           保存并重连
         </Button>

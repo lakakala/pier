@@ -268,6 +268,10 @@ test.describe.serial('controller console over HTTPS', () => {
     });
     await expect(page.getByLabel('SOCKS5 代理地址', { exact: true })).toHaveCount(0);
     await expect(page.getByLabel('Agent 可达地址', { exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: '更新代理并重试', exact: true })).toHaveAttribute(
+      'aria-busy',
+      'false',
+    );
     await page.getByRole('button', { name: '更新代理并重试', exact: true }).click();
     await expect.poll(() => enrollment).not.toHaveProperty('agent_proxy');
     await page.getByRole('combobox', { name: '连接代理' }).click();
