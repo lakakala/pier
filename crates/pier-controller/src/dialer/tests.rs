@@ -3,8 +3,26 @@ use crate::auth::tests::{config, initialize, send};
 use axum::{body::to_bytes, http::StatusCode};
 use pier_protocol::{AgentReport, enrollment::InitRequest};
 
-#[tokio::test]
-async fn passive_enrollment_and_address_edits_use_admin_auth_and_survive_restart() {
+#[test]
+fn passive_enrollment_and_address_edits_use_admin_auth_and_survive_restart() {
+    // A Tokio timeout cannot interrupt a blocking std::sync::Mutex acquisition.
+    // Bound the entire scenario from another OS thread so a lock regression fails CI.
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(passive_enrollment_and_address_edits());
+        let _ = done.send(());
+    });
+    result
+        .recv_timeout(Duration::from_secs(60))
+        .expect("passive connection API scenario stalled or panicked");
+    worker.join().unwrap();
+}
+
+async fn passive_enrollment_and_address_edits() {
     let root = tempfile::tempdir().unwrap();
     let cfg = config(root.path());
     let state = Controller::open(cfg.clone()).unwrap();

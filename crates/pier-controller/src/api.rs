@@ -336,7 +336,7 @@ async fn update_connection(
     Path(id): Path<String>,
     Json(patch): Json<ConnectionPatch>,
 ) -> ApiResult<Value> {
-    let _guard = state.mutation_lock.lock().unwrap();
+    let mutation = state.mutation_lock.lock().unwrap();
     let mut record: AgentRecord = state.store.get("agents", &id)?.ok_or_else(missing)?;
     if record.connection.mode != pier_protocol::connection::ConnectionMode::ControllerToAgent {
         return Err(conflict("connection mode is fixed during initialization"));
@@ -364,6 +364,8 @@ async fn update_connection(
         session.cancelled.cancel();
     }
     state.dialer.cancel(&id);
+    // public_agent reads upgrade state under the same lock.
+    drop(mutation);
     Ok(Json(public_agent(&state, record)))
 }
 async fn bind(
