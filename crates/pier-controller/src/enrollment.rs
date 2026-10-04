@@ -351,7 +351,7 @@ mod tests {
         let mut request = request();
         request.connection_mode = ConnectionMode::ControllerToAgent;
         request.listen = Some("0.0.0.0:7444".parse().unwrap());
-        let proxy = Proxy::try_from("socks5://user:secret@proxy.test:1080".into()).unwrap();
+        let proxy = Proxy::try_from("socks5://user:secret@proxy.test:1080".to_owned()).unwrap();
         let pairing = state
             .approve_connection(
                 request.clone(),

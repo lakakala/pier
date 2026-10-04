@@ -404,7 +404,7 @@ async fn controller_initiates_noise_control_and_cleans_up_on_disconnect() {
         .cancelled
         .clone();
     let mut record = record;
-    record.proxy = Some(crate::proxy::Proxy::try_from("socks5://127.0.0.1:1".into()).unwrap());
+    record.proxy = Some(crate::proxy::Proxy::try_from("socks5://127.0.0.1:1".to_owned()).unwrap());
     state.store.put("agents", &record.id, &record).unwrap();
     // Changing only the proxy replaces the worker and closes its control session.
     reconcile(&state, &Arc::new(Semaphore::new(2))).unwrap();

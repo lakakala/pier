@@ -43,13 +43,13 @@ fn strict_urls_redaction_and_three_way_patch() {
         #[serde(default)]
         proxy: Patch,
     }
-    let old = Some(Proxy::try_from("socks5://host:1080".into()).unwrap());
+    let old = Some(Proxy::try_from("socks5://host:1080".to_owned()).unwrap());
     let parse = |json| serde_json::from_str::<Input>(json).unwrap().proxy;
     assert_eq!(parse("{}").apply(old.clone()), old);
     assert_eq!(parse(r#"{"proxy":null}"#).apply(old.clone()), None);
     assert_eq!(
         parse(r#"{"proxy":"socks5://next:1080"}"#).apply(old),
-        Some(Proxy::try_from("socks5://next:1080".into()).unwrap())
+        Some(Proxy::try_from("socks5://next:1080".to_owned()).unwrap())
     );
 }
 
