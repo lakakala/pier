@@ -247,11 +247,14 @@ async fn passive_enrollment_and_address_edits() {
         artifacts: Default::default(),
     };
     let upgrading = json!({"status":{"release":{"package":{"version":"1.0.0","revision":1},"format":"deb","architecture":"amd64",
-        "system":"ubuntu24.04","sha256":pier_protocol::hash("test"),"size":1},"phase":"downloading","grant":null,"error":null,"updated_at":pier_protocol::now()},
+        "system":"ubuntu24.04","sha256":pier_protocol::hash("test"),"size":1},"phase":"installing","grant":pier_protocol::new_id(),"error":null,"updated_at":pier_protocol::now()},
         "expires_at":pier_protocol::now()+600});
+    let mut restarting = upgrading.clone();
+    restarting["status"]["phase"] = json!("restarting");
     for (table, key, value) in [
         ("jobs", "busy", serde_json::to_value(job).unwrap()),
         ("agent_upgrades", credentials.agent_id.as_str(), upgrading),
+        ("agent_upgrades", credentials.agent_id.as_str(), restarting),
     ] {
         state.store.put(table, key, &value).unwrap();
         let response = send(
