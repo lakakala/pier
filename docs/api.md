@@ -66,6 +66,7 @@ JSON 语法、字段类型、Content-Type、查询参数解码或请求体大小
 | GET | `/v1/blueprints` | 管理员 Cookie | blueprint 与 app 声明 |
 | POST | `/v1/agents` | 管理员 Cookie | 手动注册 agent |
 | GET | `/v1/agents` | 管理员 Cookie | agent 列表 |
+| PUT | `/v1/agents/{id}/connection` | 管理员 Cookie | 修改被动 agent 的可达地址、SOCKS5 代理并重连 |
 | GET | `/v1/agents/{id}` | 管理员 Cookie | agent 状态 |
 | POST | `/v1/agents/{id}/apps/{instance}/terminals` | 管理员 Cookie、Origin、CSRF | 创建应用终端连接资格 |
 | GET | `/v1/terminals/{id}/ws` | 创建者 Cookie、同源 Origin | 一次性 WebSocket 连接 |
@@ -735,6 +736,40 @@ curl --fail-with-body "$CONTROLLER_URL/v1/deployments/$DEPLOYMENT_ID" \
 
 最后四种是终态，均不再占用该 agent 的活动部署名额。任务结果保存在 SQLite，agent 重连后同步；controller 在构建中重启会将该任务标记失败，已经交给 agent 的任务会恢复结果同步。
 
+## Agent 连接方式
+
+`GET /v1/agents` 的每个 agent 和 `GET /v1/agents/{id}` 都增加 `connection`：
+
+```json
+{"mode":"controller_to_agent","endpoint":"agent.example.com:7444","proxy_configured":true,"state":"reconnecting","last_error":"无法连接 SOCKS5 代理，正在重试"}
+```
+
+`mode` 为 `agent_to_controller`（默认）或 `controller_to_agent`；主动模式 `endpoint` 为 `null`。`state` 为 `connected`、`reconnecting`（被动 agent 离线）或 `waiting`（主动 agent 离线）；在线时 `last_error` 为 `null`。`proxy_configured` 仅表示是否保存了代理；不返回代理 URL、用户名、密码、配对秘密、token 或摘要。
+
+### PUT /v1/agents/{id}/connection
+
+要求管理员 Cookie、Origin 和 CSRF。`endpoint` 必填，`proxy` 可省略：
+
+```json
+{"endpoint":"agent.example.com:7444","proxy":"socks5://user:password@proxy.example.com:1080"}
+```
+
+支持域名、IPv4 和 `[IPv6]:端口`，不能使用通配地址、零端口、URL 路径或账号信息。仅用于已完成首次接入的被动 agent，不允许修改连接模式。成功返回更新后的 Agent 对象；保存后立即断开旧控制连接、业务通道及终端，并自动连接新地址，本地应用继续运行。返回结果中的在线状态可能短暂反映刚关闭的会话，以后续查询为准。
+
+`proxy` 的更新语义如下，`POST /v1/enrollments` 中的 `agent_proxy` 使用相同规则：
+
+| 值 | 行为 |
+| --- | --- |
+| 省略字段 | 保留已有配置；新授权默认直连 |
+| `null` | 清除代理，改为直连 |
+| URL 字符串 | 替换代理 |
+
+仅支持 `socks5://host:port` 或 `socks5://username:password@host:port`，代理主机支持域名、IPv4、`[IPv6]`，必须显式指定非零端口。禁止路径（包括末尾 `/`）、查询参数、fragment 和非法百分号编码。用户名密码需同时提供，按 URL 百分号解码后的 UTF-8 各占 1–255 字节；特殊字符应百分号编码。不支持 HTTP/HTTPS 代理或 `socks5h://`；`socks5://` 本身已由代理解析目标域名。
+
+每个 agent 的注册、控制、部署包、自动升级和终端连接均使用同一配置。TCP 建连、SOCKS5 协商和 Noise 认证合计最多 10 秒；失败后重试并提供不含凭据的错误原因，不自动回退直连。不读取代理环境变量，此设置与构建代理完全独立，仅保存在 controller 的数据库，不写入 agent 配置或配对凭据。修改代理同样会立即重连并关闭现有终端。
+
+代理 URL 或 JSON 字段格式无效返回 `422`；地址无效返回 `400`，身份不存在返回 `404`，主动模式、初始化尚未完成、存在活动部署或升级时返回 `409`。已有模式不会自动切换；只更改 controller 保存的连接设置，不修改 agent 本地监听配置。
+
 ## 初始化授权
 
 `GET /agent/init` 由内嵌 React 控制台提供，静态资源位于 `/assets/`。未登录时显示登录表单，controller 尚未初始化时显示管理员初始化表单；URL fragment 保持不变。账号登录不会自动批准接入，仍需点击授权。
@@ -748,11 +783,15 @@ curl --fail-with-body "$CONTROLLER_URL/v1/deployments/$DEPLOYMENT_ID" \
 
 ### POST /v1/enrollments
 
-请求体最大 64 KiB。所有字段必填，`info` 使用 AgentInfo 结构：
+请求体最大 64 KiB。除注明默认值的连接字段外，其余字段必填；`info` 使用 AgentInfo 结构：
 
 | 请求字段 | 类型 | 约束 |
 | --- | --- | --- |
 | `request_id` | string | init 生成的 64 位十六进制随机请求 ID |
+| `connection_mode` | string | 可省略，默认 `agent_to_controller`；被动模式为 `controller_to_agent` |
+| `listen` | string | 被动模式必填，由 init 提供的本机 IP:端口；主动模式禁止 |
+| `agent_endpoint` | string | 被动模式必填，管理员在 Web 填写 controller 可达的 agent host:port；主动模式禁止 |
+| `agent_proxy` | string / null | 被动模式可配置 SOCKS5；省略保留，`null` 清除，字符串替换；主动模式禁止设置代理 |
 | `name` | string | 去除首尾空白后非空，不含控制字符，最多 256 字节 |
 | `public_url` | string | 必须等于 controller 配置的规范 HTTPS 来源地址，不含路径、查询、fragment 或末尾斜杠 |
 | `info.architecture` | string | `amd64` 或 `arm64` |
@@ -791,7 +830,9 @@ curl --fail-with-body -X POST "$CONTROLLER_URL/v1/enrollments" \
 
 `id` 当前等于 `request_id`，用于查询授权状态；`pairing` 是供终端使用的完整字符串，含一次性秘密，有效期为 10 分钟。它不是 agent 的长期 token，应完整复制，不写入日志。
 
-有效期内重试完全相同且未完成的请求返回原配对凭据，不延长到期时间。未完成的授权过期后可用相同请求重新批准；同一个请求 ID 的内容改变或流程已完成时返回 `400`。业务错误为 `invalid or already completed enrollment; restart init if necessary`。
+有效期内重试完全相同且未完成的请求返回原配对凭据，不延长到期时间。未完成的授权过期后可用相同请求重新批准；同一个请求 ID 的内容（含模式和可达地址）改变或流程已完成时返回 `400`。业务错误为 `invalid or already completed enrollment; check connection settings`。代理配置可单独修正：未完成且未过期时重新提交相同请求、地址及新的 `agent_proxy`，保留配对秘密、有效期和已经签发的 agent 身份；已签发身份的连接配置同步更新并重连。Web 在配对等待期间提供“更新代理并重试”。部署或升级时拒绝此更新。
+
+被动模式下 controller 在授权后开始主动拨号，agent 粘贴凭据后才接受注册握手。agent 保存配置并由 systemd 启动正常监听后，controller 以长期凭据建立控制连接并收到首次上报，授权状态转为 `completed`；重启和重复兑换保持同一身份。controller 入站监听器故障不阻止被动 agent 授权、连接或部署。主动模式保持原有兑换和确认流程。
 
 此管理写接口要求 Cookie、Origin 和 CSRF；Origin 必须与配置的 public_url 完全一致，脚本调用也不能省略。
 
@@ -810,7 +851,9 @@ curl --fail-with-body "$CONTROLLER_URL/v1/enrollments/$ENROLLMENT_ID" \
   "id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "state": "authorized",
   "agent_id": null,
-  "expires_at": 1790467800
+  "expires_at": 1790467800,
+  "proxy_configured": true,
+  "last_error": null
 }
 ```
 
@@ -821,7 +864,7 @@ curl --fail-with-body "$CONTROLLER_URL/v1/enrollments/$ENROLLMENT_ID" \
 | `completed` | agent 已确认身份保存完成，临时秘密已清除 |
 | `expired` | 尚未完成且已过期，需要重新授权 |
 
-`agent_id` 是关联身份或 `null`；重新批准过期请求时可以保留先前分配的身份。已完成记录仍显示 `completed`，不会因到期改为 `expired`。查询不返回配对凭据、长期 token 或任何 token 摘要。
+`agent_id` 是关联身份或 `null`；重新批准过期请求时可以保留先前分配的身份。已完成记录仍显示 `completed`，不会因到期改为 `expired`。`proxy_configured` 表示授权时的代理配置，`last_error` 提供当前注册拨号错误（无错误为 `null`）。查询不返回代理地址或凭据、配对凭据、长期 token 或任何 token 摘要。
 
 ## 制品下载
 

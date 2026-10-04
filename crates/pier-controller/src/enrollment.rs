@@ -1,7 +1,11 @@
-use crate::{AgentRecord, Controller};
+use crate::{
+    AgentRecord, Controller,
+    proxy::{Patch, Proxy, Route},
+};
 use anyhow::{Result, ensure};
 use pier_protocol::{
     AgentReport,
+    connection::{Connection, ConnectionMode},
     enrollment::{Credentials, InitRequest, Pairing},
 };
 use serde::{Deserialize, Serialize};
@@ -10,6 +14,10 @@ use serde_json::{Value, json};
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Enrollment {
     request: InitRequest,
+    #[serde(default)]
+    connection: Connection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy: Option<Proxy>,
     pairing: Option<Pairing>,
     issued: Option<Credentials>,
     agent_id: Option<String>,
@@ -17,7 +25,21 @@ pub(crate) struct Enrollment {
     completed: bool,
 }
 impl Controller {
+    #[cfg(test)]
     pub(crate) fn approve_enrollment(&self, request: InitRequest) -> Result<Pairing> {
+        self.approve_connection(request, None, Patch::Preserve)
+    }
+    pub(crate) fn approve_connection(
+        &self,
+        request: InitRequest,
+        endpoint: Option<String>,
+        proxy_patch: Patch,
+    ) -> Result<Pairing> {
+        let connection = Connection {
+            mode: request.connection_mode,
+            endpoint,
+        };
+        connection.validate()?;
         request.validate()?;
         ensure!(
             Some(request.public_url.clone()) == self.public_url(),
@@ -25,30 +47,74 @@ impl Controller {
         );
         let _guard = self.mutation_lock.lock().unwrap();
         let old: Option<Enrollment> = self.store.get("enrollments", &request.request_id)?;
+        let proxy = proxy_patch.apply(old.as_ref().and_then(|r| r.proxy.clone()));
+        ensure!(
+            connection.mode == ConnectionMode::ControllerToAgent || proxy.is_none(),
+            "proxy requires controller-to-agent mode"
+        );
         if let Some(old) = &old {
             ensure!(
-                old.request == request && !old.completed,
+                old.request == request && old.connection == connection && !old.completed,
                 "enrollment already complete or changed"
             );
             if let Some(pairing) = &old.pairing {
                 if pairing.expires_at > pier_protocol::now() {
+                    let mut updated = old.clone();
+                    updated.proxy = proxy.clone();
+                    if let Some(agent_id) = &old.agent_id {
+                        let mut agent: AgentRecord = self
+                            .store
+                            .get("agents", agent_id)?
+                            .ok_or_else(|| anyhow::anyhow!("enrollment agent missing"))?;
+                        // Credentials may already have been delivered. Never rotate them
+                        // or extend the original grant while correcting a proxy.
+                        ensure!(
+                            !self.upgrade_busy(agent_id)?
+                                && !self
+                                    .store
+                                    .list::<crate::Job>("jobs")?
+                                    .iter()
+                                    .any(|j| j.agent_id == *agent_id && j.active()),
+                            "agent is deploying or upgrading"
+                        );
+                        agent.proxy = proxy;
+                        self.store.put_pair(
+                            ("enrollments", &request.request_id, &updated),
+                            ("agents", agent_id, &agent),
+                        )?;
+                        if let Some(session) = self.sessions.lock().unwrap().get(agent_id) {
+                            session.cancelled.cancel();
+                        }
+                        self.dialer.cancel(agent_id);
+                    } else {
+                        self.store
+                            .put("enrollments", &request.request_id, &updated)?;
+                    }
+                    self.dialer
+                        .cancel(&format!("enroll:{}", request.request_id));
                     return Ok(pairing.clone());
                 }
             }
         }
         let pairing = Pairing {
+            connection_mode: request.connection_mode,
             version: pier_protocol::VERSION,
             grant_id: request.request_id.clone(),
             request_id: request.request_id.clone(),
             public_url: self
                 .public_url()
                 .ok_or_else(|| anyhow::anyhow!("controller not initialized"))?,
-            endpoint: self.agent_endpoint()?,
+            endpoint: match &connection.endpoint {
+                Some(endpoint) => endpoint.clone(),
+                None => self.agent_endpoint()?,
+            },
             secret: pier_protocol::new_token(),
             expires_at: pier_protocol::now() + 600,
         };
         let record = Enrollment {
             request,
+            connection,
+            proxy,
             pairing: Some(pairing.clone()),
             issued: None,
             agent_id: old.and_then(|v| v.agent_id),
@@ -101,11 +167,19 @@ impl Controller {
             "agent has already connected; use saved credentials"
         );
         let credentials = Credentials {
+            connection_mode: request.connection_mode,
+            listen: request.listen,
             agent_id: agent_id.clone(),
             token: pier_protocol::new_token(),
-            controller_tcp: self.agent_endpoint()?,
+            controller_tcp: if request.connection_mode == ConnectionMode::AgentToController {
+                self.agent_endpoint()?
+            } else {
+                String::new()
+            },
         };
         let agent = AgentRecord {
+            proxy: record.proxy.clone(),
+            connection: record.connection.clone(),
             id: agent_id.clone(),
             name: request.name,
             token_hash: pier_protocol::hash(&credentials.token),
@@ -150,10 +224,47 @@ impl Controller {
         }
         Ok(())
     }
+    pub(crate) fn passive_enrollments(&self) -> Result<Vec<(String, Route)>> {
+        Ok(self
+            .store
+            .list::<Enrollment>("enrollments")?
+            .into_iter()
+            .filter(|r| {
+                !r.completed
+                    && r.expires_at > pier_protocol::now()
+                    && r.pairing.is_some()
+                    && r.connection.mode == ConnectionMode::ControllerToAgent
+            })
+            .filter_map(|r| {
+                r.connection.endpoint.map(|endpoint| {
+                    (
+                        r.request.request_id,
+                        Route {
+                            endpoint,
+                            proxy: r.proxy,
+                        },
+                    )
+                })
+            })
+            .collect())
+    }
+    pub(crate) fn complete_passive_enrollment(&self, agent: &str) -> Result<()> {
+        for record in self.store.list::<Enrollment>("enrollments")? {
+            if !record.completed
+                && record.agent_id.as_deref() == Some(agent)
+                && record.connection.mode == ConnectionMode::ControllerToAgent
+            {
+                self.acknowledge_enrollment(&record.request.request_id, agent)?;
+                self.dialer
+                    .cancel(&format!("enroll:{}", record.request.request_id));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn enrollment_status(&self, id: &str) -> Result<Option<Value>> {
         Ok(self.store.get::<Enrollment>("enrollments", id)?.map(|record| {
             let status = if record.completed { "completed" } else if record.expires_at <= pier_protocol::now() { "expired" } else if record.agent_id.is_some() { "issued" } else { "authorized" };
-            json!({"id":id,"state":status,"agent_id":record.agent_id,"expires_at":record.expires_at})
+            json!({"id":id,"state":status,"agent_id":record.agent_id,"expires_at":record.expires_at,"proxy_configured":record.proxy.is_some(),"last_error":self.dialer.error(&format!("enroll:{id}"))})
         }))
     }
 }
@@ -163,6 +274,8 @@ mod tests {
     use crate::auth::tests::config;
     fn request() -> InitRequest {
         InitRequest {
+            connection_mode: ConnectionMode::default(),
+            listen: None,
             request_id: pier_protocol::new_token(),
             name: "server".into(),
             public_url: "https://pier.example.test".into(),
@@ -228,6 +341,53 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!status.contains(&credentials.token) && !status.contains(&pairing.secret));
+    }
+    #[tokio::test]
+    async fn pending_proxy_and_issued_identity_survive_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let state = Controller::open(config.clone()).unwrap();
+        crate::auth::tests::initialize(&crate::api::router(state.clone())).await;
+        let mut request = request();
+        request.connection_mode = ConnectionMode::ControllerToAgent;
+        request.listen = Some("0.0.0.0:7444".parse().unwrap());
+        let proxy = Proxy::try_from("socks5://user:secret@proxy.test:1080".into()).unwrap();
+        let pairing = state
+            .approve_connection(
+                request.clone(),
+                Some("agent.test:7444".into()),
+                Patch::Set(proxy.clone()),
+            )
+            .unwrap();
+        let key = state.enrollment_key(&pairing.grant_id).unwrap();
+        let credentials = state
+            .issue_credentials(&pairing.grant_id, request.clone(), &key)
+            .unwrap();
+        drop(state);
+        let state = Controller::open(config).unwrap();
+        let targets = state.passive_enrollments().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, request.request_id);
+        assert_eq!(targets[0].1.proxy, Some(proxy));
+        let retry = state
+            .approve_connection(
+                request.clone(),
+                Some("agent.test:7444".into()),
+                Patch::Clear,
+            )
+            .unwrap();
+        assert_eq!(pairing.encode().unwrap(), retry.encode().unwrap());
+        let delivered = state
+            .issue_credentials(&pairing.grant_id, request, &key)
+            .unwrap();
+        assert_eq!(delivered.token, credentials.token);
+        let agent: AgentRecord = state
+            .store
+            .get("agents", &credentials.agent_id)
+            .unwrap()
+            .unwrap();
+        assert!(agent.proxy.is_none());
+        assert!(state.passive_enrollments().unwrap()[0].1.proxy.is_none());
     }
     #[tokio::test]
     async fn expired_authorization_cannot_issue_credentials() {

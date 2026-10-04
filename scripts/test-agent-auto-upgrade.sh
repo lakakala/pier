@@ -62,6 +62,7 @@ for pier_arch in $pier_targets; do
     --tmpfs /run --tmpfs /run/lock --tmpfs /tmp -v "$pier_root:/src:ro" \
     -v "$pier_packages:/packages:ro" -v "$pier_fixtures/$pier_arch:/fixtures:ro" \
     "${pier_legacy_mounts[@]}" \
+    -e PIER_TEST_CONNECTION_MODE="${PIER_TEST_CONNECTION_MODE:-agent_to_controller}" \
     -e PIER_TEST_REVISION="$pier_revision" -e PIER_TEST_PACKAGES=/packages -e PIER_TEST_FIXTURES=/fixtures \
     "pier-controller-test-$pier_distro:$pier_arch")
   docker exec "$pier_container" python3 /src/scripts/test-controller-packages.py "$pier_distro" "$pier_arch" --auto-upgrade

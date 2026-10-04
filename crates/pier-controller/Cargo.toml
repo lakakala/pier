@@ -26,4 +26,5 @@ minijinja = "2.24"
 argon2 = "0.5"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

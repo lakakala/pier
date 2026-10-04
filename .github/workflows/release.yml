@@ -169,10 +169,13 @@ jobs:
           mkdir -p target/native-packages
           cp target/release/agent/*.deb target/release/agent/*.rpm target/native-packages/
           cp target/release/controller/*."$PIER_FORMAT" target/native-packages/
-          bash scripts/test-agent-auto-upgrade.sh "$PIER_ARCH" --system "$PIER_SYSTEM" --revision "$PACKAGE_REVISION" \
-            --packages target/native-packages --fixtures "target/fixtures/controller/$PIER_SYSTEM" \
-            --legacy-packages target/fixtures/legacy-agent \
-            --logs target/ci-logs 2>&1 | tee target/ci-logs/native.log
+          for pier_mode in agent_to_controller controller_to_agent controller_to_agent_socks5; do
+            PIER_TEST_CONNECTION_MODE="$pier_mode" bash scripts/test-agent-auto-upgrade.sh "$PIER_ARCH" \
+              --system "$PIER_SYSTEM" --revision "$PACKAGE_REVISION" \
+              --packages target/native-packages --fixtures "target/fixtures/controller/$PIER_SYSTEM" \
+              --legacy-packages target/fixtures/legacy-agent \
+              --logs "target/ci-logs/$pier_mode" 2>&1 | tee "target/ci-logs/native-$pier_mode.log"
+          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: packages-controller-${{ matrix.system }}-${{ matrix.arch }}

@@ -3,7 +3,9 @@ mod api;
 mod auth;
 pub mod catalog;
 mod connection;
+mod dialer;
 mod enrollment;
+mod proxy;
 mod runtime;
 mod settings;
 mod terminal;
@@ -94,6 +96,10 @@ pub struct Config {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proxy: Option<proxy::Proxy>,
+    #[serde(default)]
+    pub connection: pier_protocol::connection::Connection,
     pub id: String,
     #[serde(default)]
     pub name: String,
@@ -133,8 +139,10 @@ struct Session {
     id: String,
     sender: mpsc::Sender<Message>,
     terminal: bool,
+    cancelled: tokio_util::sync::CancellationToken,
 }
 pub struct Controller {
+    dialer: dialer::Registry,
     terminals: terminal::Registry,
     _lock: fs::File,
     config: Config,
@@ -179,6 +187,7 @@ impl Controller {
             }
         }
         Ok(Arc::new(Self {
+            dialer: dialer::Registry::default(),
             terminals: terminal::Registry::default(),
             _lock: lock,
             upgrades: upgrades::Catalog::open(&config.state_dir),
@@ -302,8 +311,9 @@ pub async fn run(config: Config) -> Result<()> {
     let http_listener = tokio::net::TcpListener::bind(config.http_listen).await?;
     state.start_saved_listener();
     let tcp = state.clone().serve_agent_listener();
+    let dialer = dialer::run(state.clone());
     let http = axum::serve(http_listener, api::router(state)).into_future();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tracing::info!(http=%config.http_listen, "controller web listening");
-    tokio::select! { _ = tcp => Ok(()), _ = cleanup => Ok(()), result = http => Ok(result?), _ = tokio::signal::ctrl_c() => Ok(()), _ = terminate.recv() => Ok(()) }
+    tokio::select! { _ = dialer => Ok(()), _ = tcp => Ok(()), _ = cleanup => Ok(()), result = http => Ok(result?), _ = tokio::signal::ctrl_c() => Ok(()), _ = terminate.recv() => Ok(()) }
 }

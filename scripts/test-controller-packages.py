@@ -24,6 +24,10 @@ assert os.geteuid() == 0 and pathlib.Path('/.dockerenv').exists()
 assert pathlib.Path('/proc/1/comm').read_text().strip() == 'systemd'
 distro, arch = sys.argv[1:3]
 auto_upgrade = '--auto-upgrade' in sys.argv
+connection_mode = os.environ.get('PIER_TEST_CONNECTION_MODE', 'agent_to_controller')
+socks5 = connection_mode == 'controller_to_agent_socks5'
+passive = connection_mode in ('controller_to_agent', 'controller_to_agent_socks5')
+agent_host = 'agent.socks.test' if socks5 else '10.203.0.2'
 base_revision = int(os.environ.get('PIER_TEST_REVISION', '1'))
 upgrade_revision = base_revision + 1
 invalid_revision = base_revision + 2
@@ -98,6 +102,13 @@ if '--after-boot' in sys.argv:
     csrf = api('GET', '/v1/auth/session')['csrf_token']
     assert api('GET', '/v1/repository')['commit'] == meta['commit'], 'boot must not synchronize changed Git HEAD'
     assert checksum('/etc/pier/controller.yml') == meta['config_hash']
+    wait('agent reconnects after boot', lambda: any(a['online'] for a in api('GET', '/v1/agents')['agents']))
+    if passive:
+        from passive_package_checks import assert_no_outbound
+        assert_no_outbound(command)
+        if socks5:
+            from passive_package_checks import assert_socks5
+            assert_socks5(command)
     assert pathlib.Path('/proc/%s' % pid()).stat().st_uid == meta['uid']
     assert api('POST', '/v1/repository/sync', {})['commit'] == meta['next_commit']
     assert api('GET', '/v1/deployments/' + meta['job'])['state'] == 'succeeded'
@@ -179,7 +190,7 @@ recipe.write_text('schema: 2\nname: demo\nversion: "1"\nsource: {type: binary, u
 (repo / 'blueprints/demo/pier-blueprint.yml').write_text('schema: 1\nname: demo\napps: [{id: demo, app: apps/demo}]\n')
 git(repo, 'init', '-q', '-b', 'main'); commit(repo)
 command('chown', '-R', 'pier-controller:pier-controller', str(repo))
-csrf = api('POST', '/v1/auth/init', {'username': 'admin', 'password': 'controller-package-test-123', 'repository': {'url': str(repo)}, 'settings': {'tcp_listen': '127.0.0.1:17443', 'max_concurrent_builds': 3}})['csrf_token']
+csrf = api('POST', '/v1/auth/init', {'username': 'admin', 'password': 'controller-package-test-123', 'repository': {'url': str(repo)}, 'settings': {'tcp_listen': '0.0.0.0:17443' if passive else '127.0.0.1:17443', 'max_concurrent_builds': 3}})['csrf_token']
 jar.save(ignore_discard=True)
 assert api('GET', '/v1/settings')['agent_listener']['listening'] is True
 assert api('GET', '/v1/settings')['active']['agent_endpoint'] == 'localhost:17443'
@@ -188,14 +199,27 @@ assert api('GET', '/v1/repository')['commit'] is None
 assert not (state / 'snapshots').exists(), 'initialization must not fetch'
 head = api('POST', '/v1/repository/sync', {})['commit']
 assert api('GET', '/v1/repository')['needs_sync'] is False
-identity = api('POST', '/v1/agents', {'name': 'package-test'})
-pathlib.Path('/etc/pier/agent.token').write_text(identity['token'])
-pathlib.Path('/etc/pier/agent.yml').write_text('agent_id: %s\ntoken_file: /etc/pier/agent.token\ncontroller_tcp: 127.0.0.1:17443\nstate_dir: /var/lib/pier-agent\n' % identity['id'])
+if passive:
+    from passive_package_checks import initialize
+    identity = initialize(api, command, wait, socks5=socks5)
+else:
+    identity = api('POST', '/v1/agents', {'name': 'package-test'})
+    pathlib.Path('/etc/pier/agent.token').write_text(identity['token'])
+    pathlib.Path('/etc/pier/agent.yml').write_text('agent_id: %s\ntoken_file: /etc/pier/agent.token\ncontroller_tcp: 127.0.0.1:17443\nstate_dir: /var/lib/pier-agent\n' % identity['id'])
 if auto_upgrade:
-    with open('/etc/pier/agent.yml', 'a') as out:
-        out.write('heartbeat_seconds: 1\nruntime:\n  startup_grace_seconds: 30\n  stop_timeout_seconds: 2\n')
+    if passive:
+        config_file = pathlib.Path('/etc/pier/agent.yml')
+        text = config_file.read_text()
+        for field, value in [('heartbeat_seconds', 1), ('startup_grace_seconds', 30), ('stop_timeout_seconds', 2)]:
+            text = re.sub(r'(^\s*' + field + r':) \d+', r'\g<1> ' + str(value), text, flags=re.MULTILINE)
+        config_file.write_text(text)
+    else:
+        with open('/etc/pier/agent.yml', 'a') as out:
+            out.write('heartbeat_seconds: 1\nruntime:\n  startup_grace_seconds: 30\n  stop_timeout_seconds: 2\n')
 os.chmod('/etc/pier/agent.token', 0o600); os.chmod('/etc/pier/agent.yml', 0o600)
 command('systemctl', 'enable', '--now', 'pier-agent')
+if passive:
+    command('systemctl', 'restart', 'pier-agent')
 agent_path = '/v1/agents/' + identity['id']
 wait('agent online', lambda: api('GET', agent_path)['online'])
 api('PUT', agent_path + '/binding', {'blueprint': 'blueprints/demo', 'variables': {}})
@@ -211,6 +235,23 @@ def deploy(images=None):
     return job
 
 job = deploy()
+if passive:
+    view = api('GET', agent_path)
+    app_pids = [app['pid'] for app in view['report']['apps']]
+    assert view['connection']['mode'] == 'controller_to_agent'
+    api('PUT', agent_path + '/connection', {'endpoint': agent_host + ':7445'})
+    wait('wrong passive address goes offline', lambda: not api('GET', agent_path)['online'])
+    wait('connection error visible', lambda: api('GET', agent_path)['connection']['last_error'])
+    api('PUT', agent_path + '/connection', {'endpoint': agent_host + ':7444'})
+    wait('passive endpoint restored', lambda: api('GET', agent_path)['online'])
+    assert [app['pid'] for app in api('GET', agent_path)['report']['apps']] == app_pids
+    if socks5:
+        api('PUT', agent_path + '/connection', {'endpoint': agent_host + ':7444', 'proxy': 'socks5://pier-ci:wrong@127.0.0.1:1080'})
+        wait('proxy replacement disconnects control', lambda: not api('GET', agent_path)['online'])
+        wait('proxy authentication failure visible', lambda: '认证失败' in (api('GET', agent_path)['connection']['last_error'] or ''))
+        api('PUT', agent_path + '/connection', {'endpoint': agent_host + ':7444', 'proxy': 'socks5://pier-ci:proxy-secret@127.0.0.1:1080'})
+        wait('proxy replacement restores control', lambda: api('GET', agent_path)['online'])
+        assert [app['pid'] for app in api('GET', agent_path)['report']['apps']] == app_pids
 if auto_upgrade and distro == 'ubuntu2404':
     # The legacy fixture uses this build's binary with the old native version.
     # Verify the one-time manual migration before exercising automatic updates.
@@ -370,6 +411,9 @@ with socket.socket() as occupied:
     wait('web available with broken agent listener', lambda: api('GET', '/v1/auth/session'))
     broken = api('GET', '/v1/settings')
     assert not broken['agent_listener']['listening'] and broken['agent_listener']['error']
+    if passive:
+        wait('passive agent without controller inbound listener', lambda: api('GET', agent_path)['online'])
+        job = deploy()
     repaired = api('PUT', '/v1/settings', {'tcp_listen': '127.0.0.1:17443'})
     assert repaired['restart_required']
 command('systemctl', 'restart', 'pier-controller')
@@ -434,3 +478,13 @@ next_commit = commit(repo)
 meta_file.write_text(json.dumps({'commit': head, 'next_commit': next_commit, 'config_hash': config_hash, 'uid': account.pw_uid, 'job': job}))
 source.shutdown(); daemon.terminate(); daemon.wait(timeout=30)
 print('PASS %s/%s: install, web init, saved/active settings, listener failure and repair, manual sync, binary/Docker source deployments, upgrade without restart, crash recovery' % (distro, arch), flush=True)
+
+if passive:
+    from passive_package_checks import assert_no_outbound
+    assert_no_outbound(command)
+    print('PASS passive mode: no outbound TCP during enrollment, deployment, terminals or upgrades', flush=True)
+
+if socks5:
+    from passive_package_checks import assert_socks5
+    assert_socks5(command)
+    print('PASS SOCKS5: all channel purposes tunneled, remote DNS, authentication retry, no direct fallback', flush=True)

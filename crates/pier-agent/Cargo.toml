@@ -24,5 +24,6 @@ tempfile.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 pier-controller = { path = "../pier-controller" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }

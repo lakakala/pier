@@ -12,6 +12,7 @@ pub async fn connect(
     runtime: Arc<Runtime>,
     mut events: mpsc::UnboundedReceiver<Message>,
     upgrades: Arc<crate::upgrade::Manager>,
+    mut accepted: Option<mpsc::Receiver<crate::transport::Accepted>>,
 ) -> Result<()> {
     let token = fs::read_to_string(&config.token_file)?.trim().to_string();
     let info = host_info()?;
@@ -46,9 +47,18 @@ pub async fn connect(
         let terminals = tokio_util::sync::CancellationToken::new();
         let _terminal_guard = terminals.clone().drop_guard();
         let session: Result<()> = async {
-            let stream = pier_protocol::secure::connect(&config.controller_tcp, pier_protocol::secure::Purpose::Control, &config.agent_id, &pier_protocol::secure::token_key(&token)).await?;
+            let (stream, _permit) = if let Some(receiver) = accepted.as_mut() {
+                let (stream, permit) = receiver.recv().await.context("agent listener stopped")?;
+                (stream, Some(permit))
+            } else {
+                (pier_protocol::secure::connect(&config.controller_tcp, pier_protocol::secure::Purpose::Control, &config.agent_id, &pier_protocol::secure::token_key(&token)).await?, None)
+            };
             let mut stream = pier_protocol::framed(stream);
             pier_protocol::send(&mut stream, &Message::Hello { version: pier_protocol::VERSION, agent_id: config.agent_id.clone(), info: info.clone(), software: Some(upgrades.software()) }).await?;
+            if config.connection_mode == pier_protocol::connection::ConnectionMode::ControllerToAgent {
+                let Message::Session { id } = timeout(Duration::from_secs(10), pier_protocol::receive(&mut stream)).await?? else { anyhow::bail!("control session required"); };
+                runtime.transport.begin(id, terminals.clone())?;
+            }
             let welcome = timeout(Duration::from_secs(10), pier_protocol::receive(&mut stream)).await??;
             let Message::Welcome { version: pier_protocol::VERSION, upgrade } = welcome else { anyhow::bail!("invalid welcome or protocol version"); };
             upgrades.offer(upgrade);
@@ -82,6 +92,7 @@ pub async fn connect(
                     }
                     event = events.recv() => {
                         let event = event.context("event channel closed")?;
+                        if matches!(&event, Message::OpenChannel { session, .. } if !runtime.transport.current(session)) { continue; }
                         timeout(Duration::from_secs(30), pier_protocol::send(&mut stream, &event)).await??;
                         if matches!(event, Message::Result { .. }) {
                             timeout(Duration::from_secs(10), pier_protocol::send(&mut stream, &Message::Report { report: runtime.report()? })).await??;
@@ -96,11 +107,16 @@ pub async fn connect(
             }
         }.await;
         terminals.cancel();
+        runtime.transport.disconnect();
         if session.is_err() {
             tracing::warn!(
                 retry_seconds = delay,
                 "controller connection lost; local services continue"
             );
+        }
+        if let Some(receiver) = &accepted {
+            ensure!(!receiver.is_closed(), "agent listener stopped");
+            continue;
         }
         tokio::time::sleep(Duration::from_secs(delay)).await;
         delay = (delay * 2).min(60);
@@ -125,7 +141,7 @@ pub(crate) fn host_info() -> Result<AgentInfo> {
 }
 /// Used from the existing blocking deployment worker, never from a Tokio I/O task.
 pub(crate) fn download(
-    config: &Config,
+    transport: &crate::transport::Transport,
     deployment: &str,
     app: &pier_protocol::DeploymentApp,
     path: &std::path::Path,
@@ -133,20 +149,14 @@ pub(crate) fn download(
 ) -> Result<()> {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use std::{io::Write, sync::atomic::Ordering};
-    let token = fs::read_to_string(&config.token_file)?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
             timeout(Duration::from_secs(300), async {
-                let io = pier_protocol::secure::connect(
-                    &config.controller_tcp,
-                    pier_protocol::secure::Purpose::Artifact,
-                    &config.agent_id,
-                    &pier_protocol::secure::token_key(&token),
-                )
-                .await?;
-                let mut stream = pier_protocol::framed(io);
+                let mut stream = transport
+                    .open(pier_protocol::secure::Purpose::Artifact)
+                    .await?;
                 pier_protocol::send(
                     &mut stream,
                     &Message::ArtifactRequest {

@@ -17,6 +17,8 @@ async fn setup() -> (tempfile::TempDir, Arc<Controller>, Router, String, String)
             "agents",
             "agent",
             &AgentRecord {
+                proxy: None,
+                connection: Default::default(),
                 id: "agent".into(),
                 name: "demo".into(),
                 token_hash: pier_protocol::hash("token"),
@@ -37,6 +39,7 @@ async fn setup() -> (tempfile::TempDir, Arc<Controller>, Router, String, String)
     state.sessions.lock().unwrap().insert(
         "agent".into(),
         Session {
+            cancelled: tokio_util::sync::CancellationToken::new(),
             id: "control".into(),
             sender,
             terminal: true,

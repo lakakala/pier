@@ -370,6 +370,8 @@ mod tests {
                 "agents",
                 "agent",
                 &AgentRecord {
+                    proxy: None,
+                    connection: Default::default(),
                     id: "agent".into(),
                     name: "test".into(),
                     token_hash: "test".into(),

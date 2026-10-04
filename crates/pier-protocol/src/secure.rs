@@ -98,33 +98,43 @@ pub async fn connect(
     key: &[u8; 32],
 ) -> Result<SecureStream> {
     timeout(Duration::from_secs(10), async {
-        ensure!(crate::safe_id(id), "invalid peer id");
-        let mut io = TcpStream::connect(endpoint).await?;
-        io.set_nodelay(true)?;
-        let raw = serde_json::to_vec(&Prelude {
-            version: crate::VERSION,
-            purpose,
-            id: id.into(),
-        })?;
-        io.write_all(MAGIC).await?;
-        write_record(&mut io, &raw).await?;
-        let binding = prologue(&raw);
-        let mut handshake = snow::Builder::new(PATTERN.parse()?)
-            .psk(0, key)?
-            .prologue(&binding)?
-            .build_initiator()?;
-        let mut output = vec![0; MAX_RECORD];
-        let n = handshake.write_message(&[], &mut output)?;
-        write_record(&mut io, &output[..n]).await?;
-        let reply = read_record(&mut io).await?;
-        ensure!(
-            handshake.read_message(&reply, &mut output)? == 0,
-            "unexpected handshake payload"
-        );
-        Ok::<_, anyhow::Error>(SecureStream::new(io, handshake.into_transport_mode()?))
+        connect_stream(TcpStream::connect(endpoint).await?, purpose, id, key).await
     })
     .await
     .context("encrypted connection timed out")?
+}
+
+/// Authenticate an already connected TCP stream (including a proxy tunnel).
+/// The caller must bound connection establishment and this handshake with one timeout.
+pub async fn connect_stream(
+    mut io: TcpStream,
+    purpose: Purpose,
+    id: &str,
+    key: &[u8; 32],
+) -> Result<SecureStream> {
+    ensure!(crate::safe_id(id), "invalid peer id");
+    io.set_nodelay(true)?;
+    let raw = serde_json::to_vec(&Prelude {
+        version: crate::VERSION,
+        purpose,
+        id: id.into(),
+    })?;
+    io.write_all(MAGIC).await?;
+    write_record(&mut io, &raw).await?;
+    let binding = prologue(&raw);
+    let mut handshake = snow::Builder::new(PATTERN.parse()?)
+        .psk(0, key)?
+        .prologue(&binding)?
+        .build_initiator()?;
+    let mut output = vec![0; MAX_RECORD];
+    let n = handshake.write_message(&[], &mut output)?;
+    write_record(&mut io, &output[..n]).await?;
+    let reply = read_record(&mut io).await?;
+    ensure!(
+        handshake.read_message(&reply, &mut output)? == 0,
+        "unexpected handshake payload"
+    );
+    Ok::<_, anyhow::Error>(SecureStream::new(io, handshake.into_transport_mode()?))
 }
 
 /// The caller has already read and validated the bounded prelude and selected
@@ -150,6 +160,7 @@ pub async fn accept(mut io: TcpStream, raw: &[u8], key: &[u8; 32]) -> Result<Sec
 /// A bounded, cancellation-safe encrypted stream. Flush completes the network
 /// write, so dropping a framed stream after `send` cannot lose its final reply.
 pub struct SecureStream {
+    cancelled: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
     io: TcpStream,
     transport: snow::TransportState,
     header: [u8; 2],
@@ -163,8 +174,27 @@ pub struct SecureStream {
     failed: bool,
 }
 impl SecureStream {
+    pub fn cancel_on(&mut self, token: tokio_util::sync::CancellationToken) {
+        self.cancelled = Some(Box::pin(token.cancelled_owned()));
+    }
+    fn check_cancelled(&mut self, cx: &mut TaskContext<'_>) -> std::io::Result<()> {
+        if self.failed {
+            return Err(std::io::ErrorKind::ConnectionAborted.into());
+        }
+        if self
+            .cancelled
+            .as_mut()
+            .is_some_and(|f| f.as_mut().poll(cx).is_ready())
+        {
+            self.failed = true;
+            return Err(std::io::ErrorKind::ConnectionAborted.into());
+        }
+        Ok(())
+    }
+
     fn new(io: TcpStream, transport: snow::TransportState) -> Self {
         Self {
+            cancelled: None,
             io,
             transport,
             header: [0; 2],
@@ -242,6 +272,9 @@ impl AsyncRead for SecureStream {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
         if self.failed {
             return Poll::Ready(Err(std::io::ErrorKind::InvalidData.into()));
         }
@@ -270,8 +303,14 @@ impl AsyncWrite for SecureStream {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        if let Err(error) = self.check_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
         if self.failed {
             return Poll::Ready(Err(std::io::ErrorKind::InvalidData.into()));
+        }
+        if let Err(error) = self.check_cancelled(cx) {
+            return Poll::Ready(Err(error));
         }
         std::task::ready!(self.flush_pending(cx))?;
         if buf.is_empty() {
@@ -291,6 +330,9 @@ impl AsyncWrite for SecureStream {
         Poll::Ready(Ok(n))
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
         std::task::ready!(self.flush_pending(cx))?;
         Pin::new(&mut self.io).poll_flush(cx)
     }
@@ -298,6 +340,9 @@ impl AsyncWrite for SecureStream {
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
         std::task::ready!(self.flush_pending(cx))?;
         Pin::new(&mut self.io).poll_shutdown(cx)
     }

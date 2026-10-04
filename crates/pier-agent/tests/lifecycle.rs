@@ -297,6 +297,8 @@ fn real_controller_agent_lifecycle() {
         reqwest::StatusCode::UNAUTHORIZED
     );
     let request = pier_protocol::enrollment::InitRequest {
+        connection_mode: Default::default(),
+        listen: None,
         request_id: pier_protocol::new_token(),
         name: "fixture".into(),
         public_url: "https://pier.example.test".into(),
@@ -638,6 +640,8 @@ fn real_controller_agent_lifecycle() {
     let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
     let local = pier_agent::Runtime::open(
         pier_agent::Config {
+            connection_mode: Default::default(),
+            listen: None,
             agent_id: agent_id.into(),
             token_file: dir.join("agent.token"),
             controller_tcp: format!("127.0.0.1:{tcp_port}"),

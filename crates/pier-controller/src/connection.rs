@@ -2,7 +2,10 @@ use crate::{AgentRecord, Controller, Job, Session};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use pier_protocol::secure::{self, Purpose};
-use pier_protocol::{AgentReport, DeploymentResult, Message};
+use pier_protocol::{
+    AgentReport, DeploymentResult, Message,
+    connection::{ConnectionMode, Wire},
+};
 use std::{sync::Arc, time::Duration};
 use tokio::io::AsyncReadExt;
 use tokio::{
@@ -10,6 +13,7 @@ use tokio::{
     sync::mpsc,
     time::{Instant, timeout},
 };
+use tokio_util::sync::CancellationToken;
 
 pub async fn listen(state: Arc<Controller>, listener: TcpListener) -> Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(256));
@@ -55,6 +59,7 @@ fn report(state: &Controller, agent_id: &str, report: AgentReport) -> Result<()>
     if let Some(result_value) = &report.result {
         result(state, agent_id, result_value)?;
     }
+    let _guard = state.mutation_lock.lock().unwrap();
     let mut record: AgentRecord = state
         .store
         .get("agents", agent_id)?
@@ -73,6 +78,10 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
                 .store
                 .get("agents", &prelude.id)?
                 .context("unknown agent")?;
+            ensure!(
+                agent.connection.mode == ConnectionMode::AgentToController,
+                "agent must accept controller connections"
+            );
             secure::decode_key(&agent.token_hash)?
         };
         let stream = secure::accept(socket, &raw, &key).await?;
@@ -97,6 +106,10 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
             else {
                 anyhow::bail!("enrollment request required");
             };
+            ensure!(
+                request.connection_mode.is_default(),
+                "passive enrollment requires controller dial"
+            );
             let credentials = state.issue_credentials(&prelude.id, request, &key)?;
             timeout(
                 Duration::from_secs(10),
@@ -138,6 +151,19 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
             return crate::terminal::attach(&state, &prelude.id, stream).await;
         }
     }
+    control(state, prelude.id, stream, CancellationToken::new(), false).await
+}
+
+pub(crate) async fn control(
+    state: Arc<Controller>,
+    expected: String,
+    mut stream: Wire,
+    cancelled: CancellationToken,
+    reverse: bool,
+) -> Result<()> {
+    let _cancel_guard = cancelled.clone().drop_guard();
+    stream.get_mut().cancel_on(cancelled.clone());
+    let session_id = pier_protocol::new_id();
     let Message::Hello {
         version,
         agent_id,
@@ -151,18 +177,32 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
         version == pier_protocol::VERSION,
         "unsupported protocol version"
     );
-    let mut record: AgentRecord = state
-        .store
-        .get("agents", &agent_id)?
-        .context("unknown agent")?;
-    ensure!(agent_id == prelude.id, "authenticated identity mismatch");
+    ensure!(agent_id == expected, "authenticated identity mismatch");
     ensure!(
         info.hostname.len() <= 256 && info.os_release.len() <= 8192,
         "invalid host information"
     );
-    record.info = Some(info);
-    record.last_seen = Some(pier_protocol::now());
-    state.store.put("agents", &agent_id, &record)?;
+    let record = {
+        let _guard = state.mutation_lock.lock().unwrap();
+        ensure!(!cancelled.is_cancelled(), "connection settings changed");
+        let mut record: AgentRecord = state
+            .store
+            .get("agents", &agent_id)?
+            .context("unknown agent")?;
+        record.info = Some(info);
+        record.last_seen = Some(pier_protocol::now());
+        state.store.put("agents", &agent_id, &record)?;
+        record
+    };
+    if reverse {
+        pier_protocol::send(
+            &mut stream,
+            &Message::Session {
+                id: session_id.clone(),
+            },
+        )
+        .await?;
+    }
     state.record_software(&agent_id, software.as_ref())?;
     pier_protocol::send(
         &mut stream,
@@ -186,7 +226,6 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
         .iter()
         .any(|v| v == pier_protocol::terminal::CAPABILITY);
     report(&state, &agent_id, initial)?;
-    let session_id = pier_protocol::new_id();
     let (sender, mut receiver) = mpsc::channel(8);
     {
         let mut sessions = state.sessions.lock().unwrap();
@@ -197,10 +236,27 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
                 id: session_id.clone(),
                 sender,
                 terminal,
+                cancelled: cancelled.clone(),
             },
         );
     }
-    let result = async {
+    struct Guard(Arc<Controller>, String, String);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.terminals.disconnect_agent(&self.1, &self.2);
+            let mut sessions = self.0.sessions.lock().unwrap();
+            if sessions.get(&self.1).is_some_and(|s| s.id == self.2) {
+                sessions.remove(&self.1);
+            }
+        }
+    }
+    let _guard = Guard(state.clone(), agent_id.clone(), session_id.clone());
+    if reverse {
+        state.complete_passive_enrollment(&agent_id)?;
+    }
+    let channel_slots = Arc::new(tokio::sync::Semaphore::new(16));
+    let mut channel_ids = std::collections::BTreeMap::<String, Instant>::new();
+    async {
         for job in state.store.list::<Job>("jobs")? {
             if job.agent_id == agent_id && job.active() && job.plan.is_some() { state.dispatch(&job.id).await?; }
         }
@@ -213,6 +269,22 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
                     match message? {
                         Message::Ping => pier_protocol::send(&mut stream, &Message::Pong).await?,
                         Message::Pong => (),
+                        Message::OpenChannel { session, id, purpose } => {
+                            ensure!(reverse && session == session_id && pier_protocol::safe_id(&id), "invalid channel request");
+                            ensure!(matches!(purpose, Purpose::Artifact | Purpose::Upgrade | Purpose::Terminal), "invalid channel purpose");
+                            channel_ids.retain(|_, seen| seen.elapsed() < Duration::from_secs(60));
+                            ensure!(channel_ids.len() < 4096 && channel_ids.insert(id.clone(), Instant::now()).is_none(), "replayed or excessive channel requests");
+                            let permit = channel_slots.clone().try_acquire_owned().context("too many business channels")?;
+                            let state = state.clone();
+                            let agent = record.clone();
+                            let cancelled = cancelled.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if reverse_channel(state, agent, session, id, purpose, cancelled).await.is_err() {
+                                    tracing::debug!("reverse business channel closed");
+                                }
+                            });
+                        }
                         Message::Report { report: value } => report(&state, &agent_id, value)?,
                         Message::Result { result: value } => result(&state, &agent_id, &value)?,
                         Message::Progress { id, phase } => {
@@ -235,13 +307,59 @@ async fn connection(state: Arc<Controller>, mut socket: TcpStream) -> Result<()>
             }
         }
         #[allow(unreachable_code)] Ok::<(),anyhow::Error>(())
-    }.await;
-    state.terminals.disconnect_agent(&agent_id, &session_id);
-    let mut sessions = state.sessions.lock().unwrap();
-    if sessions.get(&agent_id).is_some_and(|s| s.id == session_id) {
-        sessions.remove(&agent_id);
+    }.await
+}
+
+async fn reverse_channel(
+    state: Arc<Controller>,
+    agent: AgentRecord,
+    session: String,
+    id: String,
+    purpose: Purpose,
+    cancelled: CancellationToken,
+) -> Result<()> {
+    let key = secure::decode_key(&agent.token_hash)?;
+    let endpoint = agent
+        .connection
+        .endpoint
+        .as_deref()
+        .context("agent endpoint required")?;
+    let io = tokio::select! {
+        _ = cancelled.cancelled() => anyhow::bail!("control disconnected"),
+        result = crate::proxy::connect(endpoint, agent.proxy.as_ref(), purpose, &agent.id, &key) => result?,
+    };
+    let mut wire = pier_protocol::framed(io);
+    wire.get_mut().cancel_on(cancelled);
+    timeout(
+        Duration::from_secs(10),
+        pier_protocol::send(
+            &mut wire,
+            &Message::Channel {
+                session,
+                id,
+                purpose,
+            },
+        ),
+    )
+    .await??;
+    match purpose {
+        Purpose::Artifact => {
+            timeout(
+                Duration::from_secs(300),
+                artifact(&state, &agent.id, &mut wire),
+            )
+            .await?
+        }
+        Purpose::Upgrade => {
+            timeout(
+                Duration::from_secs(300),
+                crate::upgrades::serve(&state, &agent.id, &mut wire),
+            )
+            .await?
+        }
+        Purpose::Terminal => crate::terminal::attach(&state, &agent.id, wire).await,
+        _ => anyhow::bail!("invalid business purpose"),
     }
-    result
 }
 
 async fn artifact(

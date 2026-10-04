@@ -221,6 +221,124 @@ test.describe.serial('controller console over HTTPS', () => {
     await expect.poll(() => closed).toBeGreaterThan(before);
     await expect(page.locator('.app-terminal')).toHaveCount(0);
   });
+  test('passive enrollment SOCKS5 retry and connection proxy editing', async ({ page }) => {
+    await login(page);
+    const request = {
+      request_id: 'ab'.repeat(32),
+      name: 'passive-browser',
+      public_url: new URL(page.url()).origin,
+      connection_mode: 'controller_to_agent',
+      listen: '0.0.0.0:7444',
+      info: { architecture: 'amd64', hostname: 'passive-browser', os_release: 'test' },
+    };
+    let enrollment: Record<string, unknown> | undefined;
+    await page.route('**/v1/enrollments', async (route) => {
+      enrollment = route.request().postDataJSON();
+      await route.fulfill({
+        json: {
+          id: request.request_id,
+          pairing: 'pier-pair-v2.test',
+          expires_at: Math.floor(Date.now() / 1000) + 600,
+        },
+      });
+    });
+    await page.route(`**/v1/enrollments/${request.request_id}`, (route) =>
+      route.fulfill({ json: { state: 'authorized', agent_id: null } }),
+    );
+    await page.goto(`/agent/init#${Buffer.from(JSON.stringify(request)).toString('base64url')}`);
+    await expect(page.getByText('Controller → Agent', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: '授权接入', exact: true })).toBeDisabled();
+    await page.getByLabel('Agent 可达地址', { exact: true }).fill('agent.example.test:7444');
+    await page.getByRole('combobox', { name: '连接代理' }).click();
+    await page.getByTitle('替换代理', { exact: true }).click();
+    await expect(page.getByRole('button', { name: '授权接入', exact: true })).toBeDisabled();
+    await page
+      .getByLabel('SOCKS5 代理地址', { exact: true })
+      .fill('socks5://user:password@proxy.test:1080');
+    await expect(page.getByLabel('SOCKS5 代理地址', { exact: true })).toHaveAttribute(
+      'type',
+      'password',
+    );
+    await page.getByRole('button', { name: '授权接入', exact: true }).click();
+    await expect(page.getByLabel('一次性配对凭据')).toHaveValue('pier-pair-v2.test');
+    expect(enrollment).toMatchObject({
+      connection_mode: 'controller_to_agent',
+      agent_endpoint: 'agent.example.test:7444',
+      agent_proxy: 'socks5://user:password@proxy.test:1080',
+    });
+    await expect(page.getByLabel('SOCKS5 代理地址', { exact: true })).toHaveCount(0);
+    await expect(page.getByLabel('Agent 可达地址', { exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: '更新代理并重试', exact: true }).click();
+    await expect.poll(() => enrollment).not.toHaveProperty('agent_proxy');
+    await page.getByRole('combobox', { name: '连接代理' }).click();
+    await page.getByTitle('替换代理', { exact: true }).click();
+    await page
+      .getByLabel('SOCKS5 代理地址', { exact: true })
+      .fill('socks5://fixed:secret@proxy.test:1080');
+    await page.getByRole('button', { name: '更新代理并重试', exact: true }).click();
+    await expect.poll(() => enrollment?.agent_proxy).toBe('socks5://fixed:secret@proxy.test:1080');
+    await expect(page.getByLabel('一次性配对凭据')).toHaveValue('pier-pair-v2.test');
+    let proxyConfigured = true;
+    let connectionPatch: Record<string, unknown> | undefined;
+    let endpoint = 'agent.example.test:7444';
+    let busy = true;
+    await page.route('**/v1/agents/passive-browser', (route) =>
+      route.fulfill({
+        json: {
+          id: 'passive-browser',
+          name: 'passive-browser',
+          online: false,
+          info: null,
+          last_seen: 1,
+          connection: {
+            mode: 'controller_to_agent',
+            endpoint,
+            proxy_configured: proxyConfigured,
+            state: 'reconnecting',
+            last_error: '连接失败，正在重试',
+          },
+          software: null,
+          upgrade: { target: null, status: null, reason: null },
+          report: { apps: [], deployment_id: null, result: null },
+        },
+      }),
+    );
+    await page.route('**/v1/agents/passive-browser/binding', (route) =>
+      route.fulfill({ status: 404, json: { error: 'resource not found' } }),
+    );
+    await page.route('**/v1/agents/passive-browser/connection', (route) => {
+      if (busy)
+        return route.fulfill({ status: 409, json: { error: 'agent is deploying or upgrading' } });
+      connectionPatch = route.request().postDataJSON();
+      endpoint = connectionPatch!.endpoint as string;
+      if (connectionPatch!.proxy !== undefined) proxyConfigured = connectionPatch!.proxy !== null;
+      return route.fulfill({ json: {} });
+    });
+    await page.goto('/agents/passive-browser');
+    await expect(page.getByText('连接失败，正在重试')).toBeVisible();
+    await page.getByLabel('Agent 可达地址', { exact: true }).fill('next.example.test:7444');
+    await page.getByRole('button', { name: '保存并重连' }).click();
+    await expect(page.getByText('agent is deploying or upgrading')).toBeVisible();
+    busy = false;
+    await page.getByRole('button', { name: '保存并重连' }).click();
+    await expect.poll(() => endpoint).toBe('next.example.test:7444');
+    expect(connectionPatch).not.toHaveProperty('proxy');
+    await expect(page.getByText('连接代理：已配置 SOCKS5')).toBeVisible();
+    await page.getByRole('combobox', { name: '连接代理' }).click();
+    await page.getByTitle('不使用代理', { exact: true }).click();
+    await page.getByRole('button', { name: '保存并重连' }).click();
+    await expect.poll(() => connectionPatch?.proxy).toBeNull();
+    await expect(page.getByText('连接代理：直连')).toBeVisible();
+    await page.getByRole('combobox', { name: '连接代理' }).click();
+    await page.getByTitle('替换代理', { exact: true }).click();
+    await page
+      .getByLabel('SOCKS5 代理地址', { exact: true })
+      .fill('socks5://new:secret@new-proxy.test:1080');
+    await page.getByRole('button', { name: '保存并重连' }).click();
+    await expect.poll(() => connectionPatch?.proxy).toBe('socks5://new:secret@new-proxy.test:1080');
+    await expect(page.getByLabel('SOCKS5 代理地址', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('连接代理：已配置 SOCKS5')).toBeVisible();
+  });
   test('repository, declarations, binding edits and deployment flow', async ({
     page,
   }, testInfo) => {

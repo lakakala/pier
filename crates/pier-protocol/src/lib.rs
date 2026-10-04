@@ -1,3 +1,4 @@
+pub mod connection;
 pub mod enrollment;
 pub mod secure;
 pub mod store;
@@ -78,6 +79,19 @@ pub struct DeploymentResult {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
+    Session {
+        id: String,
+    },
+    OpenChannel {
+        session: String,
+        id: String,
+        purpose: secure::Purpose,
+    },
+    Channel {
+        session: String,
+        id: String,
+        purpose: secure::Purpose,
+    },
     Hello {
         version: u32,
         agent_id: String,

@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use pier_protocol::{
-    secure::{self, Purpose},
+    secure::Purpose,
     terminal::{self as protocol, Frame},
 };
 use std::{
@@ -278,15 +278,7 @@ pub(crate) async fn serve(
     request: Request,
     cancelled: CancellationToken,
 ) -> Result<()> {
-    let token = fs::read_to_string(&runtime.config.token_file)?;
-    let stream = secure::connect(
-        &runtime.config.controller_tcp,
-        Purpose::Terminal,
-        &runtime.config.agent_id,
-        &secure::token_key(&token),
-    )
-    .await?;
-    let mut wire = pier_protocol::framed(stream);
+    let mut wire = runtime.transport.open(Purpose::Terminal).await?;
     wire.codec_mut().set_max_frame_length(protocol::MAX_FRAME);
     protocol::send(
         &mut wire,

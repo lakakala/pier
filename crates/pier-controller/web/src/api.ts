@@ -24,6 +24,13 @@ export interface Catalog {
   blueprints: Record<string, Blueprint>;
 }
 export interface Agent {
+  connection?: {
+    mode: 'agent_to_controller' | 'controller_to_agent';
+    proxy_configured: boolean;
+    endpoint: string | null;
+    state: 'connected' | 'reconnecting' | 'waiting';
+    last_error: string | null;
+  };
   id: string;
   name: string;
   online: boolean;

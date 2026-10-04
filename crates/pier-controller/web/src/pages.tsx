@@ -1,3 +1,10 @@
+import {
+  AgentConnection,
+  connectionLabel,
+  ConnectionProxy,
+  proxyValue,
+  type ProxyMode,
+} from './connection';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
@@ -359,6 +366,7 @@ export function Agents() {
                 <Tag color={v ? 'success' : 'default'}>{v ? '在线' : '离线'}</Tag>
               ),
             },
+            { title: '连接方式', render: (_, a) => connectionLabel(a) },
             { title: '主机', render: (_, a) => a.info?.hostname ?? '—' },
             { title: '架构', render: (_, a) => a.info?.architecture ?? '—' },
             { title: 'Agent 版本', render: (_, a) => a.software?.version ?? '未知' },
@@ -711,6 +719,7 @@ export function AgentDetail() {
                 </Tag>
               ),
             },
+            { key: 'direction', label: '连接方式', children: connectionLabel(value) },
             { key: 'arch', label: '架构', children: value.info?.architecture ?? '—' },
             { key: 'host', label: '主机', children: value.info?.hostname ?? '—' },
             { key: 'seen', label: '最近上报', children: date(value.last_seen) },
@@ -733,6 +742,7 @@ export function AgentDetail() {
             { key: 'os', label: '发行信息', children: <pre>{value.info?.os_release ?? '—'}</pre> },
           ]}
         />
+        <AgentConnection key={value.connection?.endpoint} agent={value} refresh={agent.refresh} />
         {upgrading(value) && (
           <Alert
             className="block-gap"
@@ -921,6 +931,8 @@ export function DeploymentDetail() {
   );
 }
 interface InitRequest {
+  connection_mode?: 'agent_to_controller' | 'controller_to_agent';
+  listen?: string;
   request_id: string;
   name: string;
   public_url: string;
@@ -939,6 +951,9 @@ function decodeRequest(hash: string): InitRequest {
     value.public_url !== location.origin ||
     !/^[a-f0-9]{64}$/.test(value.request_id) ||
     typeof value.name !== 'string' ||
+    (value.connection_mode !== undefined &&
+      !['agent_to_controller', 'controller_to_agent'].includes(value.connection_mode)) ||
+    (value.connection_mode === 'controller_to_agent' && typeof value.listen !== 'string') ||
     !value.info ||
     !['amd64', 'arm64'].includes(value.info.architecture) ||
     typeof value.info.hostname !== 'string' ||
@@ -953,6 +968,10 @@ export function Enrollment() {
   const [pending, setPending] = useState(false);
   const [cancelled, setCancelled] = useState(false);
   const [pairing, setPairing] = useState('');
+  const [endpoint, setEndpoint] = useState('');
+  const [proxyMode, setProxyMode] = useState<ProxyMode>('keep');
+  const [proxy, setProxy] = useState('');
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [grant, setGrant] = useState<{ id: string; expires_at: number }>();
   const [state, setState] = useState('');
   const [agentId, setAgentId] = useState<string>();
@@ -966,6 +985,10 @@ export function Enrollment() {
   }, [location.hash]);
   useEffect(() => {
     setPairing('');
+    setEndpoint('');
+    setProxyMode('keep');
+    setProxy('');
+    setConnectionError(null);
     setGrant(undefined);
     setState('');
     setAgentId(undefined);
@@ -976,7 +999,7 @@ export function Enrollment() {
     if (!grant) return;
     const controller = new AbortController();
     const timer = setInterval(() => {
-      void api<{ state: string; agent_id: string | null }>(
+      void api<{ state: string; agent_id: string | null; last_error?: string | null }>(
         `/v1/enrollments/${grant.id}`,
         'GET',
         undefined,
@@ -986,6 +1009,7 @@ export function Enrollment() {
         .then((value) => {
           if (controller.signal.aborted) return;
           setState(value.state);
+          setConnectionError(value.last_error ?? null);
           if (value.agent_id) setAgentId(value.agent_id);
           if (['completed', 'expired'].includes(value.state)) {
             setPairing('');
@@ -1012,12 +1036,52 @@ export function Enrollment() {
             column={1}
             items={[
               { key: 'name', label: '名称', children: request.name },
+              {
+                key: 'mode',
+                label: '连接方式',
+                children:
+                  request.connection_mode === 'controller_to_agent'
+                    ? 'Controller → Agent'
+                    : 'Agent → Controller',
+              },
+              ...(request.listen
+                ? [{ key: 'listen', label: 'Agent 本机监听', children: request.listen }]
+                : []),
               { key: 'host', label: '主机', children: request.info.hostname },
               { key: 'arch', label: '架构', children: request.info.architecture },
               { key: 'os', label: '发行信息', children: <pre>{request.info.os_release}</pre> },
               { key: 'id', label: '请求', children: request.request_id },
             ]}
           />
+          {request.connection_mode === 'controller_to_agent' &&
+            !cancelled &&
+            state !== 'completed' && (
+              <Form layout="vertical">
+                <Form.Item
+                  label="Agent 可达地址"
+                  required
+                  extra="填写 Controller 能访问的域名/IP 和端口；使用 NAT 时填写映射后的地址。"
+                >
+                  <Input
+                    aria-label="Agent 可达地址"
+                    value={endpoint}
+                    disabled={!!pairing || pending}
+                    onChange={(e) => setEndpoint(e.target.value)}
+                    placeholder="agent.example.com:7444"
+                  />
+                </Form.Item>
+                <ConnectionProxy
+                  mode={proxyMode}
+                  setMode={setProxyMode}
+                  value={proxy}
+                  setValue={setProxy}
+                  disabled={pending}
+                />
+              </Form>
+            )}
+          {connectionError && state !== 'completed' && (
+            <Alert type="warning" title={connectionError} />
+          )}
           {cancelled ? (
             <Alert type="info" title="已取消授权，可在终端按 Ctrl+C 结束初始化。" />
           ) : (
@@ -1058,35 +1122,51 @@ export function Enrollment() {
                   </Button>
                 </>
               )}
-              {!pairing && state !== 'completed' && (
-                <Space>
-                  <Button
-                    type="primary"
-                    loading={pending}
-                    onClick={async () => {
-                      setPending(true);
-                      setError(undefined);
-                      try {
-                        const value = await api<{
-                          id: string;
-                          pairing: string;
-                          expires_at: number;
-                        }>('/v1/enrollments', 'POST', request);
-                        setPairing(value.pairing);
-                        setGrant({ id: value.id, expires_at: value.expires_at });
-                        setState('authorized');
-                      } catch (e) {
-                        setError(e as Error);
-                      } finally {
-                        setPending(false);
+              {(!pairing || request.connection_mode === 'controller_to_agent') &&
+                state !== 'completed' && (
+                  <Space>
+                    <Button
+                      type="primary"
+                      loading={pending}
+                      disabled={
+                        request.connection_mode === 'controller_to_agent' &&
+                        (!endpoint.trim() || (proxyMode === 'set' && !proxy))
                       }
-                    }}
-                  >
-                    {state === 'expired' ? '重新授权' : '授权接入'}
-                  </Button>
-                  <Button onClick={() => setCancelled(true)}>取消</Button>
-                </Space>
-              )}
+                      onClick={async () => {
+                        setPending(true);
+                        setError(undefined);
+                        try {
+                          const value = await api<{
+                            id: string;
+                            pairing: string;
+                            expires_at: number;
+                          }>('/v1/enrollments', 'POST', {
+                            ...request,
+                            ...(request.connection_mode === 'controller_to_agent'
+                              ? {
+                                  agent_endpoint: endpoint.trim(),
+                                  agent_proxy: proxyValue(proxyMode, proxy),
+                                }
+                              : {}),
+                          });
+                          setPairing(value.pairing);
+                          setGrant({ id: value.id, expires_at: value.expires_at });
+                          setState('authorized');
+                          setProxy('');
+                          setProxyMode('keep');
+                          setConnectionError(null);
+                        } catch (e) {
+                          setError(e as Error);
+                        } finally {
+                          setPending(false);
+                        }
+                      }}
+                    >
+                      {pairing ? '更新代理并重试' : state === 'expired' ? '重新授权' : '授权接入'}
+                    </Button>
+                    <Button onClick={() => setCancelled(true)}>取消</Button>
+                  </Space>
+                )}
             </>
           )}
         </Card>

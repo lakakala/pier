@@ -27,7 +27,33 @@ sudo pier-agent init
 
 首次安装只安装程序、unit 和文档，不启动或启用 agent，也不要求在软件包安装脚本中输入信息。`init` 需要 root、交互终端和运行中的 systemd；SSH 场景可使用 `ssh -t`。界面支持方向键和回车，`TERM=dumb` 使用数字菜单。
 
-向导依次填写 controller 的 **HTTPS 网页地址**、agent 名称（默认主机名），选择数据目录，确认后显示授权链接。可在另一台电脑打开链接，也可选择尝试打开本机浏览器。网页登录管理员账号后核对服务器信息，并批准接入，然后将一次性配对凭据粘贴回终端。配对输入不回显。初始化成功后自动执行 `systemctl enable --now pier-agent` 并退出向导，服务在后台运行。
+向导依次填写 controller 的 **HTTPS 网页地址**、选择连接方式、agent 名称（默认主机名），选择数据目录，确认后显示授权链接。可在另一台电脑打开链接，也可选择尝试打开本机浏览器。网页登录管理员账号后核对服务器信息，并批准接入，然后将一次性配对凭据粘贴回终端。配对输入不回显。初始化成功后自动执行 `systemctl enable --now pier-agent` 并退出向导，服务在后台运行。
+
+连接方式默认“Agent 主动连接 Controller”，沿用现有网络要求。选择“Controller 主动连接 Agent”时，向导要求本机监听地址（默认 `0.0.0.0:7444`），Web 授权页要求填写 controller 能访问的 agent 地址，例如 `agent.example.com:7444` 或 `[2001:db8::1]:7444`。本机监听地址与可达地址可以不同，支持 NAT 端口映射。两种模式可同时接入一个 controller；已有 agent 缺少模式配置时继续主动连接。本次不提供已有身份切换模式的向导。
+
+Web 授权页和服务器详情页可为每个被动 agent 配置独立的 SOCKS5 代理。选择“替换代理”并填写 `socks5://proxy.example.com:1080` 或 `socks5://user:password@proxy.example.com:1080`；用户名密码中的特殊字符需要 URL 百分号编码。支持无认证或用户名密码认证，目标域名由代理解析，目标及代理地址支持 IPv4/IPv6。Web 只显示“已配置 SOCKS5”或“直连”，不回显已保存的代理 URL。
+
+“保留已有代理”不会覆盖现有配置，新授权默认直连；“不使用代理”清除配置。授权尚未完成时，代理填错可点击“更新代理并重试”，原配对凭据、有效期和身份保持不变。服务器详情保存后立即重连并关闭已有终端，应用继续运行，部署或升级期间禁止修改。
+
+此代理覆盖注册、控制、部署包传输、自动升级和终端，独立于构建代理，也不读取 controller 的代理环境变量。配置仅保存在 controller 数据库，不进入 agent 配置或配对凭据。TCP 建连、SOCKS5 协商及 Noise 认证共用 10 秒超时，代理失败后显示原因并自动重试，不回退直连。仅支持 `socks5://`，URL 必须带端口，不能包含路径、查询或 fragment。
+
+被动模式下，agent 及升级辅助进程均不向 controller 发起 TCP 连接。浏览器可以在其他电脑上完成授权，配对仍通过粘贴临时凭据验证对端。controller 主动连接 agent 的同一个端口完成注册、控制、制品下载、升级和终端；业务数据使用独立认证连接，不占用心跳队列。临时监听器在配对完成后移交给 systemd 服务；正常控制握手及首次上报成功后，网页才显示注册完成。
+
+服务器详情显示连接方向、可达地址和最近连接错误。被动 agent 完成初始化后可修改可达地址，保存立即重连并关闭已有终端，应用继续运行；正在部署或升级时拒绝修改。无法连接时按 1–60 秒退避重试，地址保存在数据库并在 controller 重启后恢复。只需允许 controller 访问 agent 的监听端口；无需向被动 agent 开放 controller 的入站 TCP 端口，也不会自动修改服务器防火墙。
+
+被动 agent 配置示例（由 `init` 生成，无需手工编辑）：
+
+```yaml
+agent_id: replace-with-enrolled-agent-id
+token_file: /etc/pier/agent.token
+connection_mode: controller_to_agent
+listen: 0.0.0.0:7444
+state_dir: /var/lib/pier-agent
+heartbeat_seconds: 15
+```
+
+主动模式使用 `connection_mode: agent_to_controller`（可省略）和 `controller_tcp`，不能配置 `listen`；被动模式必须配置非零监听端口，不能配置 `controller_tcp`。controller 初始化中的 `agent_endpoint` 仍是主动 agent 连接的 controller 公布地址，与每个被动 agent 的可达地址分别维护。
+
 
 配置固定保存在 `/etc/pier/agent.yml`，独立 token 保存在 `/etc/pier/agent.token`，两者权限均为 `0600`。数据目录默认为 `/var/lib/pier-agent`。初始化进度保存在受限权限的 `/etc/pier/agent.init.json`；取消或网络中断后再次运行 `init` 可继续，过期凭据需重新在网页授权。已有配置时可选择启动服务、查看状态或退出，不覆盖身份、不重复注册。
 
@@ -74,7 +100,7 @@ sudo systemctl restart pier-agent
 
 应用崩溃并被自动拉起时，终端继续保留。关闭终端只结束该终端的 Bash 和会话内作业；部署、回滚、agent 升级/停止、控制连接丢失或 Web 登录失效会结束关联终端，并显示原因。网络中断最长 45 秒检测，重连创建新会话，不恢复旧 Bash。
 
-每个 agent 最多 8 个终端，controller 最多 64 个。浏览器使用同源 WSS，agent 主动建立独立 Noise 连接，复用现有通信监听端口。HTTPS 反向代理须支持 WebSocket Upgrade，见 [Nginx 示例](../examples/services/controller.nginx.conf)。服务端不记录终端输入输出；Bash 历史由账户配置决定。
+每个 agent 最多 8 个终端，controller 最多 64 个。浏览器使用同源 WSS，根据连接模式由 agent 或 controller 发起独立 Noise 连接，复用对应接收方的通信监听端口。HTTPS 反向代理须支持 WebSocket Upgrade，见 [Nginx 示例](../examples/services/controller.nginx.conf)。服务端不记录终端输入输出；Bash 历史由账户配置决定。
 
 新 controller 与旧 agent 继续使用协议 v2，原部署和自动升级流程不变；agent 升级并上报 `app_terminal_v1` 能力后启用终端按钮。接口及帧格式见 [应用终端 API](api.md#应用-bash-终端)。GitHub Actions 的六个平台安装测试覆盖真实 PTY、账户环境、流控和进程清理。
 
@@ -243,7 +269,7 @@ npm test
 
 ## 网页授权与无证书通信
 
-浏览器访问的 HTTPS 由反向代理处理，controller 本身提供 HTTP，默认 `127.0.0.1:8080`。网页运行设置中的 `public_url` 是规范的 HTTPS 来源地址，例如 `https://pier.example.com`，不含路径或末尾斜杠；`agent_endpoint` 是服务器实际可连接的 `host:port`，例如 `pier.example.com:7443`。监听地址和公开地址分开配置。未迁移旧公开地址时，首次初始化要求规范 HTTPS Origin 与保留端口的 Host 一致；初始化后固定使用当前生效的来源，不按后续请求或转发头重新推断地址。反向代理示例见 [controller.nginx.conf](../examples/services/controller.nginx.conf)。公网只开放代理的 HTTPS 和 controller 的加密 TCP 端口；后端 HTTP 应限制在本机或受保护的代理网络。
+浏览器访问的 HTTPS 由反向代理处理，controller 本身提供 HTTP，默认 `127.0.0.1:8080`。网页运行设置中的 `public_url` 是规范的 HTTPS 来源地址，例如 `https://pier.example.com`，不含路径或末尾斜杠；`agent_endpoint` 是服务器实际可连接的 `host:port`，例如 `pier.example.com:7443`。监听地址和公开地址分开配置。未迁移旧公开地址时，首次初始化要求规范 HTTPS Origin 与保留端口的 Host 一致；初始化后固定使用当前生效的来源，不按后续请求或转发头重新推断地址。反向代理示例见 [controller.nginx.conf](../examples/services/controller.nginx.conf)。根据连接模式开放代理 HTTPS，以及 controller 或 agent 的加密 TCP 监听端口；后端 HTTP 应限制在本机或受保护的代理网络。
 
 首次打开 controller 的 `/init` 页面，设置唯一管理员用户名、密码、确认密码和定义仓库，成功后自动登录。已有 YAML 仓库配置迁移后无需重复填写。初始化不需要初始化码，只允许成功一次；后续访问 `/login`。管理员账号和会话保存在 SQLite，密码使用 Argon2id 随机盐哈希；controller 重启不会重新开放初始化。
 
@@ -259,11 +285,11 @@ agent 授权链接 fragment 只携带请求 ID 和待确认的服务器信息。
 
 agent **不进行 HTTPS 连接，也不配置 CA 或证书**。初次连接使用一次性秘密通过 `Noise_NNpsk0_25519_ChaChaPoly_SHA256` 建立认证加密通道，再向加密兑换接口领取长期 token。后续连接使用 `SHA-256(token)` 的原始 32 字节作为 Noise PSK；controller 保存的 token 摘要因此也属于认证秘密，不能公开。新 token 使用系统随机源生成 32 随机字节后编码为 64 个十六进制字符。
 
-控制连接、凭据兑换和安装包下载使用不同用途的握手，用途、版本和身份绑定到握手。每次连接产生新会话密钥，不回退明文。包通过独立加密连接分块传输，要求结束标记、准确长度和 SHA-256 校验，不阻塞控制连接心跳。agent 不需要入站端口，不继承 HTTP 代理环境变量。
+控制连接、凭据兑换和安装包下载使用不同用途的握手，用途、版本和身份绑定到握手。每次连接产生新会话密钥，不回退明文。包通过独立加密连接分块传输，要求结束标记、准确长度和 SHA-256 校验，不阻塞控制连接心跳。主动模式的 agent 不需要入站端口；被动模式的 agent 需开放其监听端口。两种模式均不继承 HTTP 代理环境变量。
 
 授权兑换结果与 agent 身份在 SQLite 事务中原子保存，有效期内重复兑换返回同一份凭据。agent 持久化配置后通过长期凭据确认完成，controller 清除临时配对秘密；过期清理每 30 秒执行。确认丢失可重试，不会创建新 agent；清理是数据库逻辑更新，不承诺擦除历史备份或 SQLite WAL 中的旧字节。
 
-原有 `POST /v1/agents` 手动注册 API 保留，返回 `id` 和 `token`，仍可手动配置 agent。管理 API 与原有 HTTP 产物接口仅通过受保护的反向代理访问；agent 自身的部署包下载使用加密 TCP。默认每 15 秒上报状态，controller 45 秒无消息判定失联，agent 按 1–60 秒退避重连。
+原有 `POST /v1/agents` 手动注册 API 保留，返回 `id` 和 `token`，仍可手动配置 agent。管理 API 与原有 HTTP 产物接口仅通过受保护的反向代理访问；agent 自身的部署包下载使用加密 TCP。默认每 15 秒上报状态，controller 45 秒无消息判定失联，连接发起方按 1–60 秒退避重连。
 
 ### 从 TLS 协议 v1 迁移
 
@@ -370,3 +396,9 @@ Ubuntu 的迁移测试先安装带旧式数字修订号的测试 DEB，部署 ap
 Web 初始化与运行设置改造（2026-09-27）验证：49 项 Rust 默认测试（含文档测试）、格式检查、Clippy（`-D warnings`）通过；前端格式、TypeScript 和内嵌资源重建一致性检查通过。5 项 Chromium HTTPS 测试覆盖首次初始化、运行设置立即生效与保存后待重启、Cookie/CSRF、退出、仓库同步、变量保留与修改、部署冲突重试与进度、接入链接登录与配对、改密、会话失效及手机尺寸页面，且无 CSP 违规或未捕获脚本错误。Rust 回归另覆盖初始化端口冲突无部分提交、监听失败后修复、旧 YAML 单次迁移及重启后设置生效。部署表单的在线 agent 和任务进度使用浏览器测试替身，真实部署由独立系统测试覆盖。
 
 Controller 包测试使用独立 systemd 容器，内部启动测试专用 Docker daemon，不挂载宿主 Docker socket 或 cgroup。Docker 静态二进制仅安装到测试镜像（[官方安装说明](https://docs.docker.com/engine/install/binaries/)）。覆盖专用用户、仅两个启动字段的默认配置、初始化前无 agent 监听、网页初始化立即启用通信、运行设置保存后手动重启生效、端口冲突时 Web 可用与修复、仅手动同步、真实二进制部署，以及 Git 源码 app 在内层 Docker 中执行构建命令后的部署；源码夹具使用复制脚本的最小构建命令，验证权限和挂载，不依赖额外语言工具链。测试还验证升级 PID 不变、Cookie/数据重启恢复、崩溃拉起和卸载保留；升级夹具使用当前发布修订号的下一值，与正式产物分别存储。
+
+### 被动连接的 CI 验证
+
+GitHub Actions 的每个系统/架构包测试均保留主动与被动直连场景，并增加经 SOCKS5 连接的被动场景。被动模式在一次性容器内创建独立 agent 网络命名空间，拒绝所有主动 TCP SYN，仅允许对 controller 连接的响应；覆盖交互注册、实际部署、Web Bash、地址修改、原生自动升级和重启恢复。升级辅助进程也位于此网络命名空间，只写入本地升级日志；agent 主进程重新连接后补报状态。Rust 测试补充密钥、身份、通道会话绑定、重放、超时及断线清理校验。实际验证结论以对应提交的 Actions 结果为准。
+
+GitHub Actions 的原生系统测试在 AlmaLinux 8、AlmaLinux 9、Ubuntu 24.04 的 amd64/arm64 六种组合中运行三种连接场景：agent 主动连接、controller 直连、controller 经 SOCKS5 连接。代理场景禁止 controller 直连 agent，使用仅在代理端解析的目标域名，并检查注册、控制、部署包、升级、终端均通过代理，包含错误密码修正和系统重启恢复。

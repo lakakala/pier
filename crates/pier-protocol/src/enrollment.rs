@@ -1,3 +1,4 @@
+use crate::connection::ConnectionMode;
 use anyhow::{Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -5,6 +6,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InitRequest {
+    #[serde(default, skip_serializing_if = "ConnectionMode::is_default")]
+    pub connection_mode: ConnectionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<std::net::SocketAddr>,
     pub request_id: String,
     pub name: String,
     pub public_url: String,
@@ -12,6 +17,15 @@ pub struct InitRequest {
 }
 impl InitRequest {
     pub fn validate(&self) -> Result<()> {
+        match self.connection_mode {
+            ConnectionMode::AgentToController => {
+                ensure!(self.listen.is_none(), "unexpected agent listener")
+            }
+            ConnectionMode::ControllerToAgent => ensure!(
+                self.listen.is_some_and(|a| a.port() > 0),
+                "agent listener required"
+            ),
+        }
         ensure!(self.request_id.len() == 64, "invalid request id");
         crate::secure::decode_key(&self.request_id)?;
         ensure!(
@@ -43,6 +57,8 @@ impl InitRequest {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pairing {
+    #[serde(default, skip_serializing_if = "ConnectionMode::is_default")]
+    pub connection_mode: ConnectionMode,
     pub version: u32,
     pub grant_id: String,
     pub request_id: String,
@@ -69,7 +85,9 @@ impl Pairing {
             "invalid pairing version or id"
         );
         ensure!(
-            pairing.request_id == request.request_id && pairing.public_url == request.public_url,
+            pairing.connection_mode == request.connection_mode
+                && pairing.request_id == request.request_id
+                && pairing.public_url == request.public_url,
             "pairing belongs to another initialization or controller"
         );
         ensure!(
@@ -84,8 +102,13 @@ impl Pairing {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credentials {
+    #[serde(default, skip_serializing_if = "ConnectionMode::is_default")]
+    pub connection_mode: ConnectionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<std::net::SocketAddr>,
     pub agent_id: String,
     pub token: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub controller_tcp: String,
 }
 
@@ -124,6 +147,8 @@ mod tests {
     #[test]
     fn validates_binding_expiry_and_origins() {
         let request = InitRequest {
+            connection_mode: ConnectionMode::default(),
+            listen: None,
             request_id: crate::new_token(),
             name: "host".into(),
             public_url: "https://pier.example.test".into(),
@@ -134,6 +159,7 @@ mod tests {
             },
         };
         let mut pairing = Pairing {
+            connection_mode: ConnectionMode::default(),
             version: crate::VERSION,
             request_id: request.request_id.clone(),
             grant_id: crate::new_id(),

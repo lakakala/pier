@@ -8,6 +8,7 @@ mod network;
 mod supervisor;
 mod systemd;
 mod terminal;
+mod transport;
 pub mod upgrade;
 
 use account::Account;
@@ -58,7 +59,15 @@ impl Default for RuntimeOptions {
 pub struct Config {
     pub agent_id: String,
     pub token_file: PathBuf,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub controller_tcp: String,
+    #[serde(
+        default,
+        skip_serializing_if = "pier_protocol::connection::ConnectionMode::is_default"
+    )]
+    pub connection_mode: pier_protocol::connection::ConnectionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<std::net::SocketAddr>,
     pub state_dir: PathBuf,
     #[serde(default = "heartbeat")]
     pub heartbeat_seconds: u64,
@@ -99,6 +108,7 @@ struct Completed {
 }
 
 pub struct Runtime {
+    transport: Arc<transport::Transport>,
     terminals: Arc<terminal::Manager>,
     _lock: fs::File,
     config: Config,
@@ -139,7 +149,18 @@ impl Runtime {
             (1..=30).contains(&config.heartbeat_seconds),
             "heartbeat interval must be 1..30 seconds"
         );
-        pier_protocol::enrollment::endpoint(&config.controller_tcp)?;
+        match config.connection_mode {
+            pier_protocol::connection::ConnectionMode::AgentToController => {
+                pier_protocol::enrollment::endpoint(&config.controller_tcp)?;
+                ensure!(config.listen.is_none(), "active agent cannot listen");
+            }
+            pier_protocol::connection::ConnectionMode::ControllerToAgent => {
+                ensure!(
+                    config.controller_tcp.is_empty() && config.listen.is_some_and(|a| a.port() > 0),
+                    "passive agent requires listen and forbids controller_tcp"
+                );
+            }
+        }
         ensure!(
             fs::read_to_string(&config.token_file)?.trim().len() >= 32,
             "agent token must contain at least 32 characters"
@@ -159,6 +180,7 @@ impl Runtime {
         );
         store.put("identity", "agent_id", &config.agent_id)?;
         let state = Arc::new(Self {
+            transport: transport::Transport::new(config.clone(), events.clone()),
             terminals: Arc::new(terminal::Manager::default()),
             _lock: lock,
             config,
@@ -457,7 +479,13 @@ impl Runtime {
         for app in &plan.apps {
             self.stopped()?;
             let package = workspace.path().join(format!("{}.tar.gz", app.id));
-            network::download(&self.config, &plan.id, app, &package, &self.shutting_down)?;
+            network::download(
+                &self.transport,
+                &plan.id,
+                app,
+                &package,
+                &self.shutting_down,
+            )?;
             let extracted = workspace.path().join(&app.id);
             let manifest = pier_pkg::unpack(&package, &extracted, &app.sha256, plan.architecture)?;
             ensure!(
@@ -526,6 +554,7 @@ pub async fn run(config: Config) -> Result<()> {
     let runtime_config = config.clone();
     let runtime =
         tokio::task::spawn_blocking(move || Runtime::open(runtime_config, events_tx)).await??;
+    let accepted = runtime.transport.bind().await?;
     let upgrade_config = config.clone();
     let upgrade_runtime = runtime.clone();
     // The upgrade worker may acknowledge readiness only after local apps are restored.
@@ -533,7 +562,7 @@ pub async fn run(config: Config) -> Result<()> {
         upgrade::Manager::open(upgrade_config, upgrade_runtime)
     })
     .await??;
-    let network = network::connect(config, runtime.clone(), events_rx, upgrades);
+    let network = network::connect(config, runtime.clone(), events_rx, upgrades, accepted);
     systemd::notify_ready()?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = tokio::select! {
@@ -541,6 +570,7 @@ pub async fn run(config: Config) -> Result<()> {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
     };
+    runtime.transport.stop();
     tokio::task::spawn_blocking(move || runtime.shutdown()).await?;
     result
 }

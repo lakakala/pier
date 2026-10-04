@@ -235,7 +235,7 @@ impl Manager {
                     Some("upgrade worker stopped; manual recovery required".into()),
                 )?;
             }
-            let _ = report(&self.config, &job.status).await;
+            let _ = report(&self.runtime.transport, &job.status).await;
             self.runtime
                 .maintenance
                 .store(job.status.phase.active(), Ordering::SeqCst);
@@ -275,14 +275,14 @@ impl Manager {
             previous_pid: std::process::id(),
         };
         save(&mut job, Phase::Downloading, None)?;
-        let _ = report(&self.config, &job.status).await;
+        let _ = report(&self.runtime.transport, &job.status).await;
         let path = Path::new(ROOT).join(release.filename());
         let mut retry = 30;
         while release.verify(&path).is_err() {
             if !self.wanted(&release) {
                 return Ok(());
             }
-            match download(&self.config, &release, &path).await {
+            match download(&self.runtime.transport, &release, &path).await {
                 Ok(()) => break,
                 Err(_) => {
                     save(
@@ -290,7 +290,7 @@ impl Manager {
                         Phase::Downloading,
                         Some("package download interrupted; retrying".into()),
                     )?;
-                    let _ = report(&self.config, &job.status).await;
+                    let _ = report(&self.runtime.transport, &job.status).await;
                     tokio::time::sleep(Duration::from_secs(retry)).await;
                     retry = (retry * 2).min(300);
                 }
@@ -307,17 +307,17 @@ impl Manager {
                 Phase::Failed,
                 Some("downloaded package validation failed; manual recovery required".into()),
             )?;
-            let _ = report(&self.config, &job.status).await;
+            let _ = report(&self.runtime.transport, &job.status).await;
             return Ok(());
         }
         save(&mut job, Phase::Waiting, None)?;
-        let _ = report(&self.config, &job.status).await;
+        let _ = report(&self.runtime.transport, &job.status).await;
         loop {
             if !self.wanted(&release) {
                 return Ok(());
             }
             let granted = exchange(
-                &self.config,
+                &self.runtime.transport,
                 Message::UpgradeReserve {
                     sha256: release.sha256.clone(),
                 },
@@ -331,7 +331,7 @@ impl Manager {
                         Phase::Failed,
                         Some("local deployment was not idle; manual recovery required".into()),
                     )?;
-                    let _ = report(&self.config, &job.status).await;
+                    let _ = report(&self.runtime.transport, &job.status).await;
                     return Ok(());
                 }
                 if let Err(error) = save(&mut job, Phase::Installing, None) {
@@ -339,7 +339,7 @@ impl Manager {
                     job.status.phase = Phase::Failed;
                     job.status.error =
                         Some("cannot persist installation; manual recovery required".into());
-                    let _ = report(&self.config, &job.status).await;
+                    let _ = report(&self.runtime.transport, &job.status).await;
                     return Err(error);
                 }
                 let started = tokio::task::spawn_blocking(|| {
@@ -353,7 +353,7 @@ impl Manager {
                         Some("cannot start upgrade worker; manual recovery required".into()),
                     )?;
                     self.runtime.maintenance.store(false, Ordering::SeqCst);
-                    let _ = report(&self.config, &job.status).await;
+                    let _ = report(&self.runtime.transport, &job.status).await;
                 }
                 return Ok(());
             }
@@ -364,31 +364,22 @@ impl Manager {
 
 type Stream =
     tokio_util::codec::Framed<secure::SecureStream, tokio_util::codec::LengthDelimitedCodec>;
-async fn connect(config: &Config) -> Result<Stream> {
-    let token = fs::read_to_string(&config.token_file)?;
-    Ok(pier_protocol::framed(
-        secure::connect(
-            &config.controller_tcp,
-            secure::Purpose::Upgrade,
-            &config.agent_id,
-            &secure::token_key(&token),
-        )
-        .await?,
-    ))
+async fn connect(transport: &crate::transport::Transport) -> Result<Stream> {
+    transport.open(secure::Purpose::Upgrade).await
 }
-async fn exchange(config: &Config, message: Message) -> Result<Message> {
+async fn exchange(transport: &crate::transport::Transport, message: Message) -> Result<Message> {
     timeout(Duration::from_secs(15), async {
-        let mut stream = connect(config).await?;
+        let mut stream = connect(transport).await?;
         pier_protocol::send(&mut stream, &message).await?;
         pier_protocol::receive(&mut stream).await
     })
     .await?
 }
-async fn report(config: &Config, status: &Status) -> Result<()> {
+async fn report(transport: &crate::transport::Transport, status: &Status) -> Result<()> {
     ensure!(
         matches!(
             exchange(
-                config,
+                transport,
                 Message::UpgradeStatus {
                     status: status.clone()
                 }
@@ -400,11 +391,15 @@ async fn report(config: &Config, status: &Status) -> Result<()> {
     );
     Ok(())
 }
-async fn download(config: &Config, release: &Release, path: &Path) -> Result<()> {
+async fn download(
+    transport: &crate::transport::Transport,
+    release: &Release,
+    path: &Path,
+) -> Result<()> {
     timeout(Duration::from_secs(300), async {
         let staged = tempfile::NamedTempFile::new_in(ROOT)?;
         let mut file = tokio::fs::File::from_std(staged.reopen()?);
-        let mut stream = connect(config).await?;
+        let mut stream = connect(transport).await?;
         pier_protocol::send(&mut stream, &Message::UpgradeDownload { sha256: release.sha256.clone() }).await?;
         ensure!(matches!(pier_protocol::receive(&mut stream).await?, Message::ArtifactBegin { size } if size == release.size), "upgrade size mismatch");
         let mut received = 0;
@@ -429,6 +424,20 @@ async fn download(config: &Config, release: &Release, path: &Path) -> Result<()>
             }
         }
     }).await?
+}
+
+// The standalone installer must never create an outbound socket for a passive agent.
+// The running/new agent reports the durable journal through its control-session broker.
+async fn report_saved(config: &Config, status: &Status) -> Result<()> {
+    if config.connection_mode == pier_protocol::connection::ConnectionMode::ControllerToAgent {
+        return Ok(());
+    }
+    let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    report(
+        &crate::transport::Transport::new(config.clone(), events),
+        status,
+    )
+    .await
 }
 
 /// Internal entry point, launched only by the independently managed upgrade unit.
@@ -464,7 +473,7 @@ pub fn apply() -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let _ = rt.block_on(report(&job.config, &job.status));
+    let _ = rt.block_on(report_saved(&job.config, &job.status));
     result
 }
 fn install(job: &mut Transaction) -> Result<()> {
@@ -496,7 +505,7 @@ fn install(job: &mut Transaction) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let _ = rt.block_on(report(&job.config, &job.status));
+    let _ = rt.block_on(report_saved(&job.config, &job.status));
     package::bounded(
         Command::new("systemctl").args(["restart", "pier-agent.service"]),
         Duration::from_secs(1510),

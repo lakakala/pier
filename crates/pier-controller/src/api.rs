@@ -77,6 +77,7 @@ pub fn router(state: Arc<Controller>) -> Router {
         .route("/v1/blueprints", get(blueprints))
         .route("/v1/agents", post(register).get(agents))
         .route("/v1/agents/{id}", get(agent))
+        .route("/v1/agents/{id}/connection", put(update_connection))
         .route(
             "/v1/agents/{id}/apps/{instance}/terminals",
             post(crate::terminal::create),
@@ -153,20 +154,44 @@ async fn no_cache(request: Request, next: Next) -> Response {
         .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     response
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentRequest {
+    request_id: String,
+    name: String,
+    public_url: String,
+    info: pier_protocol::AgentInfo,
+    #[serde(default)]
+    connection_mode: pier_protocol::connection::ConnectionMode,
+    #[serde(default)]
+    listen: Option<std::net::SocketAddr>,
+    #[serde(default)]
+    agent_endpoint: Option<String>,
+    #[serde(default)]
+    agent_proxy: crate::proxy::Patch,
+}
 async fn enroll(
     State(state): State<Arc<Controller>>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<pier_protocol::enrollment::InitRequest>,
+    Json(input): Json<EnrollmentRequest>,
 ) -> ApiResult<Value> {
     crate::auth::check_origin(&state, &headers)?;
-    if !state.agent_ready() {
+    let request = pier_protocol::enrollment::InitRequest {
+        request_id: input.request_id,
+        name: input.name,
+        public_url: input.public_url,
+        info: input.info,
+        connection_mode: input.connection_mode,
+        listen: input.listen,
+    };
+    if request.connection_mode.is_default() && !state.agent_ready() {
         return Err(conflict(
             "agent listener unavailable; correct settings and restart controller",
         ));
     }
     let pairing = state
-        .approve_enrollment(request)
-        .map_err(|_| bad("invalid or already completed enrollment; restart init if necessary"))?;
+        .approve_connection(request, input.agent_endpoint, input.agent_proxy)
+        .map_err(|_| bad("invalid or already completed enrollment; check connection settings"))?;
     Ok(Json(
         json!({"pairing":pairing.encode()?,"id":pairing.grant_id,"expires_at":pairing.expires_at}),
     ))
@@ -255,6 +280,8 @@ async fn register(
         "agents",
         &id,
         &AgentRecord {
+            proxy: None,
+            connection: Default::default(),
             id: id.clone(),
             name: request.name,
             token_hash: pier_protocol::hash(&token),
@@ -267,6 +294,12 @@ async fn register(
 }
 fn public_agent(state: &Controller, agent: AgentRecord) -> Value {
     let mut value = json!({"id":agent.id,"name":agent.name,"info":agent.info,"last_seen":agent.last_seen,"report":agent.report,"online":state.sessions.lock().unwrap().contains_key(&agent.id)});
+    value["connection"] = state.dialer.view(
+        &agent.id,
+        &agent.connection,
+        agent.proxy.is_some(),
+        value["online"].as_bool().unwrap_or(false),
+    );
     match state.upgrade_view(&agent.id) {
         Ok(upgrade) => value
             .as_object_mut()
@@ -290,6 +323,48 @@ async fn agent(State(state): State<Arc<Controller>>, Path(id): Path<String>) -> 
         &state,
         state.store.get("agents", &id)?.ok_or_else(missing)?,
     )))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionPatch {
+    endpoint: String,
+    #[serde(default)]
+    proxy: crate::proxy::Patch,
+}
+async fn update_connection(
+    State(state): State<Arc<Controller>>,
+    Path(id): Path<String>,
+    Json(patch): Json<ConnectionPatch>,
+) -> ApiResult<Value> {
+    let _guard = state.mutation_lock.lock().unwrap();
+    let mut record: AgentRecord = state.store.get("agents", &id)?.ok_or_else(missing)?;
+    if record.connection.mode != pier_protocol::connection::ConnectionMode::ControllerToAgent {
+        return Err(conflict("connection mode is fixed during initialization"));
+    }
+    if record.last_seen.is_none() {
+        return Err(conflict("agent initialization is not complete"));
+    }
+    if state.upgrade_busy(&id)?
+        || state
+            .store
+            .list::<Job>("jobs")?
+            .iter()
+            .any(|j| j.agent_id == id && j.active())
+    {
+        return Err(conflict("agent is deploying or upgrading"));
+    }
+    record.connection.endpoint = Some(patch.endpoint);
+    record.proxy = patch.proxy.apply(record.proxy);
+    record
+        .connection
+        .validate()
+        .map_err(|_| bad("agent endpoint must be a reachable host:port"))?;
+    state.store.put("agents", &id, &record)?;
+    if let Some(session) = state.sessions.lock().unwrap().get(&id) {
+        session.cancelled.cancel();
+    }
+    state.dialer.cancel(&id);
+    Ok(Json(public_agent(&state, record)))
 }
 async fn bind(
     State(state): State<Arc<Controller>>,
@@ -345,16 +420,16 @@ async fn deploy(
                 "repository settings changed or catalog unavailable; sync before deploying",
             ));
         }
-        if !state.agent_ready() {
-            return Err(conflict(
-                "agent listener unavailable; correct settings and restart controller",
-            ));
-        }
         let runtime = state.active_runtime()?;
         let record: AgentRecord = state
             .store
             .get("agents", &request.agent_id)?
             .ok_or_else(missing)?;
+        if record.connection.mode.is_default() && !state.agent_ready() {
+            return Err(conflict(
+                "agent listener unavailable; correct settings and restart controller",
+            ));
+        }
         if !state
             .sessions
             .lock()
@@ -530,6 +605,8 @@ mod tests {
         };
         let state = Controller::open(config).unwrap();
         let owner = AgentRecord {
+            proxy: None,
+            connection: Default::default(),
             id: "owner".into(),
             name: "owner".into(),
             token_hash: pier_protocol::hash("owner-token"),
