@@ -66,6 +66,12 @@ def checksum(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
 
 
+# /run/systemd/system exists before boot-time tmpfiles cleanup finishes.
+# Wait for that cleanup before any package operation: it removes DNF lock files.
+wait('systemd tmpfiles initialization', lambda: subprocess.call(
+    ['systemctl', 'is-active', '--quiet', 'systemd-tmpfiles-setup.service'],
+    stderr=subprocess.DEVNULL) == 0)
+
 if '--after-boot' in sys.argv:
     meta = json.loads(META.read_text())
     wait('enabled service starts after boot with controller offline', running)
@@ -87,7 +93,6 @@ if '--after-boot' in sys.argv:
     print('PASS %s/%s: boot recovery, uninstall and data retention' % (distro, arch), flush=True)
     sys.exit(0)
 
-wait('systemd boot', lambda: pathlib.Path('/run/systemd/system').exists())
 assert not pathlib.Path('/usr/sbin/policy-rc.d').exists(), 'test image must allow normal package service hooks'
 if distro == 'ubuntu2404':
     original = glob.glob('/src/dist/pier-agent_*-1.ubuntu24.04_%s.deb' % arch)

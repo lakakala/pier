@@ -95,6 +95,12 @@ def api(method, path, data=None):
         return json.load(response)
 
 
+# /run/systemd/system exists before boot-time tmpfiles cleanup finishes.
+# Wait for that cleanup before any package operation: it removes DNF lock files.
+wait('systemd tmpfiles initialization', lambda: subprocess.call(
+    ['systemctl', 'is-active', '--quiet', 'systemd-tmpfiles-setup.service'],
+    stderr=subprocess.DEVNULL) == 0)
+
 if '--after-boot' in sys.argv:
     meta = json.loads(meta_file.read_text())
     jar, client = make_client()
@@ -125,7 +131,6 @@ if '--after-boot' in sys.argv:
     print('PASS %s/%s: boot without auto-sync, session/data recovery, manual sync, uninstall retention' % (distro, arch), flush=True)
     sys.exit(0)
 
-wait('systemd', lambda: pathlib.Path('/run/systemd/system').exists())
 root.mkdir(mode=0o755)
 if distro == 'ubuntu2404':
     suffix = '_*-%s.ubuntu24.04_%s.deb' % (base_revision, arch)
