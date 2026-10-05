@@ -358,7 +358,11 @@ controller 断线时 app 继续运行并自动重启。agent 正常退出会停�
 
 ## 代理与边界
 
-app 下载、Git 和构建代理仍由 app 的 `proxy.enabled` 开启；地址来自 controller 当前生效的 `build_proxy`，首次在 Web 初始化设置，以后在控制器设置页修改并重启生效。定义仓库本身使用 controller 运行账户的 Git/SSH 配置。Docker 拉取镜像仍使用 Docker daemon 的代理设置。agent 连接和部署包下载直接访问配置的 controller，不继承环境中的 HTTP 代理。
+定义仓库同步与 app 下载、Git 和构建共用 controller 当前生效的 `build_proxy`，首次在 Web 初始化的“仓库同步与构建代理”中设置，以后在控制器设置页修改或清除并重启生效。app 是否使用代理仍由其 `proxy.enabled` 控制；定义仓库同步直接使用此配置。
+
+HTTP 定义仓库使用 `http_proxy`，HTTPS 定义仓库使用 `https_proxy`，两字段不互相回退；代理地址仅支持 `http://` 和 `https://`，支持用户名和密码。`no_proxy` 按 Git/libcurl 规则指定直连主机。未配置对应代理时明确直连，忽略环境变量及 Git 中的 HTTP 代理设置。代理故障不回退直连，TLS 证书校验保持开启。SSH 与本地定义仓库继续使用 controller 运行账户的 Git/SSH 连接方式。修改代理不会自动同步或使现有目录失效；同步失败保留上次成功的目录。
+
+Docker 拉取镜像仍使用 Docker daemon 的代理设置。agent 连接和部署包下载直接访问配置的 controller，不继承环境中的 HTTP 代理。
 
 当前为单管理员控制台，应用定义仍由 Git 管理；不提供 HTTP 健康检查、自动数据库迁移、零停机升级或多 controller 高可用。启动成功仅表示进程在观察窗口内持续运行，之后异常退出按自动拉起策略处理。
 

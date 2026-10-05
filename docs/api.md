@@ -269,7 +269,7 @@ curl --fail-with-body -X POST "$CONTROLLER_URL/v1/auth/logout" \
 | `max_concurrent_builds` | 整数 1–64 |
 | `build_proxy` | 代理对象；HTTP/HTTPS URL 最多 4096 字节，使用 `http://` 或 `https://`，不可带路径、查询、fragment 或控制字符；`no_proxy` 最多 4096 字节，无控制字符 |
 
-省略字段保留已保存值；省略 `build_proxy` 保留全部代理设置，传 `{}` 清除代理，提供代理对象则整体替换，内部省略或 `null` 表示未配置。app 的 `proxy.enabled` 决定是否使用这些代理；Docker 拉取镜像仍由 Docker daemon 配置代理。
+省略字段保留已保存值；省略 `build_proxy` 保留全部代理设置，传 `{}` 清除代理，提供代理对象则整体替换，内部省略或 `null` 表示未配置。定义仓库同步与 app 构建共用当前生效的 `build_proxy`；仓库同步直接使用此配置，app 仍由其 `proxy.enabled` 决定是否使用代理。Docker 拉取镜像仍由 Docker daemon 配置代理。
 
 校验全部通过后原子保存，返回与 GET 相同的结构；业务参数无效返回 `400`，类型或格式错误由 Axum 拒绝，失败不修改任何设置。保存时不尝试重新绑定端口，不改变当前来源校验、接入地址或构建参数，不同步 Git、不自动重启。执行 `sudo systemctl restart pier-controller` 后使用新值；监听失败时修正后再次重启。调整 `public_url` 后重启前仍使用旧来源，重启后改用新来源；调整 `agent_endpoint` 不会自动更新已有 agent 本地配置。
 
@@ -322,6 +322,10 @@ curl --fail-with-body -X PUT "$CONTROLLER_URL/v1/repository" \
 ### POST /v1/repository/sync
 
 无请求体，等待同步和目录校验完成后返回当前 commit：
+
+HTTP 仓库使用当前生效的 `build_proxy.http_proxy`，HTTPS 仓库使用 `build_proxy.https_proxy`；代理地址均可为 `http://` 或 `https://`，可带用户名和密码。两字段不互相回退，`no_proxy` 指定按 Git/libcurl 规则直连的主机。未配置对应代理时明确直连，不继承环境变量或系统、用户 Git 配置中的 HTTP 代理。代理失败不回退直连，TLS 证书仍正常校验；SSH 和本地路径继续使用原有 Git/SSH 连接方式。
+
+保存或清除代理配置后重启 controller 生效；同步开始时使用当前运行配置的快照。代理变更不触发自动同步、不使已有目录失效，代理凭据不会写入定义快照的 Git 配置或同步错误信息。
 
 ```sh
 curl --fail-with-body -X POST "$CONTROLLER_URL/v1/repository/sync" \

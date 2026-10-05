@@ -24,7 +24,11 @@ npm run build:check
 
 controller 启动 YAML 只保留 `http_listen` 和 `state_dir`。初次访问 `/init` 设置管理员、仓库，以及“运行设置”中的 agent 监听、公开地址、agent 公布地址、构建并行数和代理；初始化成功立即生效。后续在 `/settings/controller` 保存运行设置并手动重启，页面显示当前值、保存值、待重启状态及监听错误。初始化后到“定义仓库”手动同步；该页也支持保存新的地址或分支，保存不会触发拉取。后续在 `/login` 登录。API 通过 HttpOnly Cookie 认证，写请求带会话返回的 CSRF token。密码、登录 Cookie、代理凭据、agent 凭据和绑定变量不会写入 localStorage/sessionStorage。`/agent/init` 在原地址完成登录，保留 init 链接的 fragment。
 
-## 浏览器测试
+“仓库同步与构建代理”复用 `build_proxy`，定义仓库同步按仓库协议使用 HTTP 或 HTTPS 代理，遵循 NO_PROXY；未配置对应代理时直连，不继承系统环境或 Git 的 HTTP 代理。保存或清除后重启 controller 生效。app 仍由其 `proxy.enabled` 控制，SSH 与本地仓库连接方式保持不变。
+
+## 测试
+
+仓库代理的 Rust 集成测试需要 Python 3、OpenSSL 和 Git，通过本地 smart HTTP 服务、带认证的 HTTP(S) 代理及受信任的临时证书验证真实 Git 拉取，不访问外部仓库：`cargo test -p pier-controller repository_proxy_transport_and_restart`（在仓库根目录执行）。
 
 先从仓库根目录执行 `cargo build -p pier-controller --locked`，再在本目录执行：
 

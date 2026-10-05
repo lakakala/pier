@@ -41,6 +41,7 @@ test.describe.serial('controller console', () => {
       test.info().project.use.baseURL!,
     );
     await page.getByLabel('构建并发数', { exact: true }).fill('3');
+    await expect(page.getByLabel('仓库同步与构建代理', { exact: true })).toBeVisible();
     await page.getByRole('button', { name: '创建管理员' }).click();
     await expect(page.getByRole('heading', { name: '运行概览' })).toBeVisible();
     const beforeSync = await (await page.request.get('/v1/repository')).json();
@@ -82,17 +83,30 @@ test.describe.serial('controller console', () => {
     await page.getByRole('link', { name: '控制器设置', exact: true }).click();
     await expect(page.getByLabel('构建并发数', { exact: true })).toHaveValue('3');
     await page.getByLabel('构建并发数', { exact: true }).fill('4');
+    await page.getByLabel('仓库同步与构建代理', { exact: true }).click();
+    await page.getByText('设置代理', { exact: true }).click();
+    await page.getByLabel('HTTPS 代理', { exact: true }).fill('http://proxy.example:7890');
     await page.getByRole('button', { name: '保存运行设置', exact: true }).click();
     await expect(page.getByText('已保存，重启后生效', { exact: true })).toBeVisible();
     const saved = await (await page.request.get('/v1/settings')).json();
     expect(saved.active.max_concurrent_builds).toBe(3);
     expect(saved.saved.max_concurrent_builds).toBe(4);
+    expect(saved.active.build_proxy.https_proxy).toBeNull();
+    expect(saved.saved.build_proxy.https_proxy).toBe('http://proxy.example:7890');
     expect(saved.restart_required).toBe(true);
     await page.reload();
     await expect(page.getByLabel('构建并发数', { exact: true })).toHaveValue('4');
     await page.getByLabel('构建并发数', { exact: true }).fill('3');
+    await page.getByLabel('仓库同步与构建代理', { exact: true }).click();
+    await page.getByText('清除代理', { exact: true }).click();
     await page.getByRole('button', { name: '保存运行设置', exact: true }).click();
     await expect(page.getByText('已保存，重启后生效', { exact: true })).toHaveCount(0);
+    await page.getByRole('link', { name: '定义仓库', exact: true }).click();
+    await expect(
+      page.getByText('，未配置对应代理时直连。保存或清除代理后需重启生效。', { exact: false }),
+    ).toBeVisible();
+    await page.getByRole('link', { name: '控制器设置中的代理', exact: true }).click();
+    await expect(page).toHaveURL('/settings/controller');
   });
   test('agent upgrade status exposes versions and blocks deployment during restart', async ({
     page,

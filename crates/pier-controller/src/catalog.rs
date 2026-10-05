@@ -1,3 +1,4 @@
+use crate::BuildProxy;
 use anyhow::{Context, Result, bail, ensure};
 use minijinja::{Environment, UndefinedBehavior};
 use pier_pkg::{AppMetadata, VariableDefinition};
@@ -180,19 +181,67 @@ pub fn scan(root: &Path, commit: String) -> Result<Catalog> {
     Ok(result)
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let result = Command::new("git")
+fn git(dir: &Path, args: &[&str], url: &str, proxy: &BuildProxy) -> Result<String> {
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(url) = url::Url::parse(url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+    {
+        // The active controller settings are authoritative, including direct
+        // connections. Do not inherit ambient proxies or persist credentials.
+        for key in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            command.env_remove(key);
+        }
+        let address = if url.scheme() == "https" {
+            &proxy.https_proxy
+        } else {
+            &proxy.http_proxy
+        };
+        // remote.origin.proxy takes precedence over URL-specific http.*.proxy
+        // settings. An empty value explicitly disables proxying.
+        command
+            .env("GIT_CONFIG_COUNT", "3")
+            .env("GIT_CONFIG_KEY_0", "http.proxy")
+            .env("GIT_CONFIG_VALUE_0", address.as_deref().unwrap_or(""))
+            .env("GIT_CONFIG_KEY_1", "remote.origin.proxy")
+            .env("GIT_CONFIG_VALUE_1", address.as_deref().unwrap_or(""))
+            .env("GIT_CONFIG_KEY_2", "credential.interactive")
+            .env("GIT_CONFIG_VALUE_2", "false")
+            .env("NO_PROXY", proxy.no_proxy.as_deref().unwrap_or(""))
+            .env("no_proxy", proxy.no_proxy.as_deref().unwrap_or(""));
+    }
+    let result = command.output()?;
     if !result.status.success() {
         bail!("repository git command failed ({})", result.status);
     }
     Ok(String::from_utf8(result.stdout)?.trim().to_string())
 }
+/// Sync directly, without inheriting HTTP(S) proxies from the environment or Git.
 pub fn sync(url: &str, reference: &str, state_dir: &Path) -> Result<Catalog> {
+    sync_with_proxy(url, reference, state_dir, &BuildProxy::default())
+}
+
+pub(crate) fn sync_with_proxy(
+    url: &str,
+    reference: &str,
+    state_dir: &Path,
+    proxy: &BuildProxy,
+) -> Result<Catalog> {
     ensure!(
         !url.is_empty() && !url.starts_with('-') && !url.contains(['\0', '\n']),
         "invalid repository URL"
@@ -204,6 +253,7 @@ pub fn sync(url: &str, reference: &str, state_dir: &Path) -> Result<Catalog> {
     let snapshots = state_dir.join("snapshots");
     fs::create_dir_all(&snapshots)?;
     let temporary = tempfile::tempdir_in(&snapshots)?;
+    let git = |dir: &Path, args: &[&str]| git(dir, args, url, proxy);
     git(temporary.path(), &["init", "--quiet"])?;
     git(temporary.path(), &["remote", "add", "origin", url])?;
     git(
@@ -231,6 +281,9 @@ pub fn sync(url: &str, reference: &str, state_dir: &Path) -> Result<Catalog> {
     catalog.root = destination;
     Ok(catalog)
 }
+
+#[cfg(test)]
+mod proxy_tests;
 
 #[cfg(test)]
 mod tests {

@@ -128,10 +128,20 @@ impl Controller {
             .repository
             .clone()
             .context("repository not configured")?;
-        let result = catalog::sync(
+        // Saved settings take effect only after restart, just as for builds.
+        // Internal callers may sync before initialization; those connect directly.
+        let proxy = self
+            .runtime
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|runtime| runtime.settings.build_proxy.clone())
+            .unwrap_or_default();
+        let result = catalog::sync_with_proxy(
             &repository.url,
             &repository.reference,
             &self.config.state_dir,
+            &proxy,
         );
         let _mutation = self.mutation_lock.lock().unwrap();
         let mut settings = self.settings.write().unwrap();

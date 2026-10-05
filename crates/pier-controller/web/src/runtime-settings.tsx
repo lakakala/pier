@@ -109,9 +109,9 @@ export function RuntimeFields({
       </Form.Item>
       <Form.Item
         name="proxy_action"
-        label="构建代理"
+        label="仓库同步与构建代理"
         initialValue="preserve"
-        extra="是否使用代理由 app 的 YML 控制；Docker 拉取镜像的代理仍由 Docker daemon 配置。"
+        extra="定义仓库同步使用当前生效的代理，未配置对应代理时直连；app 构建由其 proxy.enabled 控制。初始化时立即生效，后续保存或清除需重启。Docker 拉取镜像的代理仍由 Docker daemon 配置。"
       >
         <Select
           options={[
@@ -238,7 +238,7 @@ export function ControllerSettings() {
                   saved: view.saved[key],
                 })),
                 {
-                  name: '构建代理',
+                  name: '仓库同步与构建代理',
                   active: configured(view.active) ? '已配置' : '未配置',
                   saved: `${configured(view.saved) ? '已配置' : '未配置'}${JSON.stringify(view.active.build_proxy) !== JSON.stringify(view.saved.build_proxy) ? '（待变更）' : ''}`,
                 },

@@ -172,6 +172,10 @@ export function Repository() {
         />
       )}
       <Card title="仓库配置" className="block-gap">
+        <Typography.Paragraph type="secondary">
+          HTTP(S) 仓库同步使用<Link to="/settings/controller">控制器设置中的代理</Link>
+          ，未配置对应代理时直连。保存或清除代理后需重启生效。
+        </Typography.Paragraph>
         <Form
           form={form}
           layout="vertical"
