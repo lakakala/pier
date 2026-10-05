@@ -157,6 +157,69 @@ test.describe.serial('controller console', () => {
     ).toBeVisible();
     await expect(page.getByRole('button', { name: '创建部署', exact: true })).toBeEnabled();
   });
+  test('specific upgrade blockers appear in the list and details despite historical success', async ({
+    page,
+  }) => {
+    await login(page);
+    const reason =
+      '当前 agent PID 123 不是 pier-agent.service 的 MainPID 456；请通过该服务运行 agent';
+    const agent = {
+      id: 'upgrade-blocked',
+      name: 'blocked-agent',
+      online: true,
+      last_seen: null,
+      info: { hostname: 'blocked-host', architecture: 'amd64', os_release: 'Ubuntu 24.04' },
+      report: {
+        capabilities: ['multi_blueprint_v1'],
+        apps: [],
+        blueprints: [],
+        result: null,
+        deployment_id: null,
+      },
+      software: {
+        version: '0.2.0',
+        package: { version: '0.2.0', revision: 1 },
+        system: 'ubuntu24.04',
+        format: 'deb',
+        supported: false,
+        reason,
+      },
+      upgrade: {
+        target: null,
+        reason: null as string | null,
+        status: { phase: 'succeeded', error: null as string | null },
+      },
+    };
+    await page.route('**/v1/agents', (route) => route.fulfill({ json: { agents: [agent] } }));
+    await page.route('**/v1/agents/upgrade-blocked', (route) => route.fulfill({ json: agent }));
+    await page.route('**/v1/agents/upgrade-blocked/bindings', (route) =>
+      route.fulfill({ json: { bindings: [] } }),
+    );
+    await page.goto('/agents');
+    await expect(page.getByText('自动升级不可用', { exact: true })).toBeVisible();
+    await expect(page.getByText(reason, { exact: true })).toBeVisible();
+    await expect(page.getByText('升级成功', { exact: true })).toHaveCount(0);
+    await page.getByRole('link', { name: 'blocked-agent', exact: true }).click();
+    await expect(page.getByText('自动升级不可用原因', { exact: true })).toBeVisible();
+    await expect(page.getByText(reason, { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: '创建部署', exact: true })).toBeEnabled();
+    // A past failure must not replace the current eligibility blocker.
+    agent.upgrade.status.phase = 'failed';
+    agent.upgrade.status.error = 'earlier installation failed';
+    agent.upgrade.reason = reason;
+    await page.reload();
+    await expect(page.getByText(reason, { exact: true })).toBeVisible();
+    await expect(page.getByText('earlier installation failed', { exact: true })).toBeVisible();
+    // After a restart reports healthy eligibility, stale blockers disappear.
+    agent.software.supported = true;
+    agent.software.reason = '';
+    agent.upgrade.reason = null;
+    agent.upgrade.status.phase = 'succeeded';
+    agent.upgrade.status.error = null;
+    await page.reload();
+    await expect(page.getByText('升级成功', { exact: true })).toBeVisible();
+    await expect(page.getByText(reason, { exact: true })).toHaveCount(0);
+  });
   test('app terminal capability, input, resize, CSP and session disposal', async ({ page }) => {
     await login(page);
     let online = false;

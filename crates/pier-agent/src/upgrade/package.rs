@@ -1,12 +1,45 @@
 use anyhow::{Context, Result, ensure};
 use pier_protocol::upgrade::{Format, Release, Version};
 use std::{
+    fmt, io,
     path::Path,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
 
-fn query(command: &mut Command) -> Result<String> {
+#[derive(Debug)]
+enum QueryError {
+    Io(io::Error),
+    Timeout,
+    Exit(ExitStatus),
+    InvalidOutput,
+}
+impl From<io::Error> for QueryError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+impl fmt::Display for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Only bounded diagnostics reach the controller; never include command output.
+        match self {
+            Self::Io(error) => match error.kind() {
+                io::ErrorKind::NotFound => f.write_str("未找到查询命令或所需文件"),
+                io::ErrorKind::PermissionDenied => f.write_str("查询被拒绝访问"),
+                _ => f.write_str("查询发生 I/O 错误"),
+            },
+            Self::Timeout => f.write_str("查询超过 20 秒未完成"),
+            Self::Exit(status) => match status.code() {
+                Some(code) => write!(f, "查询失败，退出码 {code}"),
+                None => f.write_str("查询进程被信号终止"),
+            },
+            Self::InvalidOutput => f.write_str("查询返回的数据无效或过大"),
+        }
+    }
+}
+impl std::error::Error for QueryError {}
+
+fn query(command: &mut Command) -> std::result::Result<String, QueryError> {
     use std::os::unix::process::CommandExt;
     let output = tempfile::tempfile()?;
     let mut child = command
@@ -27,19 +60,23 @@ fn query(command: &mut Command) -> Result<String> {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.wait();
-            anyhow::bail!("package metadata query timed out");
+            return Err(QueryError::Timeout);
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    ensure!(
-        status.success() && output.metadata()?.len() <= 8192,
-        "package metadata unavailable"
-    );
+    if !status.success() {
+        return Err(QueryError::Exit(status));
+    }
+    if output.metadata()?.len() > 8192 {
+        return Err(QueryError::InvalidOutput);
+    }
     use std::io::{Read, Seek};
     let mut output = output;
     output.rewind()?;
     let mut text = String::new();
-    output.read_to_string(&mut text)?;
+    output
+        .read_to_string(&mut text)
+        .map_err(|_| QueryError::InvalidOutput)?;
     Ok(text.trim().to_string())
 }
 pub(super) fn version(value: &str, system: &str, allow_legacy: bool) -> Result<Version> {
@@ -68,21 +105,35 @@ fn arch(value: &str, format: Format) -> Result<()> {
     Ok(())
 }
 pub(super) fn installed(system: &str, format: Format) -> Result<Version> {
-    let text = match format {
-        Format::Deb => query(Command::new("dpkg-query").args([
-            "-W",
-            "-f=${Status}\n${Version}\n${Architecture}",
-            "pier-agent",
-        ]))?,
-        Format::Rpm => query(Command::new("rpm").args([
-            "-q",
-            "--qf",
-            "%{EPOCHNUM}\n%{VERSION}-%{RELEASE}\n%{ARCH}",
-            "pier-agent",
-        ]))?,
+    let (tool, queried) = match format {
+        Format::Deb => (
+            "dpkg-query",
+            query(Command::new("dpkg-query").args([
+                "-W",
+                "-f=${Status}\n${Version}\n${Architecture}",
+                "pier-agent",
+            ])),
+        ),
+        Format::Rpm => (
+            "rpm",
+            query(Command::new("rpm").args([
+                "-q",
+                "--qf",
+                "%{EPOCHNUM}\n%{VERSION}-%{RELEASE}\n%{ARCH}",
+                "pier-agent",
+            ])),
+        ),
     };
+    let text = queried.map_err(|error| {
+        anyhow::anyhow!(
+            "无法读取 pier-agent 原生安装包记录：{tool} {error}；请检查安装包及包管理器"
+        )
+    })?;
+    installed_metadata(&text, system, format)
+}
+fn installed_metadata(text: &str, system: &str, format: Format) -> Result<Version> {
     let lines: Vec<_> = text.lines().collect();
-    ensure!(lines.len() == 3, "invalid installed package metadata");
+    ensure!(lines.len() == 3, "pier-agent 安装包元数据格式错误");
     ensure!(
         lines[0]
             == if format == Format::Deb {
@@ -90,10 +141,15 @@ pub(super) fn installed(system: &str, format: Format) -> Result<Version> {
             } else {
                 "0"
             },
-        "package not fully installed or unsupported epoch"
+        if format == Format::Deb {
+            "pier-agent DEB 未处于完整安装状态；请修复安装包"
+        } else {
+            "pier-agent RPM 的 Epoch 不为 0；不支持自动升级该安装包"
+        }
     );
-    arch(lines[2], format)?;
+    arch(lines[2], format).context("pier-agent 安装包架构与当前 agent 架构不一致")?;
     version(lines[1], system, true)
+        .context("pier-agent 安装包版本格式或发行版后缀不匹配；请安装对应系统的官方安装包")
 }
 pub(super) fn inspect(path: &Path, release: &Release) -> Result<()> {
     release.verify(path)?;
@@ -130,21 +186,40 @@ pub(super) fn inspect(path: &Path, release: &Release) -> Result<()> {
     Ok(())
 }
 pub(super) fn systemctl(args: &[&str]) -> Result<String> {
-    query(Command::new("systemctl").args(args))
+    Ok(query(Command::new("systemctl").args(args))?)
 }
-pub(super) fn managed() -> bool {
-    let exe = std::env::current_exe().ok();
-    let owned = exe.as_deref().is_some_and(|p| {
-        p == Path::new("/usr/bin/pier-agent") || p == Path::new("/usr/bin/pier-agent (deleted)")
-    });
-    owned
-        && systemctl(&[
+pub(super) fn managed() -> Result<()> {
+    let exe = std::env::current_exe().context("无法读取当前 agent 的可执行文件路径")?;
+    managed_process(&exe, std::process::id(), || {
+        systemctl(&[
             "show",
             "--property=MainPID",
             "--value",
             "pier-agent.service",
         ])
-        .is_ok_and(|p| p == std::process::id().to_string())
+        .map_err(|error| {
+            anyhow::anyhow!("无法查询 pier-agent.service 的 MainPID：systemctl {error}")
+        })
+    })
+}
+fn managed_process(exe: &Path, pid: u32, main_pid: impl FnOnce() -> Result<String>) -> Result<()> {
+    ensure!(
+        exe == Path::new("/usr/bin/pier-agent")
+            || exe == Path::new("/usr/bin/pier-agent (deleted)"),
+        "当前运行程序不在 /usr/bin/pier-agent；请使用原生安装包提供的程序"
+    );
+    let main_pid = main_pid()?
+        .parse::<u32>()
+        .context("pier-agent.service 返回了无效的 MainPID")?;
+    ensure!(
+        main_pid != 0,
+        "pier-agent.service 没有主进程；请通过 systemctl 启动 agent 服务"
+    );
+    ensure!(
+        main_pid == pid,
+        "当前 agent PID {pid} 不是 pier-agent.service 的 MainPID {main_pid}；请通过该服务运行 agent"
+    );
+    Ok(())
 }
 pub(super) fn helper_active() -> bool {
     systemctl(&[
@@ -190,6 +265,81 @@ pub(super) fn bounded(command: &mut Command, limit: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn installed_metadata_explains_each_rejected_package() {
+        let deb_arch = if crate::architecture().unwrap() == pier_pkg::Architecture::Amd64 {
+            "amd64"
+        } else {
+            "arm64"
+        };
+        let valid = format!("install ok installed\n1.2.3-1.ubuntu24.04\n{deb_arch}");
+        assert!(installed_metadata(&valid, "ubuntu24.04", Format::Deb).is_ok());
+        for (metadata, reason) in [
+            ("unexpected".into(), "元数据格式错误"),
+            (
+                valid.replace("install ok installed", "deinstall ok config-files"),
+                "未处于完整安装状态",
+            ),
+            (valid.replace(deb_arch, "other-architecture"), "架构不一致"),
+            (
+                valid.replace("ubuntu24.04", "ubuntu22.04"),
+                "版本格式或发行版后缀不匹配",
+            ),
+        ] {
+            let error = installed_metadata(&metadata, "ubuntu24.04", Format::Deb).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+            assert!(error.to_string().len() <= 256);
+        }
+        let error =
+            installed_metadata("1\n1.2.3-1.el9\nx86_64", "almalinux9", Format::Rpm).unwrap_err();
+        assert!(error.to_string().contains("Epoch 不为 0"));
+    }
+
+    #[test]
+    fn process_checks_explain_path_service_and_pid_failures() {
+        let native = Path::new("/usr/bin/pier-agent");
+        assert!(managed_process(native, 123, || Ok("123".into())).is_ok());
+        assert!(
+            managed_process(Path::new("/usr/bin/pier-agent (deleted)"), 123, || Ok(
+                "123".into()
+            ))
+            .is_ok()
+        );
+        let error = managed_process(Path::new("/tmp/pier-agent"), 123, || {
+            panic!("wrong path must not query systemd")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("不在 /usr/bin/pier-agent"));
+        for (pid, reason) in [
+            ("0", "没有主进程"),
+            ("456", "MainPID 456"),
+            ("invalid", "无效的 MainPID"),
+        ] {
+            let error = managed_process(native, 123, || Ok(pid.into())).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+        let error =
+            managed_process(native, 123, || anyhow::bail!("systemctl unavailable")).unwrap_err();
+        assert_eq!(error.to_string(), "systemctl unavailable");
+    }
+
+    #[test]
+    fn query_diagnostics_distinguish_failures_without_exposing_output() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing-query");
+        let error = query(&mut Command::new(missing)).unwrap_err();
+        assert!(error.to_string().contains("未找到查询命令"));
+        let error = query(Command::new("/bin/sh").args([
+            "-c",
+            "printf private-output; printf private-error >&2; exit 7",
+        ]))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "查询失败，退出码 7");
+        let error =
+            query(Command::new("/bin/sh").args(["-c", "head -c 9000 /dev/zero"])).unwrap_err();
+        assert!(error.to_string().contains("数据无效或过大"));
+        assert!(QueryError::Timeout.to_string().contains("20 秒"));
+    }
+
     #[test]
     fn native_versions_reject_epochs_foreign_releases_and_invalid_revisions() {
         for (s, system) in [

@@ -34,6 +34,7 @@ import {
   packageVersion,
   upgrading,
   upgradeLabel,
+  upgradeReason,
   terminal,
   type Agent,
   type Binding,
@@ -374,7 +375,17 @@ export function Agents() {
             { title: '主机', render: (_, a) => a.info?.hostname ?? '—' },
             { title: '架构', render: (_, a) => a.info?.architecture ?? '—' },
             { title: 'Agent 版本', render: (_, a) => a.software?.version ?? '未知' },
-            { title: '自动升级', render: (_, a) => upgradeLabel(a) },
+            {
+              title: '自动升级',
+              render: (_, a) => (
+                <Space orientation="vertical" size={0}>
+                  <span>{upgradeLabel(a)}</span>
+                  {upgradeReason(a) && (
+                    <Typography.Text type="secondary">{upgradeReason(a)}</Typography.Text>
+                  )}
+                </Space>
+              ),
+            },
             { title: '最近上报', dataIndex: 'last_seen', render: date },
           ]}
         />
@@ -872,12 +883,16 @@ export function AgentDetail() {
             title="Agent 正在升级，暂时无法创建部署；重启时应用会短暂中断。"
           />
         )}
-        {(value.upgrade?.status?.error || value.upgrade?.reason) && (
+        {upgradeReason(value) && (
           <Alert
             className="block-gap"
             type="warning"
-            title={value.upgrade.status?.error || value.upgrade.reason}
+            title="自动升级不可用原因"
+            description={upgradeReason(value)}
           />
+        )}
+        {value.upgrade?.status?.error && (
+          <Alert className="block-gap" type="warning" title={value.upgrade.status.error} />
         )}
         {!value.online && (
           <Alert type="warning" title="服务器离线，下方展示最近一次上报的进程信息。" />

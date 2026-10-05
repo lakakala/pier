@@ -93,9 +93,13 @@ export const packageVersion = (value?: PackageVersion | null) =>
   value ? `${value.version}-${value.revision}` : '—';
 export const upgrading = (agent: Agent) =>
   ['installing', 'restarting'].includes(agent.upgrade?.status?.phase ?? '');
+export const upgradeReason = (agent: Agent) =>
+  agent.software?.supported === false
+    ? agent.software.reason || agent.upgrade?.reason
+    : agent.upgrade?.reason || agent.software?.reason;
 export const upgradeLabel = (agent: Agent) => {
   const phase = agent.upgrade?.status?.phase;
-  if (phase)
+  if (phase && phase !== 'succeeded' && phase !== 'failed')
     return {
       waiting: '等待部署结束',
       downloading: '下载中',
@@ -105,7 +109,10 @@ export const upgradeLabel = (agent: Agent) => {
       failed: '升级失败，需手动恢复',
     }[phase];
   if (!agent.software) return '需手动升级一次';
-  if (agent.upgrade?.reason || !agent.software.supported) return '自动升级不可用';
+  if (!agent.software.supported) return '自动升级不可用';
+  if (phase === 'failed') return '升级失败，需手动恢复';
+  if (upgradeReason(agent)) return '自动升级不可用';
+  if (phase === 'succeeded') return '升级成功';
   return '已启用自动升级';
 };
 export interface Binding {

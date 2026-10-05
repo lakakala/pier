@@ -535,6 +535,8 @@ curl --fail-with-body "$CONTROLLER_URL/v1/agents/$AGENT_ID" \
 | `upgrade.status` | 最近一次升级记录，或 `null` |
 | `upgrade.reason` | 未提供升级的原因，正常时为 `null` |
 
+`software.reason` 由 agent 在启动时上报具体检查失败原因，包括系统识别、原生包查询/安装状态/版本/架构、可执行文件路径、systemd MainPID，以及升级目录或记录问题。`software.supported=false` 时，`upgrade.reason` 保留该原因；旧 agent 未提供原因时返回手动更新提示。诊断不包含命令原始输出，修复后需重启 agent 重新检测。服务器列表和详情页展示当前原因，历史升级状态不会将其隐藏。
+
 发行版后缀仅用于原生包元数据和文件名，`software.package` 仍使用基础版本与数字修订号。旧版 Ubuntu agent 需要手动安装一次带 `.ubuntu24.04` 的新包并重启，之后恢复自动升级。
 
 发行包对象含 `package`（版本与修订号）、`system`、`format`、`architecture`（`amd64` / `arm64`）、`sha256`、`size`（字节数）。状态对象含 `release`（发行包）、`phase`、`error`（可空的简短原因）、`updated_at`（Unix 秒）。HTTP 不暴露升级授权凭据，也不提供手动上传或触发升级接口。

@@ -91,29 +91,37 @@ fn save(job: &mut Transaction, phase: Phase, error: Option<String>) -> Result<()
     write_json(&Path::new(ROOT).join(JOB), job)
 }
 fn detect() -> Software {
+    detect_with(
+        fs::read_to_string("/etc/os-release"),
+        package::installed,
+        package::managed,
+    )
+}
+fn detect_with(
+    os_release: std::io::Result<String>,
+    installed: impl FnOnce(&str, Format) -> Result<pier_protocol::upgrade::Version>,
+    managed: impl FnOnce() -> Result<()>,
+) -> Software {
     let mut software = Software {
         version: env!("CARGO_PKG_VERSION").into(),
         package: None,
         system: None,
         format: None,
         supported: false,
-        reason: Some(
-            "automatic upgrades require a supported native package managed by pier-agent.service"
-                .into(),
-        ),
+        reason: None,
     };
-    if let Some((system, format)) = fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|s| pier_protocol::upgrade::system(&s))
-    {
+    let detected = (|| -> Result<()> {
+        let os_release = os_release.context("无法读取 /etc/os-release，不能识别系统发行版")?;
+        let (system, format) = pier_protocol::upgrade::system(&os_release)
+            .context("当前发行版不支持自动升级；仅支持 Ubuntu 24.04、AlmaLinux 8 和 9")?;
         software.system = Some(system.into());
         software.format = Some(format);
-        software.package = package::installed(system, format).ok();
-        software.supported = software.package.is_some() && package::managed();
-        if software.supported {
-            software.reason = None;
-        }
-    }
+        software.package = Some(installed(system, format)?);
+        managed()?;
+        Ok(())
+    })();
+    software.supported = detected.is_ok();
+    software.reason = detected.err().map(|error| error.to_string());
     software
 }
 
@@ -131,21 +139,30 @@ impl Manager {
         let mut lock = None;
         if software.supported {
             let prepared = (|| -> Result<_> {
-                private_dir(Path::new(ROOT))?;
-                let lock = pier_protocol::state_lock(Path::new(ROOT))?;
-                if let Some(mut job) = load()? {
+                private_dir(Path::new(ROOT))
+                    .context("自动升级目录 /var/lib/pier-agent-upgrade 无法访问或权限不符合要求")?;
+                let lock = pier_protocol::state_lock(Path::new(ROOT))
+                    .context("自动升级目录已被其他进程占用或无法加锁")?;
+                if let Some(mut job) =
+                    load().context("自动升级记录无法读取、权限不符合要求或内容损坏")?
+                {
                     ensure!(
                         job.config.agent_id == config.agent_id,
-                        "upgrade journal belongs to another agent; manual recovery required"
+                        "自动升级记录属于其他 agent 身份；请检查重新初始化前保留的升级记录"
                     );
                     if job.status.phase.active() {
                         runtime.maintenance.store(true, Ordering::SeqCst);
-                        if !package::helper_active() || job.boot_id != boot_id()? {
+                        if !package::helper_active()
+                            || job.boot_id
+                                != boot_id()
+                                    .context("无法读取系统 boot_id，不能恢复自动升级记录")?
+                        {
                             save(
                                 &mut job,
                                 Phase::Failed,
                                 Some("upgrade interrupted; manual recovery required".into()),
-                            )?;
+                            )
+                            .context("无法保存自动升级中断记录；请检查升级目录权限和磁盘空间")?;
                             runtime.maintenance.store(false, Ordering::SeqCst);
                         } else if job.status.phase == Phase::Restarting
                             && job.previous_pid != std::process::id()
@@ -159,7 +176,8 @@ impl Manager {
                                     pid: std::process::id(),
                                     package: job.status.release.package.clone(),
                                 },
-                            )?;
+                            )
+                            .context("无法写入自动升级就绪记录；请检查升级目录权限和磁盘空间")?;
                         }
                     } else if job.status.phase == Phase::Failed
                         && job.previous_pid != std::process::id()
@@ -172,20 +190,18 @@ impl Manager {
                             .as_ref()
                             .is_some_and(|p| p.version == software.version)
                     {
-                        save(&mut job, Phase::Succeeded, None)?;
+                        save(&mut job, Phase::Succeeded, None)
+                            .context("无法保存自动升级完成记录；请检查升级目录权限和磁盘空间")?;
                     }
                 }
                 Ok(lock)
             })();
             match prepared {
                 Ok(value) => lock = Some(value),
-                Err(_) => {
+                Err(error) => {
                     tracing::warn!("upgrade journal unavailable; manual recovery required");
                     software.supported = false;
-                    software.reason = Some(
-                        "upgrade journal unavailable; inspect local permissions and recovery state"
-                            .into(),
-                    );
+                    software.reason = Some(error.to_string());
                 }
             }
         }
@@ -528,4 +544,68 @@ fn install(job: &mut Transaction) -> Result<()> {
         "new agent stopped during startup"
     );
     save(job, Phase::Succeeded, None)
+}
+
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+    use pier_protocol::upgrade::Version;
+
+    fn installed(_: &str, _: Format) -> Result<Version> {
+        Ok(Version {
+            version: "1.2.3".into(),
+            revision: 1,
+        })
+    }
+
+    #[test]
+    fn detection_reports_the_failed_check_and_retains_known_metadata() {
+        for (os, reason) in [
+            (
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                "无法读取 /etc/os-release",
+            ),
+            (Ok("ID=debian\nVERSION_ID=12".into()), "当前发行版不支持"),
+        ] {
+            let software = detect_with(
+                os,
+                |_, _| panic!("unsupported system must not query packages"),
+                || panic!("unsupported system must not query systemd"),
+            );
+            assert!(!software.supported);
+            assert!(software.system.is_none());
+            assert!(software.reason.as_ref().unwrap().contains(reason));
+            software.validate().unwrap();
+        }
+        let os = || Ok("ID=ubuntu\nVERSION_ID=24.04".into());
+        let software = detect_with(
+            os(),
+            |_, _| anyhow::bail!("pier-agent DEB 未处于完整安装状态；请修复安装包"),
+            || panic!("invalid package must not query systemd"),
+        );
+        assert!(!software.supported);
+        assert_eq!(software.system.as_deref(), Some("ubuntu24.04"));
+        assert!(software.package.is_none());
+        assert!(
+            software
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("未处于完整安装状态")
+        );
+        software.validate().unwrap();
+
+        let software = detect_with(os(), installed, || {
+            anyhow::bail!("pier-agent.service 没有主进程；请通过 systemctl 启动 agent 服务")
+        });
+        assert!(!software.supported);
+        assert!(software.package.is_some());
+        assert!(software.reason.as_ref().unwrap().contains("没有主进程"));
+        software.validate().unwrap();
+
+        let software = detect_with(os(), installed, || Ok(()));
+        assert!(software.supported);
+        assert!(software.reason.is_none());
+        software.validate().unwrap();
+    }
 }

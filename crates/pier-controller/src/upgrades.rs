@@ -109,7 +109,9 @@ impl Controller {
         if !software.supported {
             return Ok(Offer {
                 release: None,
-                reason: software.reason,
+                reason: Some(software.reason.unwrap_or_else(|| {
+                    "agent 未提供自动升级不可用的具体原因；请手动更新 agent 后重启".into()
+                })),
             });
         }
         if let Some(error) = &self.upgrades.error {
@@ -403,6 +405,43 @@ mod tests {
             .unwrap();
         state
     }
+    #[test]
+    fn unavailable_reasons_reach_controller_views_and_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fixture(dir.path());
+        let mut software: Software = state.store.get("agent_software", "agent").unwrap().unwrap();
+        software.supported = false;
+        software.reason =
+            Some("pier-agent.service 没有主进程；请通过 systemctl 启动 agent 服务".into());
+        state.record_software("agent", Some(&software)).unwrap();
+        assert!(state.upgrade_offer("agent").unwrap().release.is_none());
+        let expected = state.upgrade_view("agent").unwrap();
+        assert_eq!(
+            expected["upgrade"]["reason"],
+            software.reason.as_ref().unwrap().as_str()
+        );
+        assert_eq!(
+            expected["software"]["reason"],
+            expected["upgrade"]["reason"]
+        );
+        drop(state);
+        let state =
+            Controller::open(serde_json::from_value(json!({"state_dir":dir.path()})).unwrap())
+                .unwrap();
+        assert_eq!(
+            state.upgrade_view("agent").unwrap()["upgrade"]["reason"],
+            expected["upgrade"]["reason"]
+        );
+        software.reason = None;
+        state.record_software("agent", Some(&software)).unwrap();
+        assert!(
+            state.upgrade_view("agent").unwrap()["upgrade"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("未提供")
+        );
+    }
+
     #[test]
     fn bundles_are_complete_and_cached_independently_of_installed_files() {
         let source = tempfile::tempdir().unwrap();
