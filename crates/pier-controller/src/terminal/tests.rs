@@ -43,6 +43,7 @@ async fn setup() -> (tempfile::TempDir, Arc<Controller>, Router, String, String)
             id: "control".into(),
             sender,
             terminal: true,
+            multi_blueprint: true,
         },
     );
     (
@@ -248,4 +249,66 @@ async fn tickets_are_bounded_expire_and_logout_revokes_them() {
         StatusCode::NO_CONTENT
     );
     assert!(tokens.iter().all(CancellationToken::is_cancelled));
+}
+
+#[tokio::test]
+async fn deployment_blocks_only_its_own_blueprints_terminals() {
+    let (_root, state, router, cookie, csrf) = setup().await;
+    let mut agent: AgentRecord = state.store.get("agents", "agent").unwrap().unwrap();
+    agent.report.blueprints = vec![pier_protocol::BlueprintStatus {
+        account_reserved: true,
+        id: pier_protocol::hash("web"),
+        blueprint: "web".into(),
+        name: "Web.Site".into(),
+        state: "running".into(),
+        deployment_id: Some("previous".into()),
+        apps: agent.report.apps.clone(),
+        result: None,
+    }];
+    state.store.put("agents", "agent", &agent).unwrap();
+    let mut job = Job {
+        action: pier_protocol::DeploymentAction::Deploy,
+        id: "job".into(),
+        agent_id: "agent".into(),
+        blueprint: "other".into(),
+        commit: "commit".into(),
+        state: "applying".into(),
+        error: None,
+        created_at: 0,
+        plan: None,
+        artifacts: BTreeMap::new(),
+    };
+    state.store.put("jobs", "job", &job).unwrap();
+    let path = "/v1/agents/agent/apps/instance/terminals";
+    let body = Some(json!({"cols":80,"rows":24}));
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            path,
+            &cookie,
+            &csrf,
+            "https://pier.example.test",
+            body.clone()
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    job.blueprint = "web".into();
+    state.store.put("jobs", "job", &job).unwrap();
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            path,
+            &cookie,
+            &csrf,
+            "https://pier.example.test",
+            body
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
 }

@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "binding_tests.rs"]
+mod binding_tests;
+
 use crate::{AgentRecord, Binding, Controller, Job};
 use axum::{
     Json, Router,
@@ -83,9 +87,13 @@ pub fn router(state: Arc<Controller>) -> Router {
             post(crate::terminal::create),
         )
         .route("/v1/terminals/{id}/ws", get(crate::terminal::websocket))
+        .route("/v1/agents/{id}/bindings", post(bind).get(bindings))
         .route(
-            "/v1/agents/{id}/binding",
-            put(bind).get(binding).patch(patch_binding),
+            "/v1/agents/{id}/bindings/{blueprint_id}",
+            get(binding)
+                .put(replace_binding)
+                .patch(patch_binding)
+                .delete(delete_binding),
         )
         .route("/v1/deployments", post(deploy).get(jobs))
         .route("/v1/deployments/{id}", get(job))
@@ -110,11 +118,13 @@ struct BindingPatch {
 }
 async fn patch_binding(
     State(state): State<Arc<Controller>>,
-    Path(id): Path<String>,
+    Path((id, blueprint_id)): Path<(String, String)>,
     Json(patch): Json<BindingPatch>,
 ) -> ApiResult<Value> {
     let _guard = state.mutation_lock.lock().unwrap();
-    let mut binding: Binding = state.store.get("bindings", &id)?.ok_or_else(missing)?;
+    let mut bindings = state.bindings(&id)?;
+    let binding = bindings.get_mut(&blueprint_id).ok_or_else(missing)?;
+    binding_idle(&state, &id, &binding.blueprint)?;
     if binding.blueprint != patch.blueprint {
         return Err(conflict("binding changed; reload before editing"));
     }
@@ -139,10 +149,9 @@ async fn patch_binding(
     blueprint
         .resolve(&binding.variables)
         .map_err(|e| bad(&e.to_string()))?;
-    state.store.put("bindings", &id, &binding)?;
-    Ok(Json(
-        json!({"agent_id":id,"blueprint":binding.blueprint,"variable_names":binding.variables.keys().collect::<Vec<_>>()}),
-    ))
+    let value = public_binding(&id, binding);
+    state.store.put("blueprint_bindings", &id, &bindings)?;
+    Ok(Json(value))
 }
 async fn no_cache(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
@@ -368,41 +377,136 @@ async fn update_connection(
     drop(mutation);
     Ok(Json(public_agent(&state, record)))
 }
+fn public_binding(agent: &str, binding: &Binding) -> Value {
+    json!({"agent_id":agent,"id":pier_protocol::hash(&binding.blueprint),"blueprint":binding.blueprint,"variable_names":binding.variables.keys().collect::<Vec<_>>()})
+}
+fn binding_idle(state: &Controller, agent: &str, blueprint: &str) -> Result<(), ApiError> {
+    if state
+        .store
+        .list::<Job>("jobs")?
+        .iter()
+        .any(|j| j.agent_id == agent && j.blueprint == blueprint && j.active())
+    {
+        return Err(conflict("blueprint has an active deployment"));
+    }
+    Ok(())
+}
+fn save_binding(state: &Controller, id: &str, binding: Binding, replace: bool) -> ApiResult<Value> {
+    if state.store.get::<AgentRecord>("agents", id)?.is_none() {
+        return Err(missing());
+    }
+    binding_idle(state, id, &binding.blueprint)?;
+    let mut bindings = state.bindings(id)?;
+    let key = pier_protocol::hash(&binding.blueprint);
+    if replace && !bindings.contains_key(&key) {
+        return Err(missing());
+    }
+    if !replace && bindings.contains_key(&key) {
+        return Err(conflict("blueprint already bound"));
+    }
+    let name = {
+        let catalog = state.catalog.read().unwrap();
+        let catalog = catalog
+            .as_ref()
+            .ok_or_else(|| conflict("catalog not available"))?;
+        let blueprint = catalog
+            .blueprints
+            .get(&binding.blueprint)
+            .ok_or_else(missing)?;
+        blueprint
+            .resolve(&binding.variables)
+            .map_err(|e| bad(&e.to_string()))?;
+        blueprint.name.clone()
+    };
+    state
+        .check_blueprint_name(id, &binding.blueprint, &name)
+        .map_err(|e| bad(&e.to_string()))?;
+    let value = public_binding(id, &binding);
+    bindings.insert(key, binding);
+    state.store.put("blueprint_bindings", id, &bindings)?;
+    Ok(Json(value))
+}
 async fn bind(
     State(state): State<Arc<Controller>>,
     Path(id): Path<String>,
     Json(binding): Json<Binding>,
 ) -> ApiResult<Value> {
     let _guard = state.mutation_lock.lock().unwrap();
+    save_binding(&state, &id, binding, false)
+}
+async fn replace_binding(
+    State(state): State<Arc<Controller>>,
+    Path((id, key)): Path<(String, String)>,
+    Json(binding): Json<Binding>,
+) -> ApiResult<Value> {
+    let _guard = state.mutation_lock.lock().unwrap();
+    if key != pier_protocol::hash(&binding.blueprint) {
+        return Err(conflict("binding identity cannot change"));
+    }
+    save_binding(&state, &id, binding, true)
+}
+async fn bindings(
+    State(state): State<Arc<Controller>>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
     if state.store.get::<AgentRecord>("agents", &id)?.is_none() {
         return Err(missing());
     }
-    let catalog = state.catalog.read().unwrap();
-    let catalog = catalog
-        .as_ref()
-        .ok_or_else(|| conflict("catalog not available"))?;
-    let blueprint = catalog
-        .blueprints
-        .get(&binding.blueprint)
-        .ok_or_else(missing)?;
-    blueprint
-        .resolve(&binding.variables)
-        .map_err(|e| bad(&e.to_string()))?;
-    state.store.put("bindings", &id, &binding)?;
     Ok(Json(
-        json!({"agent_id":id,"blueprint":binding.blueprint,"variable_names":binding.variables.keys().collect::<Vec<_>>()}),
+        json!({"bindings":state.bindings(&id)?.values().map(|b| public_binding(&id,b)).collect::<Vec<_>>() }),
     ))
 }
-async fn binding(State(state): State<Arc<Controller>>, Path(id): Path<String>) -> ApiResult<Value> {
-    let binding: Binding = state.store.get("bindings", &id)?.ok_or_else(missing)?;
-    Ok(Json(
-        json!({"agent_id":id,"blueprint":binding.blueprint,"variable_names":binding.variables.keys().collect::<Vec<_>>()}),
-    ))
+async fn binding(
+    State(state): State<Arc<Controller>>,
+    Path((id, key)): Path<(String, String)>,
+) -> ApiResult<Value> {
+    let bindings = state.bindings(&id)?;
+    Ok(Json(public_binding(
+        &id,
+        bindings.get(&key).ok_or_else(missing)?,
+    )))
+}
+async fn delete_binding(
+    State(state): State<Arc<Controller>>,
+    Path((id, key)): Path<(String, String)>,
+) -> ApiResult<Value> {
+    let _guard = state.mutation_lock.lock().unwrap();
+    let mut bindings = state.bindings(&id)?;
+    let binding = bindings.get(&key).ok_or_else(missing)?;
+    binding_idle(&state, &id, &binding.blueprint)?;
+    if state.upgrade_busy(&id)? {
+        return Err(conflict("agent is upgrading"));
+    }
+    if !state
+        .sessions
+        .lock()
+        .unwrap()
+        .get(&id)
+        .is_some_and(|s| s.multi_blueprint)
+    {
+        return Err(conflict("compatible agent must be online"));
+    }
+    let record: AgentRecord = state.store.get("agents", &id)?.ok_or_else(missing)?;
+    if record
+        .report
+        .blueprints
+        .iter()
+        .any(|b| b.id == key && b.state != "stopped")
+    {
+        return Err(conflict("stop the blueprint before removing its binding"));
+    }
+    bindings.remove(&key);
+    state.store.put("blueprint_bindings", &id, &bindings)?;
+    Ok(Json(json!({"removed":true})))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Deploy {
     agent_id: String,
+    blueprint: String,
+    #[serde(default)]
+    action: pier_protocol::DeploymentAction,
+    #[serde(default)]
     commit: String,
     #[serde(default, deserialize_with = "pier_protocol::unique_map")]
     images: BTreeMap<String, String>,
@@ -417,7 +521,9 @@ async fn deploy(
         if state.upgrade_busy(&request.agent_id)? {
             return Err(conflict("agent is upgrading; wait for it to reconnect"));
         }
-        if state.repository_needs_sync() {
+        if request.action == pier_protocol::DeploymentAction::Deploy
+            && state.repository_needs_sync()
+        {
             return Err(conflict(
                 "repository settings changed or catalog unavailable; sync before deploying",
             ));
@@ -436,9 +542,12 @@ async fn deploy(
             .sessions
             .lock()
             .unwrap()
-            .contains_key(&request.agent_id)
+            .get(&request.agent_id)
+            .is_some_and(|s| s.multi_blueprint)
         {
-            return Err(conflict("agent must be online to start deployment"));
+            return Err(conflict(
+                "agent must be online and support multi_blueprint_v1 to start deployment",
+            ));
         }
         let info = record
             .info
@@ -451,6 +560,50 @@ async fn deploy(
         {
             return Err(conflict("agent already has an active deployment"));
         }
+        let binding = state
+            .bindings(&request.agent_id)?
+            .remove(&pier_protocol::hash(&request.blueprint))
+            .ok_or_else(|| conflict("agent has no such blueprint binding"))?;
+        if request.action == pier_protocol::DeploymentAction::Stop {
+            if !request.images.is_empty() || !request.commit.is_empty() {
+                return Err(bad("stop forbids images and commit"));
+            }
+            let installed = record
+                .report
+                .blueprints
+                .iter()
+                .find(|b| b.blueprint == request.blueprint)
+                .ok_or_else(|| conflict("blueprint has not been deployed"))?;
+            let id = pier_protocol::new_id();
+            let job = Job {
+                action: request.action,
+                id: id.clone(),
+                agent_id: request.agent_id.clone(),
+                blueprint: request.blueprint.clone(),
+                commit: String::new(),
+                state: "ready".into(),
+                error: None,
+                created_at: pier_protocol::now(),
+                artifacts: BTreeMap::new(),
+                plan: Some(pier_protocol::DeploymentPlan {
+                    id: id.clone(),
+                    agent_id: request.agent_id,
+                    blueprint: request.blueprint,
+                    blueprint_name: installed.name.clone(),
+                    action: request.action,
+                    commit: String::new(),
+                    architecture: info.architecture,
+                    apps: Vec::new(),
+                }),
+            };
+            state.store.put("jobs", &id, &job)?;
+            let worker = state.clone();
+            let job_id = id.clone();
+            tokio::spawn(async move {
+                let _ = worker.dispatch(&job_id).await;
+            });
+            return Ok(Json(json!({"id":id,"state":"ready"})));
+        }
         let catalog = state
             .catalog
             .read()
@@ -462,10 +615,6 @@ async fn deploy(
                 "catalog changed; reload and supply current commit",
             ));
         }
-        let binding: Binding = state
-            .store
-            .get("bindings", &request.agent_id)?
-            .ok_or_else(|| conflict("agent has no blueprint binding"))?;
         let blueprint = catalog
             .blueprints
             .get(&binding.blueprint)
@@ -491,6 +640,7 @@ async fn deploy(
         }
         id = pier_protocol::new_id();
         let job = Job {
+            action: request.action,
             id: id.clone(),
             agent_id: request.agent_id,
             blueprint: binding.blueprint.clone(),
@@ -522,12 +672,20 @@ async fn deploy(
                 )
             })
             .await;
-            if !matches!(result, Ok(Ok(()))) {
+            if !matches!(&result, Ok(Ok(()))) {
                 if let Ok(Some(mut job)) = worker.store.get::<Job>("jobs", &job_id) {
                     job.state = "failed".into();
-                    job.error = Some(
-                        "package validation or build failed; no server changes applied".into(),
-                    );
+                    job.error = Some(match &result {
+                        Ok(Err(error)) if error.is::<pier_protocol::BlueprintAccountError>() => {
+                            format!(
+                                "{}; no server changes applied",
+                                error
+                                    .downcast_ref::<pier_protocol::BlueprintAccountError>()
+                                    .unwrap()
+                            )
+                        }
+                        _ => "package validation or build failed; no server changes applied".into(),
+                    });
                     let _ = worker.store.put("jobs", &job_id, &job);
                 }
             } else {
@@ -538,7 +696,7 @@ async fn deploy(
     Ok(Json(json!({"id":id,"state":"building"})))
 }
 fn public_job(job: Job) -> Value {
-    json!({"id":job.id,"agent_id":job.agent_id,"blueprint":job.blueprint,"commit":job.commit,"state":job.state,"error":job.error,"created_at":job.created_at,"plan":job.plan})
+    json!({"id":job.id,"action":job.action,"agent_id":job.agent_id,"blueprint":job.blueprint,"commit":job.commit,"state":job.state,"error":job.error,"created_at":job.created_at,"plan":job.plan})
 }
 async fn jobs(
     State(state): State<Arc<Controller>>,
@@ -625,6 +783,7 @@ mod tests {
                 "jobs",
                 "job",
                 &Job {
+                    action: pier_protocol::DeploymentAction::Deploy,
                     id: "job".into(),
                     agent_id: "owner".into(),
                     blueprint: "blueprints/web".into(),

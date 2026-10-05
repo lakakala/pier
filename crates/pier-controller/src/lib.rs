@@ -1,6 +1,8 @@
 //! Controller service and HTTP API.
 mod api;
 mod auth;
+#[cfg(test)]
+mod build_tests;
 pub mod catalog;
 mod connection;
 mod dialer;
@@ -117,6 +119,8 @@ pub struct Binding {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
+    #[serde(default)]
+    pub action: pier_protocol::DeploymentAction,
     pub id: String,
     pub agent_id: String,
     pub blueprint: String,
@@ -139,6 +143,7 @@ struct Session {
     id: String,
     sender: mpsc::Sender<Message>,
     terminal: bool,
+    multi_blueprint: bool,
     cancelled: tokio_util::sync::CancellationToken,
 }
 pub struct Controller {
@@ -205,6 +210,50 @@ impl Controller {
             listener_status: RwLock::new(runtime::ListenerStatus::default()),
         }))
     }
+    fn bindings(&self, agent: &str) -> Result<BTreeMap<String, Binding>> {
+        Ok(self
+            .store
+            .get("blueprint_bindings", agent)?
+            .unwrap_or_default())
+    }
+    fn check_blueprint_name(&self, agent: &str, path: &str, name: &str) -> Result<()> {
+        use pier_protocol::BlueprintAccountError as Error;
+        ensure!(
+            pier_protocol::valid_system_username(name),
+            Error::InvalidName
+        );
+        let catalog = self.catalog.read().unwrap();
+        if let Some(catalog) = catalog.as_ref() {
+            for binding in self.bindings(agent)?.values() {
+                ensure!(
+                    binding.blueprint == path
+                        || catalog
+                            .blueprints
+                            .get(&binding.blueprint)
+                            .is_none_or(|b| b.name != name),
+                    Error::DuplicateName(name.into())
+                );
+            }
+        }
+        if let Some(record) = self.store.get::<AgentRecord>("agents", agent)? {
+            for blueprint in record
+                .report
+                .blueprints
+                .iter()
+                .filter(|b| b.account_reserved)
+            {
+                ensure!(
+                    blueprint.blueprint == path || blueprint.name != name,
+                    Error::ReservedName(name.into())
+                );
+                // A successful deployment, including a later stop, reserves the name.
+                if blueprint.blueprint == path {
+                    ensure!(blueprint.name == name, Error::NameChanged(name.into()));
+                }
+            }
+        }
+        Ok(())
+    }
     fn build(
         &self,
         id: &str,
@@ -224,12 +273,15 @@ impl Controller {
             id: id.into(),
             agent_id: job.agent_id.clone(),
             blueprint: binding.blueprint.clone(),
+            blueprint_name: blueprint.name.clone(),
+            action: pier_protocol::DeploymentAction::Deploy,
             commit: catalog.commit.clone(),
             architecture,
             apps: Vec::new(),
         };
         // Validate all recipes before starting any download or build.
         let mut options = BTreeMap::new();
+        self.check_blueprint_name(&job.agent_id, &binding.blueprint, &blueprint.name)?;
         for app in &blueprint.apps {
             let metadata = &catalog.apps[&app.app];
             let image = images.get(&app.id).cloned();
@@ -283,6 +335,7 @@ impl Controller {
             .lock()
             .unwrap()
             .get(&job.agent_id)
+            .filter(|s| s.multi_blueprint)
             .map(|s| s.sender.clone());
         if let (Some(sender), Some(plan)) = (sender, job.plan) {
             sender

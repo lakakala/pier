@@ -28,6 +28,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 struct Entry {
+    blueprint_id: String,
     uid: u32,
     sid: i32,
     started: u64,
@@ -47,6 +48,18 @@ impl Manager {
             .map(|e| e.sid)
             .collect();
         account::cleanup_preserving(account, &preserved)
+    }
+    pub fn close_blueprint(&self, blueprint_id: &str, reason: &str) {
+        for entry in self
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.blueprint_id == blueprint_id)
+        {
+            let _ = entry.close.send(Some(reason.into()));
+            signal_entry(entry, libc::SIGTERM);
+        }
     }
     pub fn close_all(&self, reason: &str) {
         for entry in self.entries.lock().unwrap().values() {
@@ -125,20 +138,34 @@ impl Runtime {
             pier_protocol::safe_id(&id) && pier_protocol::safe_id(instance),
             "invalid terminal identity"
         );
-        let _operation = self
-            .operation
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("deployment in progress"))?;
+        // Holding this guard until PTY registration prevents a target deployment
+        // from missing a concurrently opened terminal. Other blueprints remain usable.
+        let busy = self.busy_blueprint.lock().unwrap();
         self.stopped()?;
         ensure!(!self.maintenance.load(Ordering::SeqCst), "agent upgrading");
         let durable: crate::DurableState = self.store.get("runtime", "state")?.unwrap_or_default();
-        ensure!(durable.pending.is_none(), "deployment in progress");
-        let app = durable
-            .snapshot
-            .apps
+        let (blueprint_id, app) = durable
+            .blueprints
             .iter()
-            .find(|app| app.instance == instance)
+            .find_map(|(id, snapshot)| {
+                snapshot
+                    .apps
+                    .iter()
+                    .find(|app| app.instance == instance)
+                    .map(|app| (id, app))
+            })
             .context("app not installed")?;
+        ensure!(
+            busy.as_ref() != Some(blueprint_id),
+            "blueprint deployment in progress"
+        );
+        ensure!(
+            durable
+                .pending
+                .as_ref()
+                .is_none_or(|p| p.blueprint_id != *blueprint_id),
+            "blueprint deployment in progress"
+        );
         let account = app.account.clone();
         account::verify(&account)?;
         ensure!(
@@ -226,6 +253,7 @@ impl Runtime {
         entries.insert(
             id.clone(),
             Entry {
+                blueprint_id: blueprint_id.clone(),
                 uid,
                 sid,
                 started,

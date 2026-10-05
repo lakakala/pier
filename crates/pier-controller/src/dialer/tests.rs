@@ -236,6 +236,7 @@ async fn passive_enrollment_and_address_edits() {
         assert!(!text.contains(value) && !text.contains("private-password"));
     }
     let job = crate::Job {
+        action: pier_protocol::DeploymentAction::Deploy,
         id: "busy".into(),
         agent_id: credentials.agent_id.clone(),
         blueprint: "test".into(),

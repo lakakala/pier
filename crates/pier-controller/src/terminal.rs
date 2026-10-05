@@ -100,12 +100,17 @@ pub(crate) async fn create(
     {
         return Err(missing());
     }
+    let blueprint = record
+        .report
+        .blueprints
+        .iter()
+        .find(|b| b.apps.iter().any(|a| a.instance == instance));
     if state.upgrade_busy(&agent)?
-        || state
-            .store
-            .list::<Job>("jobs")?
-            .iter()
-            .any(|job| job.agent_id == agent && job.active())
+        || state.store.list::<Job>("jobs")?.iter().any(|job| {
+            job.agent_id == agent
+                && job.active()
+                && blueprint.is_none_or(|b| b.blueprint == job.blueprint)
+        })
     {
         return Err(conflict("agent is deploying or upgrading"));
     }

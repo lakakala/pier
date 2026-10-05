@@ -1,8 +1,8 @@
 # Pier
 
-controller Web 的服务器详情页支持打开各 app 用户的 Bash 终端，默认进入该用户主目录；应用自动重启保留会话，关闭页面或重新部署时结束会话。见 [Web 终端说明](docs/services.md#在-web-中打开应用终端)。
+controller Web 的服务器详情页支持从应用行打开蓝图用户的 Bash 终端，默认进入蓝图共享数据目录；整组自动重启保留会话，重新部署或停止只结束目标蓝图的会话。见 [Web 终端说明](docs/services.md#在-web-中打开应用终端)。
 
-本仓库现为 Rust workspace：`pier-pkg` 保持为打包库，新增 `pier-controller` 和 `pier-agent` 两个服务。controller 从 Git 读取 app/blueprint，通过 React + Ant Design 控制台和 API 管理部署；agent 使用独立系统用户运行 app，自行守护进程并处理整组回退。controller 和 agent 均提供 DEB/RPM。controller 的 YAML 只保留 Web 监听地址和数据目录；首次访问 `/init` 创建管理员，配置仓库、agent 通信和构建参数，立即生效。后续在控制器设置页修改运行参数并手动重启，定义仓库仅手动同步。管理 API 使用 Cookie 会话。配置和运行说明见 [服务部署文档](docs/services.md)，HTTP 接口见 [controller API 文档](docs/api.md)。
+本仓库现为 Rust workspace：`pier-pkg` 保持为打包库，新增 `pier-controller` 和 `pier-agent` 两个服务。controller 从 Git 读取 app/blueprint，通过 React + Ant Design 控制台和 API 管理部署；agent 支持多个蓝图独立部署，每个蓝图使用同名系统用户及共享数据目录，整组守护应用进程并处理回退。controller 和 agent 均提供 DEB/RPM。controller 的 YAML 只保留 Web 监听地址和数据目录；首次访问 `/init` 创建管理员，配置仓库、agent 通信和构建参数，立即生效。后续在控制器设置页修改运行参数并手动重启，定义仓库仅手动同步。管理 API 使用 Cookie 会话。配置和运行说明见 [服务部署文档](docs/services.md)，HTTP 接口见 [controller API 文档](docs/api.md)。
 
 agent/controller 共用根 `Cargo.toml` 的 `[workspace.package].version`。每次推送 `master`，GitHub Actions 自动构建十二个 DEB/RPM 包及 `SHA256SUMS`，agent、controller 各按三个系统和两种架构展开六个独立任务，在对应系统容器中编译和测试，验证后创建标签并发布 GitHub Release，无需手动打标签。相同 Cargo 版本依次发布为 `vX.Y.Z`、`vX.Y.Z-r1`、`vX.Y.Z-r2`，对应安装包修订号 `1`、`2`、`3`。详见 [构建与发布说明](docs/services.md#github-actions-构建与发布)。
 

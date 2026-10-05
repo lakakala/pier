@@ -18,59 +18,59 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// One worker owns the complete blueprint; individual children never clean a UID.
 pub struct Supervisor {
     stop: Arc<AtomicBool>,
-    pub status: Arc<Mutex<AppStatus>>,
+    pub status: Arc<Mutex<Vec<AppStatus>>>,
     worker: Option<JoinHandle<()>>,
 }
 impl Supervisor {
     pub fn start(
-        installed: Installed,
+        apps: Vec<Installed>,
         options: RuntimeOptions,
         observe: bool,
         terminals: Arc<crate::terminal::Manager>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let status = Arc::new(Mutex::new(AppStatus {
-            instance: installed.instance.clone(),
-            id: installed.id.clone(),
-            state: "starting".into(),
-            ..AppStatus::default()
-        }));
-        let ready = Arc::new(AtomicBool::new(false));
-        let (worker_stop, worker_status, worker_ready) =
-            (stop.clone(), status.clone(), ready.clone());
+        let status = Arc::new(Mutex::new(
+            apps.iter()
+                .map(|app| AppStatus {
+                    instance: app.instance.clone(),
+                    id: app.id.clone(),
+                    state: "starting".into(),
+                    ..AppStatus::default()
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let (worker_stop, worker_status) = (stop.clone(), status.clone());
         let worker = thread::spawn(move || {
             let mut delay = 1;
-            loop {
-                if worker_stop.load(Ordering::SeqCst) {
-                    break;
+            let mut ready = false;
+            while !worker_stop.load(Ordering::SeqCst) {
+                for status in worker_status.lock().unwrap().iter_mut() {
+                    status.state = "starting".into();
                 }
-                worker_status.lock().unwrap().state = "starting".into();
                 let started = Instant::now();
-                let outcome = run_child(
-                    &installed,
+                if let Err(error) = run_group(
+                    &apps,
                     &options,
                     &worker_stop,
                     &worker_status,
-                    &worker_ready,
+                    &mut ready,
                     &terminals,
-                );
-                if let Err(error) = &outcome {
-                    tracing::warn!(instance=%installed.id, %error, "app process operation failed");
-                }
-                if let Ok(code) = outcome {
-                    worker_status.lock().unwrap().exit_code = code;
+                ) {
+                    tracing::warn!(%error, "blueprint process operation failed");
                 }
                 if worker_stop.load(Ordering::SeqCst) {
                     break;
                 }
-                if observe && !worker_ready.load(Ordering::SeqCst) {
-                    worker_status.lock().unwrap().state = "failed".into();
+                if observe && !ready {
+                    for status in worker_status.lock().unwrap().iter_mut() {
+                        status.state = "failed".into();
+                    }
                     return;
                 }
-                {
-                    let mut status = worker_status.lock().unwrap();
+                for status in worker_status.lock().unwrap().iter_mut() {
                     status.state = "backoff".into();
                     status.pid = None;
                     status.restarts += 1;
@@ -81,9 +81,10 @@ impl Supervisor {
                 pause(&worker_stop, Duration::from_secs(delay));
                 delay = (delay * 2).min(60);
             }
-            let mut status = worker_status.lock().unwrap();
-            status.state = "stopped".into();
-            status.pid = None;
+            for status in worker_status.lock().unwrap().iter_mut() {
+                status.state = "stopped".into();
+                status.pid = None;
+            }
         });
         Self {
             stop,
@@ -112,17 +113,23 @@ fn pause(stop: &AtomicBool, duration: Duration) {
         thread::sleep(Duration::from_millis(50));
     }
 }
-fn run_child(
-    installed: &Installed,
-    options: &RuntimeOptions,
-    stop: &AtomicBool,
-    status: &Mutex<AppStatus>,
-    ready: &AtomicBool,
-    terminals: &crate::terminal::Manager,
-) -> Result<Option<i32>> {
-    account::verify(&installed.account)?;
-    // Remove orphaned descendants before each restart as well as after agent crashes.
-    terminals.cleanup(&installed.account)?;
+struct Process {
+    child: Child,
+    output_stop: Arc<AtomicBool>,
+    out: Option<JoinHandle<()>>,
+    err: Option<JoinHandle<()>>,
+}
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.output_stop.store(true, Ordering::SeqCst);
+        for worker in [self.out.take(), self.err.take()].into_iter().flatten() {
+            let _ = worker.join();
+        }
+    }
+}
+fn spawn(installed: &Installed, status: &Mutex<Vec<AppStatus>>, index: usize) -> Result<Process> {
     let service = &installed.manifest.service;
     let mut command = Command::new(installed.release.join(&service.command[0]));
     command
@@ -156,7 +163,7 @@ fn run_child(
         });
     }
     let mut child = command.spawn()?;
-    status.lock().unwrap().pid = Some(child.id());
+    status.lock().unwrap()[index].pid = Some(child.id());
     let output_stop = Arc::new(AtomicBool::new(false));
     let out = logger(
         child.stdout.take().unwrap(),
@@ -170,48 +177,83 @@ fn run_child(
         output_stop.clone(),
         gid,
     );
-    let start = Instant::now();
-    let result = loop {
-        if stop.load(Ordering::SeqCst) {
-            break terminate(&mut child, options.stop_timeout_seconds);
+    Ok(Process {
+        child,
+        output_stop,
+        out: Some(out),
+        err: Some(err),
+    })
+}
+fn run_group(
+    apps: &[Installed],
+    options: &RuntimeOptions,
+    stop: &AtomicBool,
+    status: &Mutex<Vec<AppStatus>>,
+    ready: &mut bool,
+    terminals: &crate::terminal::Manager,
+) -> Result<()> {
+    let account = &apps[0].account;
+    account::verify(account)?;
+    terminals.cleanup(account)?;
+    let mut children = Vec::new();
+    let result = (|| {
+        for (i, app) in apps.iter().enumerate() {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            children.push(spawn(app, status, i)?);
         }
-        match child.try_wait() {
-            Ok(Some(exit)) => break Ok(exit.code()),
-            Ok(None) => (),
-            Err(error) => {
-                let _ = terminate(&mut child, 0);
-                break Err(error.into());
+        let start = Instant::now();
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            for (i, process) in children.iter_mut().enumerate() {
+                if let Some(exit) = process.child.try_wait()? {
+                    status.lock().unwrap()[i].exit_code = exit.code();
+                    return Ok(());
+                }
+            }
+            if start.elapsed() >= Duration::from_secs(options.startup_grace_seconds) {
+                *ready = true;
+                for status in status.lock().unwrap().iter_mut() {
+                    status.state = "running".into();
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    })();
+    // Request all stops before waiting; descendants are cleaned once per blueprint.
+    for process in &mut children {
+        if matches!(process.child.try_wait(), Ok(None)) {
+            // SAFETY: this worker owns the unreaped process and therefore its PGID.
+            unsafe {
+                libc::kill(-(process.child.id() as i32), libc::SIGTERM);
             }
         }
-        if start.elapsed() >= Duration::from_secs(options.startup_grace_seconds) {
-            ready.store(true, Ordering::SeqCst);
-            status.lock().unwrap().state = "running".into();
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    let _ = terminals.cleanup(&installed.account);
-    output_stop.store(true, Ordering::SeqCst);
-    let _ = out.join();
-    let _ = err.join();
-    status.lock().unwrap().pid = None;
-    result
-}
-fn terminate(child: &mut Child, seconds: u64) -> Result<Option<i32>> {
-    // The child is still owned and unreaped, so its PID/PGID cannot be reused.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGTERM);
     }
-    let deadline = Instant::now() + Duration::from_secs(seconds);
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status.code());
-        }
+    let deadline = Instant::now() + Duration::from_secs(options.stop_timeout_seconds);
+    while Instant::now() < deadline
+        && children
+            .iter_mut()
+            .any(|p| matches!(p.child.try_wait(), Ok(None)))
+    {
         thread::sleep(Duration::from_millis(50));
     }
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    for process in &mut children {
+        if matches!(process.child.try_wait(), Ok(None)) {
+            // SAFETY: owned, unreaped child as above.
+            unsafe {
+                libc::kill(-(process.child.id() as i32), libc::SIGKILL);
+            }
+        }
     }
-    Ok(child.wait()?.code())
+    drop(children);
+    let cleanup = terminals.cleanup(account);
+    for status in status.lock().unwrap().iter_mut() {
+        status.pid = None;
+    }
+    result.and(cleanup)
 }
 fn logger<R: Read + AsRawFd + Send + 'static>(
     mut reader: R,

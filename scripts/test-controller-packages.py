@@ -116,6 +116,8 @@ if '--after-boot' in sys.argv:
             from passive_package_checks import assert_socks5
             assert_socks5(command)
     assert pathlib.Path('/proc/%s' % pid()).stat().st_uid == meta['uid']
+    app_account = pwd.getpwnam('demo')
+    assert [app_account.pw_uid, app_account.pw_gid] == meta['app_identity']
     assert api('POST', '/v1/repository/sync', {})['commit'] == meta['next_commit']
     assert api('GET', '/v1/deployments/' + meta['job'])['state'] == 'succeeded'
     if distro == 'ubuntu2404':
@@ -227,11 +229,11 @@ if passive:
     command('systemctl', 'restart', 'pier-agent')
 agent_path = '/v1/agents/' + identity['id']
 wait('agent online', lambda: api('GET', agent_path)['online'])
-api('PUT', agent_path + '/binding', {'blueprint': 'blueprints/demo', 'variables': {}})
+api('POST', agent_path + '/bindings', {'blueprint': 'blueprints/demo', 'variables': {}})
 
 
 def deploy(images=None):
-    job = api('POST', '/v1/deployments', {'agent_id': identity['id'], 'commit': api('GET', '/v1/repository')['commit'], 'images': images or {}})['id']
+    job = api('POST', '/v1/deployments', {'agent_id': identity['id'], 'blueprint': 'blueprints/demo', 'commit': api('GET', '/v1/repository')['commit'], 'images': images or {}})['id']
     def completed():
         result = api('GET', '/v1/deployments/' + job)
         assert result['state'] not in ('failed', 'rolled_back', 'rollback_failed'), json.dumps(result)
@@ -240,6 +242,10 @@ def deploy(images=None):
     return job
 
 job = deploy()
+app_account = pwd.getpwnam('demo')
+app_identity = [app_account.pw_uid, app_account.pw_gid]
+assert app_account.pw_uid != 0 and app_account.pw_shell.endswith('/nologin')
+assert app_account.pw_dir.endswith('/data')
 if passive:
     view = api('GET', agent_path)
     app_pids = [app['pid'] for app in view['report']['apps']]
@@ -302,7 +308,7 @@ assert change['active']['max_concurrent_builds'] == 3
 assert change['saved']['max_concurrent_builds'] == 4 and change['restart_required']
 assert pid() == old_pid
 if auto_upgrade:
-    pending = api('POST', '/v1/deployments', {'agent_id': identity['id'], 'commit': head, 'images': {}})['id']
+    pending = api('POST', '/v1/deployments', {'agent_id': identity['id'], 'blueprint': 'blueprints/demo', 'commit': head, 'images': {}})['id']
     wait('deployment applying before controller restart', lambda: api('GET', '/v1/deployments/' + pending)['state'] == 'applying')
 command('systemctl', 'restart', 'pier-controller')
 wait('explicit restart', lambda: pid() not in (0, old_pid))
@@ -316,7 +322,7 @@ if auto_upgrade:
     wait('installation reserved after deployment', lambda: (api('GET', agent_path)['upgrade']['status'] or {}).get('phase') == 'installing')
     assert api('GET', '/v1/deployments/' + pending)['state'] == 'succeeded'
     try:
-        api('POST', '/v1/deployments', {'agent_id': identity['id'], 'commit': head, 'images': {}})
+        api('POST', '/v1/deployments', {'agent_id': identity['id'], 'blueprint': 'blueprints/demo', 'commit': head, 'images': {}})
         raise AssertionError('deployment accepted during upgrade')
     except urllib.error.HTTPError as error:
         assert error.code == 409
@@ -476,11 +482,13 @@ assert api('GET', '/v1/repository')['commit'] == head
 api('POST', '/v1/repository/sync', {})
 wait('agent reconnects', lambda: api('GET', agent_path)['online'])
 job = deploy({'demo': 'pier-package-smoke:local'})
+app_account = pwd.getpwnam('demo')
+assert [app_account.pw_uid, app_account.pw_gid] == app_identity
 assert api('GET', '/v1/deployments/' + job)['plan']['architecture'] == arch
 head = api('GET', '/v1/repository')['commit']
 (repo / 'README.md').write_text('This commit must not be fetched automatically on reboot.\n')
 next_commit = commit(repo)
-meta_file.write_text(json.dumps({'commit': head, 'next_commit': next_commit, 'config_hash': config_hash, 'uid': account.pw_uid, 'job': job}))
+meta_file.write_text(json.dumps({'commit': head, 'next_commit': next_commit, 'config_hash': config_hash, 'uid': account.pw_uid, 'app_identity': app_identity, 'job': job}))
 source.shutdown(); daemon.terminate(); daemon.wait(timeout=30)
 print('PASS %s/%s: install, web init, saved/active settings, listener failure and repair, manual sync, binary/Docker source deployments, upgrade without restart, crash recovery' % (distro, arch), flush=True)
 

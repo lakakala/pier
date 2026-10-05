@@ -467,6 +467,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = fixture(dir.path());
         let mut job = Job {
+            action: pier_protocol::DeploymentAction::Deploy,
             id: "job".into(),
             agent_id: "agent".into(),
             blueprint: "test".into(),

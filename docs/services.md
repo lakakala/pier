@@ -5,7 +5,7 @@
 ```text
 Git 定义仓库 → controller → pier-pkg → tar.gz
                   ↑                    ↓ 加密 TCP 下载
-                  └── TCP + Noise ──── agent → app 独立用户/进程
+                  └── TCP + Noise ──── agent → 多蓝图 → 蓝图共享用户 / 应用进程
 ```
 
 controller 使用本地 SQLite 和产物目录，第一版运行单实例；agent 使用自己的 SQLite 保存成功部署和事务恢复记录。两个服务均锁定各自的数据目录，禁止同一目录并发运行多个实例。不要让两个服务共用数据目录。
@@ -64,7 +64,7 @@ sudo systemctl stop pier-agent
 sudo systemctl restart pier-agent
 ```
 
-systemd 以 root 运行 agent，以便创建 app 专属用户和切换身份。agent 恢复本地部署后通过 `READY=1` 报告就绪，此时不要求 controller 在线；每个 app 的独立进程仍由 agent 守护。`Restart=on-failure` 在 agent 异常退出后重启，间隔 5 秒。`KillMode=mixed` 先向 agent 发送 SIGTERM，由它停止 app；停止超时 900 秒后 systemd 清理整个进程组所属的 cgroup。初始化失败保留已经写好的身份配置，并显示日志排查命令。
+systemd 以 root 运行 agent，以便创建蓝图专属用户和切换身份。agent 恢复本地部署后通过 `READY=1` 报告就绪，此时不要求 controller 在线；每个蓝图的应用进程组由 agent 守护。`Restart=on-failure` 在 agent 异常退出后重启，间隔 5 秒。`KillMode=mixed` 先向 agent 发送 SIGTERM，由它停止 app；停止超时 900 秒后 systemd 清理整个进程组所属的 cgroup。初始化失败保留已经写好的身份配置，并显示日志排查命令。
 
 agent 与 controller 握手时报告运行版本、已安装包版本、发行版和自动升级能力。controller 内置对应平台的新包时，agent 自动下载，在部署空闲后安装并重启；其管理的 app 会短暂中断并从本地状态恢复。仅升级，不自动降级；版本按数字 `x.y.z`、修订号比较，重新构建同版本同修订号不会触发升级。
 
@@ -90,19 +90,19 @@ sudo systemctl restart pier-agent
 
 更早、没有更新器的 agent 同样需要手动安装一次新版包并重启。直接运行开发二进制、非 systemd 实例和非受支持发行版不自动升级。
 
-手动执行包管理器安装仍不会在安装脚本中重启 agent；需要执行 `systemctl restart pier-agent`。DEB 附带仅针对本服务的 needrestart 设置。卸载停止两个单元并禁用主服务，保留配置、token、app 用户、部署数据与升级记录；DEB purge 同样保留这些运行数据。
+手动执行包管理器安装仍不会在安装脚本中重启 agent；需要执行 `systemctl restart pier-agent`。DEB 附带仅针对本服务的 needrestart 设置。卸载停止两个单元并禁用主服务，保留配置、token、蓝图用户、部署数据与升级记录；DEB purge 同样保留这些运行数据。
 
 ## 在 Web 中打开应用终端
 
-登录 controller，进入“服务器 → 服务器详情”，在已部署应用所在行点击“终端”，即可打开 app 系统用户的交互式 Bash。终端可全屏，支持 Tab 补全、Ctrl+C、复制粘贴和窗口缩放；顶部显示实际用户名与主目录。
+登录 controller，进入“服务器 → 服务器详情”，在蓝图下的已部署应用行点击“终端”，即可打开蓝图系统用户的交互式 Bash。终端可全屏，支持 Tab 补全、Ctrl+C、复制粘贴和窗口缩放；顶部显示实际用户名与主目录。
 
-默认进入 app 用户的主目录（应用数据目录），使用基础 Shell 环境，不自动加载 `service.env` 或 app 声明的变量。账户保留 `nologin`，由 agent 验证身份后通过 PTY 启动 Bash，无需 SSH 配置或新端口。安装包显式依赖 Bash，应用发布目录保持原有权限。
+默认进入蓝图用户的主目录（蓝图共享数据目录），使用基础 Shell 环境，不自动加载 `service.env` 或 app 声明的变量。账户保留 `nologin`，由 agent 验证身份后通过 PTY 启动 Bash，无需 SSH 配置或新端口。安装包显式依赖 Bash，应用发布目录保持原有权限。
 
-应用崩溃并被自动拉起时，终端继续保留。关闭终端只结束该终端的 Bash 和会话内作业；部署、回滚、agent 升级/停止、控制连接丢失或 Web 登录失效会结束关联终端，并显示原因。网络中断最长 45 秒检测，重连创建新会话，不恢复旧 Bash。
+应用退出触发蓝图整组自动重启时，终端继续保留。关闭终端只结束该终端的 Bash 和会话内作业；显式部署、回滚或停止蓝图只结束目标蓝图的终端。agent 升级/停止、控制连接丢失或 Web 登录失效会结束关联终端，并显示原因。网络中断最长 45 秒检测，重连创建新会话，不恢复旧 Bash。
 
 每个 agent 最多 8 个终端，controller 最多 64 个。浏览器使用同源 WebSocket（HTTP 对应 WS，HTTPS 对应 WSS），根据连接模式由 agent 或 controller 发起独立 Noise 连接，复用对应接收方的通信监听端口。使用反向代理时须支持 WebSocket Upgrade，见 [Nginx 示例](../examples/services/controller.nginx.conf)。服务端不记录终端输入输出；Bash 历史由账户配置决定。
 
-新 controller 与旧 agent 继续使用协议 v2，原部署和自动升级流程不变；agent 升级并上报 `app_terminal_v1` 能力后启用终端按钮。接口及帧格式见 [应用终端 API](api.md#应用-bash-终端)。GitHub Actions 的六个平台安装测试覆盖真实 PTY、账户环境、流控和进程清理。
+新 controller 与旧 agent 继续使用协议 v2，并保留原自动升级通道；多蓝图部署需要 `multi_blueprint_v1` 能力，终端按钮另需 `app_terminal_v1` 能力。接口及帧格式见 [应用终端 API](api.md#应用-bash-终端)。GitHub Actions 的六个平台安装测试覆盖真实 PTY、账户环境、流控和进程清理。
 
 ## Controller 安装与网页初始化
 
@@ -285,7 +285,7 @@ agent **不进行 HTTPS 连接，也不配置 CA 或证书**。初次连接使�
 
 ### 从 TLS 协议 v1 迁移
 
-controller 和 agent 必须一起升级，v2 不接受旧 TLS 连接，也不自动降级。
+以下仅描述通信协议迁移。升级到多蓝图版本还需遵守[账户与部署状态的兼容边界](#用户目录和守护行为)，旧的逐应用部署状态不能直接恢复。controller 和 agent 必须一起升级，v2 不接受旧 TLS 连接，也不自动降级。
 
 - controller 将 `https_listen` 替换为 `http_listen`，移除 `tls_cert`、`tls_key`，直接通过 HTTP 访问或设置可选 HTTPS 反向代理；在 Web 初始化或设置页配置 `public_url` 和 `agent_endpoint`。
 - agent 移除 `ca_cert`、`controller_https`、`controller_server_name`；保留 `agent_id`、`token_file`、`controller_tcp`、`state_dir` 和运行选项。
@@ -318,11 +318,11 @@ apps:
 
 `GET /v1/blueprints` 返回 blueprint 映射及所有 app 的变量声明，便于管理客户端生成填写表单。`GET /v1/apps` 单独返回 app 声明。app 的名称和版本可能仍含模板；目录 ID 不依赖渲染值。绑定查询仅返回已填写变量名，不返回其值。
 
-一个 agent 绑定一个 blueprint，同一个 blueprint 可以绑定多个 agent。建立或修改绑定、同步 Git 均不触发部署。无效的新目录快照不会替换上次可用快照，查询仓库状态可以看到同步错误。
+一个 agent 可以绑定多个不同 blueprint，同一个 blueprint 在该 agent 上只绑定一份，也可以绑定到其他 agent。每个绑定分别保存变量，通过 `/v1/agents/{id}/bindings` 管理。建立或修改绑定、同步 Git 均不触发部署。无效的新目录快照不会替换上次可用快照，查询仓库状态可以看到同步错误。
 
 ## HTTP API 与部署
 
-完整接口列表、鉴权方式、请求与响应、错误状态和调用示例见 [controller API 文档](api.md)。部署前先查询定义并绑定 blueprint，再提交当前 commit 与各源码实例所需的构建镜像；具体参数约束统一在 API 文档中维护。
+完整接口列表、鉴权方式、请求与响应、错误状态和调用示例见 [controller API 文档](api.md)。部署前先查询定义并绑定 blueprint，再明确提交目标 blueprint 路径、当前 commit 与各源码实例所需的构建镜像；具体参数约束统一在 API 文档中维护。
 
 接口返回任务 ID，controller 在后台打包，默认最多同时处理两个服务器的构建任务。全部包构建完成后才通知 agent，因此打包失败不会改变服务器。每次使用独立产物目录，避免同名包及不同服务器的配置相互覆盖。
 
@@ -330,31 +330,36 @@ apps:
 
 agent 在修改服务前下载并验证所有包，包括整体 SHA-256、目标架构、文件清单、文件哈希和启动文件；拒绝路径越界、软硬链接、特殊文件及未声明文件。包解压上限为 10 GiB、100000 个条目，清单上限为 4 MiB。随后持久化原部署，按列表顺序更新 app。默认启动后连续存活 10 秒视为成功，可通过 agent 配置调整。
 
-任何 app 启动失败会回退整个 blueprint：停止本次新版本，恢复之前的程序、配置和 app 列表。数据目录不参与回退；数据库迁移等外部副作用也不回滚。部署中 agent 重启时使用事务记录恢复之前的成功部署。首次部署失败会停止本次已启动的 app。回退失败的 app 仍会按退避策略尝试恢复，任务明确记录 `rollback_failed`。
+各 blueprint 独立部署、停止和回滚；同一 agent 同时最多执行一个部署或停止任务，其他 blueprint 持续运行。任何 app 启动失败只回退所属 blueprint：停止本次新版本，恢复之前的程序、配置和 app 列表。数据目录不参与回退；数据库迁移等外部副作用也不回滚。部署中 agent 重启时使用事务记录恢复目标 blueprint 之前的成功部署，并恢复其他 blueprint 各自的快照。首次部署失败会停止本次已启动的 app。回退失败的 app 仍会按退避策略尝试恢复，任务明确记录 `rollback_failed`。
 
 ## 用户、目录和守护行为
 
-每个实例创建一个 `pier_<身份摘要>` 系统用户及同名组，禁用登录，升级复用原用户。遇到同名但不属于该 agent 的用户时拒绝部署；agent 不删除用户或持久化数据。
+每个蓝图使用 `pier-blueprint.yml` 的 `name` 原文创建系统用户及同名组，禁用登录。例如 `name: Web.Site` 创建 `Web.Site` 用户和组，不添加前缀、不转换大小写，也不对蓝图名称做模板渲染。名称必须符合 `[A-Za-z_][A-Za-z0-9_.-]{0,31}`；不合法时拒绝绑定或部署。应用的包名不再承担账户命名职责，继续使用打包库原有规则。
+
+同机不同蓝图不能占用同名用户或组，包括已停止、已解除绑定但保留的账户。controller 在构建前检查名称及已知的蓝图冲突；agent 验证全部制品和账户后才创建目录或停止原服务。不接管系统用户、其他蓝图或其他 agent 的账户。
+
+蓝图身份为仓库相对路径的 SHA-256；应用身份仍由蓝图路径与 `apps[].id` 共同决定。升级可以更改应用版本和 recipe 目录，但必须保持蓝图路径和蓝图 `name` 不变。agent 验证保存的账户归属、UID/GID 和主目录后复用原用户。改名或账户身份异常会拒绝部署。
+
+同一蓝图的全部应用共享账户、主目录和 `PIER_DATA_DIR`，可以相互访问数据。各应用分别保存程序版本和日志，`PIER_LOG_DIR` 指向该应用的日志目录。应用应自行协调共享文件名及数据格式；共享数据不参与部署回滚。
 
 ```text
 /var/lib/pier-agent/
 ├── agent.db
 ├── downloads/
-└── apps/<实例摘要>/
-    ├── releases/<部署ID>-<包SHA256>/
-    ├── data/
-    └── logs/
+└── blueprints/<蓝图身份摘要>/
+    ├── data/                         # 共享 HOME / PIER_DATA_DIR
+    └── apps/<apps[].id>/
+        ├── releases/<部署ID>-<SHA256>/
+        └── logs/                     # 该应用的 PIER_LOG_DIR
 ```
 
-版本文件由 root 所有，只有对应 app 组可以读取/执行；数据目录由 app 用户所有。agent 清空继承环境，以专属 UID/GID 和空附加组直接执行包内命令，保留 `service.env`，设置独立进程组，不额外拼接 shell 命令。默认设置 `PATH`、`HOME`、`USER` 和 `LOGNAME`。
+任何应用退出（包括退出码 0）都会停止并重启所属蓝图的全部应用。agent 先向各进程组发送 SIGTERM，超时后强制结束，随后对该蓝图用户执行一次残留进程清理，再按应用列表顺序启动新进程。自动重启间隔从 1 秒退避到 60 秒，整组稳定运行 60 秒后重置；其他蓝图不受影响。自动重启保留合法的终端会话，显式部署或停止只关闭目标蓝图的终端。
 
-额外提供两个不可在 `service.env` 中覆盖的变量：`PIER_DATA_DIR` 指向持久化数据，`PIER_LOG_DIR` 指向 agent 收集的日志目录。程序应以前台模式运行，将持久化内容写入数据目录，日志输出到 stdout/stderr。agent 按实例保存 stdout/stderr，每个日志文件 10 MiB，保留三份轮转历史；日志内容由应用自身负责，agent 不猜测或脱敏应用输出。
+controller 断线时蓝图继续运行和自动恢复。agent 正常退出会停止全部蓝图；SIGKILL 后由下次启动校验账户、清理遗留进程并从各自本地快照恢复。不要将蓝图专属用户用于其他手工服务，它们也会被纳入该蓝图的进程清理。
 
-期望运行的进程退出后会自动重启，包括退出码 0；重启间隔从 1 秒退避到 60 秒，运行稳定 60 秒后重置。主动停止、升级和回退期间暂停对应实例的自动拉起。停止时先向进程组发送 SIGTERM，默认 30 秒后强制终止，并清理专属用户下的残留进程。
+在控制台执行“停止蓝图”后，蓝图进入 `stopped`，绑定、账户、数据和历史版本保留。停止不依赖当前 Git 目录仍有该蓝图。agent 在线且蓝图已停止时才可“解除绑定”；解除绑定不执行部署，也不删除账户或数据。以后重新绑定相同路径、相同名称的蓝图会复用原账户及共享数据。部署 `apps: []` 同样停止该蓝图的应用。
 
-controller 断线时 app 继续运行并自动重启。agent 正常退出会停止 app；SIGKILL 无法执行退出清理，因此下次启动时校验记录的账户身份，清理该实例的遗留进程，再从本地状态恢复。不要将 app 专属用户用于其他手工运行的进程，它们也会被纳入清理。
-
-新 blueprint 列表中移除的 app 会停止，用户、数据和历史版本保留。需要停止全部 app 时，部署 `apps: []` 的 blueprint。当前不自动清理历史快照或包，运维应按保留需求管理磁盘，保留 agent 当前及回退使用的版本。
+账户和目录规则面向全新部署，不自动合并旧的应用数据或迁移 `pier_<身份摘要>`、应用包名账户。发现旧的逐应用部署状态会明确拒绝启动，要求运维先备份并处理旧部署；不会静默接管或忽略旧账户。协议保持 v2，新功能通过 `multi_blueprint_v1` 能力协商；旧 agent 仍可连接和使用原升级通道，但不能接收多蓝图部署任务。
 
 ## 代理与边界
 

@@ -14,7 +14,10 @@ pub mod upgrade;
 use account::Account;
 use anyhow::{Result, ensure};
 use pier_pkg::{Architecture, PackageManifest};
-use pier_protocol::{AgentReport, DeploymentPlan, DeploymentResult, Message, store::Store};
+use pier_protocol::{
+    AgentReport, BlueprintStatus, DeploymentAction, DeploymentPlan, DeploymentResult, Message,
+    store::Store,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -86,6 +89,9 @@ pub struct Installed {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Snapshot {
+    blueprint: String,
+    name: String,
+    result: Option<DeploymentResult>,
     deployment_id: Option<String>,
     apps: Vec<Installed>,
 }
@@ -93,11 +99,13 @@ struct Snapshot {
 struct Pending {
     id: String,
     fingerprint: String,
+    blueprint_id: String,
     before: Snapshot,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DurableState {
-    snapshot: Snapshot,
+    #[serde(default)]
+    blueprints: BTreeMap<String, Snapshot>,
     pending: Option<Pending>,
     result: Option<DeploymentResult>,
 }
@@ -115,9 +123,16 @@ pub struct Runtime {
     store: Store,
     active: Mutex<BTreeMap<String, Supervisor>>,
     operation: Mutex<()>,
+    busy_blueprint: Mutex<Option<String>>,
     shutting_down: AtomicBool,
     maintenance: AtomicBool,
     events: tokio::sync::mpsc::UnboundedSender<Message>,
+}
+struct BusyBlueprint<'a>(&'a Mutex<Option<String>>);
+impl Drop for BusyBlueprint<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
 }
 pub fn architecture() -> Result<Architecture> {
     match std::env::consts::ARCH {
@@ -170,9 +185,21 @@ impl Runtime {
         let lock = pier_protocol::state_lock(&config.state_dir)?;
         // App users need traversal to their own protected app directory.
         fs::set_permissions(&config.state_dir, fs::Permissions::from_mode(0o711))?;
-        account::directory(&config.state_dir.join("apps"), 0, 0, 0o711)?;
+        account::directory(&config.state_dir.join("blueprints"), 0, 0, 0o711)?;
         account::directory(&config.state_dir.join("downloads"), 0, 0, 0o700)?;
         let store = Store::open(&config.state_dir.join("agent.db"))?;
+        let legacy = store.get::<serde_json::Value>("runtime", "state")?;
+        ensure!(
+            store.list::<serde_json::Value>("accounts")?.is_empty()
+                && legacy.as_ref().is_none_or(|value| {
+                    value.get("snapshot").is_none()
+                        || (value["snapshot"]["apps"]
+                            .as_array()
+                            .is_some_and(Vec::is_empty)
+                            && value["pending"].is_null())
+                }),
+            "legacy per-app deployment state requires manual backup and removal; automatic account/data migration is not supported"
+        );
         let identity: Option<String> = store.get("identity", "agent_id")?;
         ensure!(
             identity.as_ref().is_none_or(|id| id == &config.agent_id),
@@ -187,32 +214,52 @@ impl Runtime {
             store,
             active: Mutex::new(BTreeMap::new()),
             operation: Mutex::new(()),
+            busy_blueprint: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             maintenance: AtomicBool::new(false),
             events,
         });
-        for account in state.store.list::<Account>("accounts")? {
-            account::cleanup(&account)?;
+        for account in state.store.list::<Account>("blueprint_accounts")? {
+            if account::cleanup(&account).is_err() {
+                tracing::warn!(user=%account.name, "blueprint account verification or cleanup failed");
+            }
         }
         let mut durable: DurableState = state.store.get("runtime", "state")?.unwrap_or_default();
-        let interrupted = durable.pending.take();
+        let interrupted = durable.pending.clone();
         if let Some(pending) = &interrupted {
-            durable.snapshot = pending.before.clone();
+            durable
+                .blueprints
+                .insert(pending.blueprint_id.clone(), pending.before.clone());
         }
-        // Keep the pending journal until the prior snapshot is restored.
-        let restored = state.restore(&durable.snapshot, interrupted.is_some());
+        let mut interrupted_restored = true;
+        for (id, snapshot) in &durable.blueprints {
+            let observe = interrupted.as_ref().is_some_and(|p| p.blueprint_id == *id);
+            let restored = state.restore(id, snapshot, observe);
+            if observe {
+                interrupted_restored = restored.is_ok();
+            }
+        }
         if let Some(pending) = interrupted {
             let result = DeploymentResult {
                 id: pending.id.clone(),
-                state: if restored.is_ok() {
+                state: if interrupted_restored {
                     "rolled_back"
                 } else {
                     "rollback_failed"
                 }
                 .into(),
-                error: Some("agent restarted during deployment; restored previous snapshot".into()),
+                error: Some(
+                    "agent restarted during deployment; restored previous blueprint snapshot"
+                        .into(),
+                ),
             };
+            durable.pending = None;
             durable.result = Some(result.clone());
+            durable
+                .blueprints
+                .get_mut(&pending.blueprint_id)
+                .unwrap()
+                .result = Some(result.clone());
             state.store.put_pair(
                 ("runtime", "state", &durable),
                 (
@@ -236,11 +283,15 @@ impl Runtime {
         );
         Ok(())
     }
-    fn stop_instance(&self, instance: &str) {
-        let supervisor = self.active.lock().unwrap().remove(instance);
+    fn stop_blueprint(&self, id: &str) -> Result<()> {
+        let supervisor = self.active.lock().unwrap().remove(id);
         if let Some(mut supervisor) = supervisor {
             supervisor.stop();
         }
+        if let Some(account) = self.store.get::<Account>("blueprint_accounts", id)? {
+            account::cleanup(&account)?;
+        }
+        Ok(())
     }
     fn stop_all(&self) {
         let active = std::mem::take(&mut *self.active.lock().unwrap());
@@ -251,89 +302,110 @@ impl Runtime {
             supervisor.stop();
         }
     }
-    fn start(&self, installed: Installed, observe: bool) -> Result<()> {
+    fn start(&self, id: &str, snapshot: &Snapshot, observe: bool) -> Result<()> {
         self.stopped()?;
-        let instance = installed.instance.clone();
+        if snapshot.apps.is_empty() {
+            return Ok(());
+        }
         let supervisor = Supervisor::start(
-            installed,
+            snapshot.apps.clone(),
             self.config.runtime.clone(),
             observe,
             self.terminals.clone(),
         );
-        self.active
-            .lock()
-            .unwrap()
-            .insert(instance.clone(), supervisor);
+        let status = supervisor.status.clone();
+        self.active.lock().unwrap().insert(id.into(), supervisor);
         if observe {
-            // Only operation worker writes the map, but report readers remain unblocked
-            // during startup observation via a separate status/ready handle.
             let deadline = std::time::Instant::now()
                 + Duration::from_secs(self.config.runtime.startup_grace_seconds + 10);
             loop {
                 self.stopped()?;
-                let state = self
-                    .active
-                    .lock()
-                    .unwrap()
-                    .get(&instance)
-                    .unwrap()
-                    .status
-                    .lock()
-                    .unwrap()
-                    .state
-                    .clone();
-                if state == "running" {
+                let statuses = status.lock().unwrap();
+                if statuses.iter().all(|s| s.state == "running") {
                     return Ok(());
                 }
                 ensure!(
-                    state != "failed" && std::time::Instant::now() < deadline,
-                    "app failed startup observation"
+                    statuses.iter().all(|s| s.state != "failed")
+                        && std::time::Instant::now() < deadline,
+                    "blueprint failed startup observation"
                 );
+                drop(statuses);
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
         Ok(())
     }
-    fn restore(&self, snapshot: &Snapshot, observe: bool) -> Result<()> {
-        self.stop_all();
-        let mut failed = false;
-        for installed in &snapshot.apps {
-            if self.start(installed.clone(), observe).is_err() {
-                failed = true;
-                self.stop_instance(&installed.instance);
-                // Failed rollback services continue retrying with backoff.
-                if !self.shutting_down.load(Ordering::SeqCst) {
-                    let _ = self.start(installed.clone(), false);
-                }
+    fn restore(&self, id: &str, snapshot: &Snapshot, observe: bool) -> Result<()> {
+        self.stop_blueprint(id)?;
+        let result = self.start(id, snapshot, observe);
+        if result.is_err() {
+            let _ = self.stop_blueprint(id);
+            if !self.shutting_down.load(Ordering::SeqCst) {
+                let _ = self.start(id, snapshot, false);
             }
         }
-        ensure!(!failed, "one or more previous services failed to restart");
-        Ok(())
+        result
     }
     pub fn report(&self) -> Result<AgentReport> {
         let durable: DurableState = self.store.get("runtime", "state")?.unwrap_or_default();
-        let apps = self
-            .active
-            .lock()
-            .unwrap()
-            .values()
-            .map(|s| s.status.lock().unwrap().clone())
-            .collect();
+        let active = self.active.lock().unwrap();
+        let mut blueprints = Vec::new();
+        for (id, snapshot) in &durable.blueprints {
+            let apps = active
+                .get(id)
+                .map(|s| s.status.lock().unwrap().clone())
+                .unwrap_or_default();
+            let state = if snapshot.apps.is_empty() {
+                "stopped"
+            } else if apps.is_empty() {
+                "failed"
+            } else if apps.iter().all(|app| app.state == "running") {
+                "running"
+            } else if apps.iter().any(|app| app.state == "failed") {
+                "failed"
+            } else if apps.iter().any(|app| app.state == "backoff") {
+                "backoff"
+            } else {
+                "starting"
+            };
+            let account = self.store.get::<Account>("blueprint_accounts", id)?;
+            blueprints.push(BlueprintStatus {
+                account_reserved: account.is_some(),
+                id: id.clone(),
+                blueprint: snapshot.blueprint.clone(),
+                name: account.map_or_else(|| snapshot.name.clone(), |account| account.name),
+                deployment_id: snapshot.deployment_id.clone(),
+                state: state.into(),
+                apps,
+                result: snapshot.result.clone(),
+            });
+        }
         Ok(AgentReport {
-            capabilities: vec![pier_protocol::terminal::CAPABILITY.into()],
-            deployment_id: durable.snapshot.deployment_id,
-            apps,
+            capabilities: vec![
+                pier_protocol::terminal::CAPABILITY.into(),
+                pier_protocol::MULTI_BLUEPRINT_CAPABILITY.into(),
+            ],
+            deployment_id: if blueprints.len() == 1 {
+                blueprints[0].deployment_id.clone()
+            } else {
+                None
+            },
+            apps: blueprints.iter().flat_map(|b| b.apps.clone()).collect(),
+            blueprints,
             result: durable.result,
         })
     }
     pub fn shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
-        self.terminals.close_all("agent_stopping");
+        {
+            let _busy = self.busy_blueprint.lock().unwrap();
+            self.shutting_down.store(true, Ordering::SeqCst);
+            self.terminals.close_all("agent_stopping");
+        }
         // Stop running apps even if a deployment is waiting on a network read.
         self.stop_all();
         let _guard = self.operation.lock().unwrap();
         self.stop_all();
-        if let Ok(accounts) = self.store.list::<Account>("accounts") {
+        if let Ok(accounts) = self.store.list::<Account>("blueprint_accounts") {
             for account in accounts {
                 let _ = account::cleanup(&account);
             }
@@ -350,6 +422,7 @@ impl Runtime {
         if durable.pending.is_some() {
             return Ok(false);
         }
+        let _busy = self.busy_blueprint.lock().unwrap();
         self.maintenance.store(true, Ordering::SeqCst);
         self.terminals.close_all("agent_upgrading");
         Ok(true)
@@ -400,32 +473,62 @@ impl Runtime {
                 "invalid artifact metadata"
             );
         }
-        self.terminals.close_all("deployment_started");
+        let blueprint_id = pier_protocol::hash(&plan.blueprint);
+        ensure!(
+            !plan.blueprint_name.is_empty(),
+            "controller must support blueprint accounts"
+        );
+        ensure!(
+            plan.action != DeploymentAction::Stop || plan.apps.is_empty(),
+            "stop plan cannot contain apps"
+        );
+        *self.busy_blueprint.lock().unwrap() = Some(blueprint_id.clone());
+        let _busy = BusyBlueprint(&self.busy_blueprint);
+        let before = durable
+            .blueprints
+            .get(&blueprint_id)
+            .cloned()
+            .unwrap_or_else(|| Snapshot {
+                blueprint: plan.blueprint.clone(),
+                name: plan.blueprint_name.clone(),
+                ..Snapshot::default()
+            });
         let _ = self.events.send(Message::Progress {
             id: plan.id.clone(),
             phase: "downloading".into(),
         });
         let result = match self.prepare(&plan) {
-            Err(_) => DeploymentResult {
+            Err(error) => DeploymentResult {
                 id: plan.id.clone(),
                 state: "failed".into(),
-                error: Some("artifact preparation failed; existing deployment retained".into()),
+                error: Some(
+                    match error.downcast_ref::<pier_protocol::BlueprintAccountError>() {
+                        Some(reason) => reason.deployment_error(),
+                        None => "artifact preparation failed; existing deployment retained".into(),
+                    },
+                ),
             },
             Ok(candidate) => {
                 self.stopped()?;
+                self.terminals
+                    .close_blueprint(&blueprint_id, "deployment_started");
                 durable.pending = Some(Pending {
                     id: plan.id.clone(),
                     fingerprint: fingerprint.clone(),
-                    before: durable.snapshot.clone(),
+                    blueprint_id: blueprint_id.clone(),
+                    before: before.clone(),
                 });
                 self.store.put("runtime", "state", &durable)?;
                 let _ = self.events.send(Message::Progress {
                     id: plan.id.clone(),
                     phase: "applying".into(),
                 });
-                let applied = self.activate(&candidate, &durable.snapshot);
-                if applied.is_ok() {
-                    durable.snapshot = candidate;
+                if self
+                    .stop_blueprint(&blueprint_id)
+                    .and_then(|()| self.start(&blueprint_id, &candidate, true))
+                    .is_ok()
+                {
+                    durable.blueprints.insert(blueprint_id.clone(), candidate);
                     DeploymentResult {
                         id: plan.id.clone(),
                         state: "succeeded".into(),
@@ -436,7 +539,7 @@ impl Runtime {
                         id: plan.id.clone(),
                         phase: "rolling_back".into(),
                     });
-                    let restored = self.restore(&durable.snapshot, true);
+                    let restored = self.restore(&blueprint_id, &before, true);
                     DeploymentResult {
                         id: plan.id.clone(),
                         state: if restored.is_ok() {
@@ -446,7 +549,8 @@ impl Runtime {
                         }
                         .into(),
                         error: Some(
-                            "app startup failed; restoring the entire previous deployment".into(),
+                            "app startup failed; restoring the previous blueprint deployment"
+                                .into(),
                         ),
                     }
                 }
@@ -454,6 +558,11 @@ impl Runtime {
         };
         let pending = durable.pending.take();
         durable.result = Some(result.clone());
+        durable
+            .blueprints
+            .entry(blueprint_id.clone())
+            .or_insert(before.clone())
+            .result = Some(result.clone());
         if let Err(error) = self.store.put_pair(
             ("runtime", "state", &durable),
             (
@@ -466,7 +575,7 @@ impl Runtime {
             ),
         ) {
             if let Some(pending) = pending {
-                let _ = self.restore(&pending.before, false);
+                let _ = self.restore(&blueprint_id, &pending.before, false);
             }
             return Err(error);
         }
@@ -495,24 +604,64 @@ impl Runtime {
             );
             downloaded.push((app, extracted, manifest));
         }
+        let id = pier_protocol::hash(&plan.blueprint);
         let mut snapshot = Snapshot {
+            blueprint: plan.blueprint.clone(),
+            name: plan.blueprint_name.clone(),
             deployment_id: Some(plan.id.clone()),
+            result: None,
             apps: Vec::new(),
         };
+        ensure!(
+            pier_protocol::valid_system_username(&plan.blueprint_name),
+            pier_protocol::BlueprintAccountError::InvalidName
+        );
+        if let Some(account) = self.store.get::<Account>("blueprint_accounts", &id)? {
+            ensure!(
+                account.name == plan.blueprint_name,
+                pier_protocol::BlueprintAccountError::NameChanged(plan.blueprint_name.clone())
+            );
+        }
+        // Stopping never creates an account and must work without a catalog.
+        if downloaded.is_empty() {
+            return Ok(snapshot);
+        }
+        let root = self.config.state_dir.join("blueprints").join(&id);
+        let data = root.join("data");
+        let saved = self.store.get::<Account>("blueprint_accounts", &id)?;
+        let checked = account::check(
+            &self.config.agent_id,
+            &id,
+            &plan.blueprint_name,
+            &data,
+            saved.as_ref(),
+        )?;
+        let registered = self.store.list::<Account>("blueprint_accounts")?;
+        ensure!(
+            !registered.iter().any(|a| a.name == plan.blueprint_name
+                && a.marker != account::marker(&self.config.agent_id, &id)),
+            pier_protocol::BlueprintAccountError::ReservedName(plan.blueprint_name.clone())
+        );
+        let account = account::create(
+            &self.config.agent_id,
+            &id,
+            &plan.blueprint_name,
+            &data,
+            checked.as_ref(),
+        )?;
+        self.store.put("blueprint_accounts", &id, &account)?;
+        account::directory(&root, 0, account.gid, 0o750)?;
+        account::directory(&data, account.uid, account.gid, 0o750)?;
+        let apps = root.join("apps");
+        account::directory(&apps, 0, account.gid, 0o750)?;
         for (app, extracted, manifest) in downloaded {
             self.stopped()?;
-            let root = self.config.state_dir.join("apps").join(&app.instance);
-            let data = root.join("data");
-            let logs = root.join("logs");
-            let account = account::create(&self.config.agent_id, &app.instance, &data)?;
-            self.store.put("accounts", &app.instance, &account)?;
-            account::directory(&root, 0, account.gid, 0o750)?;
-            account::directory(&data, account.uid, account.gid, 0o750)?;
-            account::directory(&logs, 0, account.gid, 0o750)?;
-            let releases = root.join("releases");
-            account::directory(&releases, 0, account.gid, 0o750)?;
-            // Include deployment ID so reinstalling an identical artifact never trusts
-            // potentially modified contents of an older installation.
+            let app_root = apps.join(&app.id);
+            let logs = app_root.join("logs");
+            let releases = app_root.join("releases");
+            for path in [&app_root, &logs, &releases] {
+                account::directory(path, 0, account.gid, 0o750)?;
+            }
             let release = releases.join(format!("{}-{}", plan.id, app.sha256));
             ensure!(!release.exists(), "release destination already exists");
             account::release_permissions(&extracted, account.gid)?;
@@ -522,30 +671,12 @@ impl Runtime {
                 id: app.id.clone(),
                 sha256: app.sha256.clone(),
                 release,
-                account,
+                account: account.clone(),
                 logs,
                 manifest,
             });
         }
         Ok(snapshot)
-    }
-    fn activate(&self, candidate: &Snapshot, before: &Snapshot) -> Result<()> {
-        // Stop removed instances first so replacements may reuse their listening ports.
-        for old in &before.apps {
-            if !candidate
-                .apps
-                .iter()
-                .any(|new| new.instance == old.instance)
-            {
-                self.stop_instance(&old.instance);
-            }
-        }
-        for installed in &candidate.apps {
-            self.stopped()?;
-            self.stop_instance(&installed.instance);
-            self.start(installed.clone(), true)?;
-        }
-        Ok(())
     }
 }
 

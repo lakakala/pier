@@ -442,18 +442,25 @@ export function Agents() {
   );
 }
 function BindingForm({ agent }: { agent: Agent }) {
-  const binding = useLoad<Binding>(`/v1/agents/${agent.id}/binding`);
+  const bindings = useLoad<{ bindings: Binding[] }>(`/v1/agents/${agent.id}/bindings`);
   const catalog = useLoad<Catalog>('/v1/blueprints');
   const [selected, setSelected] = useState('');
   const [replace, setReplace] = useState(false);
+  const binding = {
+    data: bindings.data?.bindings.find((b) => b.blueprint === selected),
+    error: bindings.error,
+    refresh: bindings.refresh,
+  };
+  const navigate = useNavigate();
   const [modes, setModes] = useState<string[]>([]);
   const [error, setError] = useState<Error>();
   const [pending, setPending] = useState(false);
   const [form] = Form.useForm();
   const { message } = App.useApp();
   useEffect(() => {
-    if (binding.data) setSelected(binding.data.blueprint);
-  }, [binding.data]);
+    if (!selected && bindings.data?.bindings.length)
+      setSelected(bindings.data.bindings[0].blueprint);
+  }, [bindings.data, selected]);
   const blueprint = catalog.data?.blueprints[selected];
   const editing = selected === binding.data?.blueprint && !replace;
   const variables = Object.entries(blueprint?.variables ?? {});
@@ -473,6 +480,94 @@ function BindingForm({ agent }: { agent: Agent }) {
   return (
     <Card title="Blueprint 绑定" className="block-gap">
       <ErrorBox error={error || catalog.error || failedBinding} />
+      <Table<Binding>
+        rowKey="id"
+        pagination={false}
+        dataSource={bindings.data?.bindings ?? []}
+        columns={[
+          { title: '蓝图', dataIndex: 'blueprint' },
+          {
+            title: '用户 / 组',
+            render: (_, b) =>
+              agent.report.blueprints?.find((p) => p.id === b.id)?.name ??
+              catalog.data?.blueprints[b.blueprint]?.name ??
+              '—',
+          },
+          {
+            title: '状态',
+            render: (_, b) => (
+              <StateTag
+                state={agent.report.blueprints?.find((p) => p.id === b.id)?.state ?? '未部署'}
+              />
+            ),
+          },
+          {
+            title: '操作',
+            render: (_, b) => {
+              const deployed = agent.report.blueprints?.find((p) => p.id === b.id);
+              const available =
+                agent.online &&
+                !upgrading(agent) &&
+                agent.report.capabilities?.includes('multi_blueprint_v1');
+              return (
+                <Space wrap>
+                  <Button
+                    onClick={() => {
+                      setSelected(b.blueprint);
+                      setReplace(false);
+                    }}
+                  >
+                    编辑变量
+                  </Button>
+                  <Button
+                    disabled={!available || !deployed || deployed.state === 'stopped' || pending}
+                    onClick={async () => {
+                      setPending(true);
+                      setError(undefined);
+                      try {
+                        const job = await api<{ id: string }>('/v1/deployments', 'POST', {
+                          agent_id: agent.id,
+                          blueprint: b.blueprint,
+                          action: 'stop',
+                        });
+                        navigate(`/deployments/${job.id}`);
+                      } catch (e) {
+                        setError(e as Error);
+                      } finally {
+                        setPending(false);
+                      }
+                    }}
+                  >
+                    停止蓝图
+                  </Button>
+                  <Button
+                    disabled={!available || (!!deployed && deployed.state !== 'stopped') || pending}
+                    onClick={async () => {
+                      setPending(true);
+                      setError(undefined);
+                      try {
+                        await api(`/v1/agents/${agent.id}/bindings/${b.id}`, 'DELETE');
+                        bindings.refresh();
+                        if (selected === b.blueprint) setSelected('');
+                        void message.success('已解除绑定，用户和数据保留');
+                      } catch (e) {
+                        setError(e as Error);
+                      } finally {
+                        setPending(false);
+                      }
+                    }}
+                  >
+                    解除绑定
+                  </Button>
+                </Space>
+              );
+            },
+          },
+        ]}
+      />
+      <Typography.Paragraph className="block-gap" type="secondary">
+        每个蓝图独立部署；同蓝图应用共用账户和数据，任一应用退出会重启整个蓝图。先停止蓝图，再解除绑定。
+      </Typography.Paragraph>
       <Form
         layout="vertical"
         form={form}
@@ -492,10 +587,14 @@ function BindingForm({ agent }: { agent: Agent }) {
             ),
           );
           try {
-            await api(`/v1/agents/${agent.id}/binding`, editing ? 'PATCH' : 'PUT', {
-              blueprint: selected,
-              variables: updates,
-            });
+            await api(
+              `/v1/agents/${agent.id}/bindings${binding.data ? `/${binding.data.id}` : ''}`,
+              binding.data ? (editing ? 'PATCH' : 'PUT') : 'POST',
+              {
+                blueprint: selected,
+                variables: updates,
+              },
+            );
             void message.success('绑定已保存，创建部署后应用到服务器');
             binding.refresh();
             setReplace(false);
@@ -581,7 +680,7 @@ function BindingForm({ agent }: { agent: Agent }) {
           htmlType="submit"
           type="primary"
           loading={pending}
-          disabled={!blueprint || !!failedBinding || (!binding.data && !binding.error)}
+          disabled={!blueprint || !!failedBinding || (!bindings.data && !bindings.error)}
         >
           保存绑定
         </Button>
@@ -595,7 +694,11 @@ function DeployForm({ agent }: { agent: Agent }) {
     <>
       <Button
         type="primary"
-        disabled={!agent.online || upgrading(agent)}
+        disabled={
+          !agent.online ||
+          upgrading(agent) ||
+          !agent.report.capabilities?.includes('multi_blueprint_v1')
+        }
         onClick={() => setOpen(true)}
       >
         创建部署
@@ -614,17 +717,19 @@ function DeployForm({ agent }: { agent: Agent }) {
 }
 function DeploymentEditor({ agent }: { agent: Agent }) {
   const repository = useLoad<RepositoryInfo>('/v1/repository');
-  const binding = useLoad<Binding>(`/v1/agents/${agent.id}/binding`);
+  const bindings = useLoad<{ bindings: Binding[] }>(`/v1/agents/${agent.id}/bindings`);
+  const [selected, setSelected] = useState('');
+  const binding = bindings.data?.bindings.find((b) => b.blueprint === selected);
   const catalog = useLoad<Catalog>('/v1/blueprints');
   const navigate = useNavigate();
   const [error, setError] = useState<Error>();
   const [pending, setPending] = useState(false);
-  const blueprint = binding.data && catalog.data?.blueprints[binding.data.blueprint];
+  const blueprint = binding && catalog.data?.blueprints[binding.blueprint];
   const sourceApps =
     blueprint?.apps.filter((app) => catalog.data?.apps[app.app]?.source === 'git') ?? [];
   return (
     <>
-      <ErrorBox error={error || binding.error || catalog.error || repository.error} />
+      <ErrorBox error={error || bindings.error || catalog.error || repository.error} />
       {repository.data?.needs_sync && <Alert type="warning" title="请先手动同步定义仓库" />}
       <Alert
         className="block-gap"
@@ -634,6 +739,7 @@ function DeploymentEditor({ agent }: { agent: Agent }) {
       />
       <Typography.Paragraph code>{catalog.data?.commit}</Typography.Paragraph>
       <Form
+        key={selected}
         layout="vertical"
         onFinish={async (values) => {
           if (!blueprint || !catalog.data) return;
@@ -642,6 +748,7 @@ function DeploymentEditor({ agent }: { agent: Agent }) {
           try {
             const job = await api<{ id: string }>('/v1/deployments', 'POST', {
               agent_id: agent.id,
+              blueprint: selected,
               commit: catalog.data.commit,
               images: Object.fromEntries(
                 sourceApps.map((app, index) => [app.id, values.images?.[index]]),
@@ -652,13 +759,24 @@ function DeploymentEditor({ agent }: { agent: Agent }) {
             setError(e as Error);
             if ((e as { status?: number }).status === 409) {
               catalog.refresh();
-              binding.refresh();
+              bindings.refresh();
             }
           } finally {
             setPending(false);
           }
         }}
       >
+        <Form.Item label="部署的蓝图">
+          <Select
+            aria-label="部署的蓝图"
+            value={selected || undefined}
+            onChange={setSelected}
+            options={(bindings.data?.bindings ?? []).map((b) => ({
+              value: b.blueprint,
+              label: `${catalog.data?.blueprints[b.blueprint]?.name ?? b.blueprint} · ${b.blueprint}`,
+            }))}
+          />
+        </Form.Item>
         {sourceApps.map((app, index) => (
           <Form.Item
             key={app.id}
@@ -764,24 +882,57 @@ export function AgentDetail() {
         {!value.online && (
           <Alert type="warning" title="服务器离线，下方展示最近一次上报的进程信息。" />
         )}
-        <Table
-          rowKey="instance"
-          pagination={false}
-          dataSource={value.report.apps}
-          columns={[
-            { title: '实例', dataIndex: 'id' },
-            { title: '状态', dataIndex: 'state', render: (state) => <StateTag state={state} /> },
-            { title: 'PID', dataIndex: 'pid' },
-            { title: '重启次数', dataIndex: 'restarts' },
-            { title: '退出码', dataIndex: 'exit_code' },
-            {
-              title: '操作',
-              render: (_, app) => (
-                <AppTerminal agent={value} instance={app.instance} name={app.id} />
-              ),
-            },
-          ]}
-        />
+        {!value.report.capabilities?.includes('multi_blueprint_v1') && (
+          <Alert type="info" title="升级 agent 后可使用多蓝图部署" />
+        )}
+        {(value.report.blueprints ?? []).map((blueprint) => (
+          <Card
+            key={blueprint.id}
+            className="block-gap"
+            title={`${blueprint.name} · ${blueprint.blueprint}`}
+            extra={<StateTag state={blueprint.state} />}
+          >
+            <Typography.Paragraph type="secondary">
+              用户 / 组：{blueprint.name} · 共享数据目录
+            </Typography.Paragraph>
+            <Table
+              rowKey="instance"
+              pagination={false}
+              dataSource={blueprint.apps}
+              columns={[
+                { title: '应用', dataIndex: 'id' },
+                {
+                  title: '状态',
+                  dataIndex: 'state',
+                  render: (state) => <StateTag state={state} />,
+                },
+                { title: 'PID', dataIndex: 'pid' },
+                { title: '重启次数', dataIndex: 'restarts' },
+                { title: '退出码', dataIndex: 'exit_code' },
+                {
+                  title: '操作',
+                  render: (_, app) => (
+                    <AppTerminal
+                      agent={value}
+                      instance={app.instance}
+                      name={`${blueprint.name} / ${app.id}`}
+                    />
+                  ),
+                },
+              ]}
+            />
+            {blueprint.deployment_id && (
+              <Link to={`/deployments/${blueprint.deployment_id}`}>当前部署</Link>
+            )}
+            {blueprint.result && (
+              <Typography.Paragraph>
+                最近任务：
+                <Link to={`/deployments/${blueprint.result.id}`}>{blueprint.result.id}</Link>{' '}
+                <StateTag state={blueprint.result.state} />
+              </Typography.Paragraph>
+            )}
+          </Card>
+        ))}
         {value.report.result && (
           <Typography.Paragraph className="block-gap">
             最近结果：
@@ -828,6 +979,11 @@ function JobTable({ jobs, limit }: { jobs: Job[]; limit?: number }) {
           render: (v: string) => <Link to={`/agents/${v}`}>{v.slice(0, 8)}</Link>,
         },
         { title: 'Blueprint', dataIndex: 'blueprint' },
+        {
+          title: '操作',
+          dataIndex: 'action',
+          render: (action) => (action === 'stop' ? '停止' : '部署'),
+        },
         { title: '状态', dataIndex: 'state', render: (state) => <StateTag state={state} /> },
         { title: '创建时间', dataIndex: 'created_at', render: date },
       ]}
@@ -892,6 +1048,7 @@ export function DeploymentDetail() {
               children: <Link to={`/agents/${value.agent_id}`}>{value.agent_id}</Link>,
             },
             { key: 'blueprint', label: 'Blueprint', children: value.blueprint },
+            { key: 'action', label: '操作', children: value.action === 'stop' ? '停止' : '部署' },
             {
               key: 'commit',
               label: 'commit',

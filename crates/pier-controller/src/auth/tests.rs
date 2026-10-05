@@ -539,15 +539,18 @@ async fn binding_patch_preserves_secrets_checks_defaults_and_detects_blueprint_c
     state
         .store
         .put(
-            "bindings",
+            "blueprint_bindings",
             "agent",
-            &crate::Binding {
-                blueprint: "web".into(),
-                variables: BTreeMap::from([
-                    ("SECRET".into(), "private-value".into()),
-                    ("PORT".into(), "8080".into()),
-                ]),
-            },
+            &BTreeMap::from([(
+                pier_protocol::hash("web"),
+                crate::Binding {
+                    blueprint: "web".into(),
+                    variables: BTreeMap::from([
+                        ("SECRET".into(), "private-value".into()),
+                        ("PORT".into(), "8080".into()),
+                    ]),
+                },
+            )]),
         )
         .unwrap();
     let router = crate::api::router(state.clone());
@@ -556,7 +559,7 @@ async fn binding_patch_preserves_secrets_checks_defaults_and_detects_blueprint_c
     let response = send(
         &router,
         "PATCH",
-        "/v1/agents/agent/binding",
+        &format!("/v1/agents/agent/bindings/{}", pier_protocol::hash("web")),
         &cookie,
         csrf,
         "https://pier.example.test",
@@ -571,9 +574,9 @@ async fn binding_patch_preserves_secrets_checks_defaults_and_detects_blueprint_c
             .contains("private-value")
     );
     let binding = state
-        .store
-        .get::<crate::Binding>("bindings", "agent")
+        .bindings("agent")
         .unwrap()
+        .remove(&pier_protocol::hash("web"))
         .unwrap();
     assert_eq!(binding.variables["SECRET"], "private-value");
     assert!(!binding.variables.contains_key("PORT"));
@@ -586,7 +589,7 @@ async fn binding_patch_preserves_secrets_checks_defaults_and_detects_blueprint_c
             send(
                 &router,
                 "PATCH",
-                "/v1/agents/agent/binding",
+                &format!("/v1/agents/agent/bindings/{}", pier_protocol::hash("web")),
                 &cookie,
                 csrf,
                 "https://pier.example.test",
@@ -600,9 +603,9 @@ async fn binding_patch_preserves_secrets_checks_defaults_and_detects_blueprint_c
     }
     assert_eq!(
         state
-            .store
-            .get::<crate::Binding>("bindings", "agent")
+            .bindings("agent")
             .unwrap()
+            .remove(&pier_protocol::hash("web"))
             .unwrap()
             .variables,
         binding.variables
@@ -787,7 +790,7 @@ async fn repository_configuration_requires_auth_and_stale_catalog_blocks_deploym
         &cookie,
         session["csrf_token"].as_str().unwrap(),
         "https://pier.example.test",
-        Some(json!({"agent_id":"old", "commit":"old"})),
+        Some(json!({"agent_id":"old", "blueprint":"web", "commit":"old"})),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);

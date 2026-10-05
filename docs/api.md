@@ -58,7 +58,7 @@ JSON 语法、字段类型、Content-Type、查询参数解码或请求体大小
 | POST | `/v1/auth/password` | 管理员 Cookie | 修改密码并撤销全部会话 |
 | GET | `/v1/settings` | 管理员 Cookie | 当前与已保存运行设置、待重启状态、agent 监听状态 |
 | PUT | `/v1/settings` | 管理员 Cookie | 保存运行设置，手动重启后生效 |
-| PATCH | `/v1/agents/{id}/binding` | 管理员 Cookie | 增量修改绑定变量 |
+| PATCH | `/v1/agents/{id}/bindings/{blueprint_id}` | 管理员 Cookie | 增量修改指定蓝图变量 |
 | GET | `/v1/repository` | 管理员 Cookie | 仓库配置、commit 和同步状态 |
 | PUT | `/v1/repository` | 管理员 Cookie | 保存仓库配置，不执行同步 |
 | POST | `/v1/repository/sync` | 管理员 Cookie | 立即同步并校验定义仓库 |
@@ -70,8 +70,10 @@ JSON 语法、字段类型、Content-Type、查询参数解码或请求体大小
 | GET | `/v1/agents/{id}` | 管理员 Cookie | agent 状态 |
 | POST | `/v1/agents/{id}/apps/{instance}/terminals` | 管理员 Cookie、Origin、CSRF | 创建应用终端连接资格 |
 | GET | `/v1/terminals/{id}/ws` | 创建者 Cookie、同源 Origin | 一次性 WebSocket 连接 |
-| PUT | `/v1/agents/{id}/binding` | 管理员 Cookie | 替换 blueprint 绑定 |
-| GET | `/v1/agents/{id}/binding` | 管理员 Cookie | 绑定概要 |
+| POST | `/v1/agents/{id}/bindings` | 管理员 Cookie | 新增蓝图绑定 |
+| GET | `/v1/agents/{id}/bindings` | 管理员 Cookie | 绑定列表 |
+| GET / PUT | `/v1/agents/{id}/bindings/{blueprint_id}` | 管理员 Cookie | 查询绑定 / 替换变量 |
+| DELETE | `/v1/agents/{id}/bindings/{blueprint_id}` | 管理员 Cookie | 删除未部署或已停止的绑定 |
 | POST | `/v1/deployments` | 管理员 Cookie | 创建异步部署 |
 | GET | `/v1/deployments` | 管理员 Cookie | 部署列表 |
 | GET | `/v1/deployments/{id}` | 管理员 Cookie | 部署详情 |
@@ -103,7 +105,7 @@ JSON 语法、字段类型、Content-Type、查询参数解码或请求体大小
 
 | 方向 | 帧 | 内容 |
 | --- | --- | --- |
-| 服务端 → 浏览器 | JSON 文本 | `{"type":"ready","user":"pier_...","home":"/var/lib/pier-agent/apps/.../data"}`，收到后才可输入 |
+| 服务端 → 浏览器 | JSON 文本 | `{"type":"ready","user":"Web.Site","home":"/var/lib/pier-agent/blueprints/.../data"}`，`user` 为 `pier-blueprint.yml` 的 `name`，收到后才可输入 |
 | 浏览器 → 服务端 | 二进制 | 原始输入字节，UTF-8 文本或 Ctrl+C 等控制字符，每帧 1–32768 字节 |
 | 服务端 → 浏览器 | 二进制 | 原始 PTY 输出，每帧最多 32768 字节；交给终端模拟器，不按帧独立解码 UTF-8 |
 | 浏览器 → 服务端 | JSON 文本 | `{"type":"resize","cols":120,"rows":40}` |
@@ -550,88 +552,56 @@ curl --fail-with-body "$CONTROLLER_URL/v1/agents/$AGENT_ID" \
 
 ## Blueprint 绑定
 
-一个 agent 绑定一个 blueprint，同一个 blueprint 可以用于多个 agent。绑定变量的值覆盖 blueprint 默认值，随后按 `apps[].variables` 渲染并传给对应 app。变量无默认值时必须传入；未知变量会被拒绝。
+一个 agent 可绑定多个不同蓝图，每份蓝图在该 agent 上只绑定一次。旧的单绑定 `/binding` 接口已替换为以下集合接口；旧配置需按新接口重新绑定。绑定身份 `blueprint_id` 为仓库相对路径的 SHA-256，而 Linux 用户和组使用蓝图的 `name`。绑定不自动部署，变量按绑定独立保存，不返回变量值。
 
-### PUT /v1/agents/{id}/binding
+### POST /v1/agents/{id}/bindings
 
-`id` 为 agent ID。请求替换整个绑定，不是增量更新：
-
-| 请求字段 | 类型 | 必填 / 默认值 |
-| --- | --- | --- |
-| `blueprint` | string | 必填，当前目录中的 blueprint 路径 |
-| `variables` | object，string → string | 可省略，默认 `{}`；缺少必填变量仍会报错 |
-
-将以下请求保存为 `binding.json`：
+新增绑定，请求示例：
 
 ```json
-{
-  "blueprint": "examples/blueprints/web",
-  "variables": {
-    "DB_HOST": "db.internal",
-    "API_PORT": "8080",
-    "WORKER_PORT": "8081"
-  }
-}
+{"blueprint":"examples/blueprints/web","variables":{"DB_HOST":"db.internal","API_PORT":"8080","WORKER_PORT":"8081"}}
 ```
 
-```sh
-curl --fail-with-body -X PUT "$CONTROLLER_URL/v1/agents/$AGENT_ID/binding" \
-  --cookie "$COOKIE_JAR" \
-  -H "Origin: $CONTROLLER_URL" -H "X-CSRF-Token: $CSRF_TOKEN" \
-  -H 'Content-Type: application/json' --data @binding.json
-```
+`blueprint` 必填，必须存在于当前目录；`variables` 默认为 `{}`，未知变量和缺少必填变量返回 `400`。蓝图名称必须符合系统账户规则，且不得与同机其他蓝图重名；校验失败保留已有绑定。重复绑定同一路径返回 `409`。
 
-```json
-{
-  "agent_id": "37db8dee-0a89-4eec-b37d-d4461cb2d1db",
-  "blueprint": "examples/blueprints/web",
-  "variable_names": ["API_PORT", "DB_HOST", "WORKER_PORT"]
-}
-```
+响应为 `{"agent_id":"...","id":"<blueprint_id>","blueprint":"examples/blueprints/web","variable_names":["API_PORT","DB_HOST","WORKER_PORT"]}`。`variable_names` 仅包含显式保存的变量名。
 
-`variable_names` 仅包含此次显式传入并保存的变量名，不包含仅使用默认值的变量，也不返回变量值。绑定成功不会触发部署，agent 离线也可以绑定。
+### GET /v1/agents/{id}/bindings
 
-agent 或 blueprint 不存在返回 `404`；目录不可用返回 `409`；未知变量、缺少必填变量或映射渲染失败返回 `400`。校验失败保留之前的绑定。
+返回 `{"bindings":[<绑定概要>, ...]}`，尚无绑定时数组为空；agent 不存在返回 `404`。
 
-### GET /v1/agents/{id}/binding
+### GET /v1/agents/{id}/bindings/{blueprint_id}
 
-`id` 为 agent ID，返回与 PUT 相同的绑定概要。尚无绑定时返回 `404`。
+返回单个绑定概要，未找到返回 `404`。
 
-```sh
-curl --fail-with-body "$CONTROLLER_URL/v1/agents/$AGENT_ID/binding" \
-  --cookie "$COOKIE_JAR" \
-  -H "Origin: $CONTROLLER_URL" -H "X-CSRF-Token: $CSRF_TOKEN"
-```
+### PUT /v1/agents/{id}/bindings/{blueprint_id}
 
-### PATCH /v1/agents/{id}/binding
+请求格式与新增绑定相同，但仅替换指定绑定的全部变量。`blueprint` 必须仍对应 URL 中的身份，不能把现有绑定改成另一个蓝图。未找到返回 `404`，身份不匹配返回 `409`。
 
-增量修改当前绑定变量。`id` 为 agent ID，请求中的 `blueprint` 必须与已保存绑定一致；修改 blueprint 使用 PUT。`variables` 必填，值可为字符串或 `null`：省略的键保留已有值，字符串覆盖原值（包括空字符串），`null` 移除显式值并重新使用 blueprint 默认值。
+### PATCH /v1/agents/{id}/bindings/{blueprint_id}
 
 ```json
 {"blueprint":"examples/blueprints/web","variables":{"API_PORT":"9090","WORKER_PORT":null}}
 ```
 
-将请求保存为 `binding-patch.json` 后调用：
+`variables` 必填：省略的键保留原值，字符串覆盖原值（包括空字符串），`null` 移除显式值并恢复默认值。蓝图路径不匹配返回 `409`；未知变量、删除无默认值的必填变量或渲染失败返回 `400`，整个修改不生效。PUT/PATCH 均返回绑定概要。目标蓝图有活动任务时禁止编辑。
 
-```sh
-curl --fail-with-body -X PATCH "$CONTROLLER_URL/v1/agents/$AGENT_ID/binding" \
-  --cookie "$COOKIE_JAR" -H "Origin: $CONTROLLER_URL" \
-  -H "X-CSRF-Token: $CSRF_TOKEN" -H 'Content-Type: application/json' \
-  --data @binding-patch.json
-```
+### DELETE /v1/agents/{id}/bindings/{blueprint_id}
 
-返回与 PUT 相同的绑定概要，不返回变量值。绑定已改变返回 `409`；绑定或定义不存在返回 `404`；目录不可用返回 `409`。未知变量、删除无默认值的必填变量或渲染失败返回 `400`，整个修改不生效。
+agent 必须在线、支持 `multi_blueprint_v1` 且不在升级。目标蓝图没有活动任务，并且尚未部署或已经 `stopped` 时，删除绑定并返回 `{"removed":true}`；否则返回 `409`，应先创建停止任务并等待成功上报。此操作不停止进程，不删除账户、数据或历史版本。重新绑定相同蓝图可复用保留的账户和数据。
 
 ## 部署
 
 ### POST /v1/deployments
 
-为已绑定 blueprint 的在线 agent 创建后台部署任务。
+为在线 agent 的指定绑定蓝图创建后台任务，要求 agent 上报 `multi_blueprint_v1`。任务仅影响目标蓝图。
 
 | 请求字段 | 类型 | 必填 / 默认值 |
 | --- | --- | --- |
 | `agent_id` | string | 必填，目标 agent ID |
-| `commit` | string | 必填，必须等于当前定义目录的 commit |
+| `blueprint` | string | 必填，目标绑定的蓝图路径 |
+| `action` | string | 默认 `deploy`；也可为 `stop` |
+| `commit` | string | `deploy` 时必填，必须等于当前目录 commit；`stop` 时省略 |
 | `images` | object，string → string | 可省略，默认 `{}`；每个源码 app 必须提供构建镜像 |
 
 先读取 `/v1/blueprints` 或 `/v1/repository` 获得当前 commit，再将请求保存为 `deployment.json`：
@@ -639,6 +609,7 @@ curl --fail-with-body -X PATCH "$CONTROLLER_URL/v1/agents/$AGENT_ID/binding" \
 ```json
 {
   "agent_id": "37db8dee-0a89-4eec-b37d-d4461cb2d1db",
+  "blueprint": "examples/blueprints/web",
   "commit": "0123456789abcdef0123456789abcdef01234567",
   "images": {
     "api": "pier-builder-rust:almalinux8",
@@ -669,6 +640,14 @@ curl --fail-with-body -X POST "$CONTROLLER_URL/v1/deployments" \
 | `409` | 仓库待同步、agent 离线、架构未知、已有活动部署、目录不可用、commit 已过期、未绑定 blueprint 或绑定的 blueprint 已不在当前目录 |
 
 commit 过期时重新读取目录、核对定义后再创建任务。此接口没有幂等键；响应丢失时先查询该 agent 的部署列表，确认已有任务。
+
+停止已部署蓝图使用同一接口：
+
+```json
+{"agent_id":"37db8dee-0a89-4eec-b37d-d4461cb2d1db","blueprint":"examples/blueprints/web","action":"stop"}
+```
+
+停止请求不携带 `commit` 或构建镜像；任务直接进入 `ready`，仅停止目标蓝图并关闭其终端，保留绑定与数据。即使仓库待同步或蓝图定义已从 Git 删除，也可停止已安装蓝图。等待任务成功且蓝图状态上报 `stopped` 后才可解除绑定。
 
 ### GET /v1/deployments
 
@@ -708,11 +687,13 @@ curl --fail-with-body "$CONTROLLER_URL/v1/deployments/$DEPLOYMENT_ID" \
   -H "Origin: $CONTROLLER_URL" -H "X-CSRF-Token: $CSRF_TOKEN"
 ```
 
-响应包含 `id`、`agent_id`、`blueprint`、`commit`、`state`、`error`、`created_at` 和 `plan`。`error` 为错误字符串或 `null`。构建完成前 `plan` 为 `null`，完成后包含：
+响应包含 `id`、`action`、`agent_id`、`blueprint`、`commit`、`state`、`error`、`created_at` 和 `plan`。`error` 为错误字符串或 `null`。构建完成前 `plan` 为 `null`，完成后包含：
 
 | `plan` 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `id`、`agent_id`、`blueprint`、`commit` | string | 与部署记录对应的固定身份及定义版本 |
+| `blueprint_name` | string | 固定的蓝图名称，也是用户和组名 |
+| `action` | string | `deploy` 或 `stop` |
 | `architecture` | string | `amd64` 或 `arm64` |
 | `apps` | array | 按 blueprint 顺序排列的部署包列表 |
 | `apps[].instance` | string | 64 位十六进制实例身份摘要 |
@@ -720,7 +701,7 @@ curl --fail-with-body "$CONTROLLER_URL/v1/deployments/$DEPLOYMENT_ID" \
 | `apps[].sha256` | string | tar.gz 文件的 64 位十六进制 SHA-256 |
 | `apps[].size` | integer | tar.gz 文件字节数 |
 
-响应不包含保存的变量值、token 或 controller 本地制品路径。构建失败通常返回 `package validation or build failed; no server changes applied`；agent 上报的任务错误在部署记录中转换为 `agent reported deployment failure; inspect local agent logs`。
+响应不包含保存的变量值、token 或 controller 本地制品路径。构建失败通常返回 `package validation or build failed; no server changes applied`；账户命名、归属和冲突错误展示经过限制的具体原因；其他 agent 任务错误转换为 `agent reported deployment failure; inspect local agent logs`。
 
 ### 部署状态
 
@@ -901,3 +882,9 @@ curl --fail "$CONTROLLER_URL/v1/artifacts/$DEPLOYMENT_ID/api" \
 6. 查询部署详情直到终态；结合 agent 的进程报告检查运行状态。
 
 修改绑定或同步 Git 只更新后续部署所用的定义，需要再次创建部署才会应用到服务器。
+
+### 按蓝图上报运行状态
+
+agent 的 `report.blueprints` 数组包含 `id`（蓝图路径摘要）、`blueprint`（路径）、`name`（账户名）、`deployment_id`（该蓝图最后成功任务）、`state`、`account_reserved`（是否保留专属账户）、`apps` 和 `result`（该蓝图最近任务结果）。`state` 为 `starting`、`running`、`backoff`、`failed` 或 `stopped`。停止或解除绑定不删除 agent 保存的账户和蓝图记录。
+
+`apps` 中的应用状态字段保持不变，同一蓝图应用共享账户和数据，故障时一起重启。为兼容查询，顶层 `report.apps` 仍为所有蓝图应用的展开列表，`report.result` 为整台 agent 最近任务结果；顶层 `deployment_id` 仅在恰有一个蓝图时有值，多蓝图客户端应使用分组字段。终端接口仍按应用实例 ID 打开，但终端账户和主目录属于整个蓝图。部署一个蓝图不关闭其他蓝图的终端。

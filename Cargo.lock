@@ -1338,6 +1338,7 @@ dependencies = [
  "serde_yaml_ng",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "tracing-subscriber",

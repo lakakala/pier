@@ -47,10 +47,13 @@ fn result(state: &Controller, agent_id: &str, result: &DeploymentResult) -> Resu
     );
     if job.active() || job.state == "rollback_failed" {
         job.state = result.state.clone();
-        job.error = result
-            .error
-            .as_ref()
-            .map(|_| "agent reported deployment failure; inspect local agent logs".into());
+        job.error = result.error.as_ref().map(|error| {
+            pier_protocol::BlueprintAccountError::from_deployment_error(error)
+                .map(|reason| reason.deployment_error())
+                .unwrap_or_else(|| {
+                    "agent reported deployment failure; inspect local agent logs".into()
+                })
+        });
         state.store.put("jobs", &job.id, &job)?;
     }
     Ok(())
@@ -225,6 +228,10 @@ pub(crate) async fn control(
         .capabilities
         .iter()
         .any(|v| v == pier_protocol::terminal::CAPABILITY);
+    let multi_blueprint = initial
+        .capabilities
+        .iter()
+        .any(|v| v == pier_protocol::MULTI_BLUEPRINT_CAPABILITY);
     report(&state, &agent_id, initial)?;
     let (sender, mut receiver) = mpsc::channel(8);
     {
@@ -236,6 +243,7 @@ pub(crate) async fn control(
                 id: session_id.clone(),
                 sender,
                 terminal,
+                multi_blueprint,
                 cancelled: cancelled.clone(),
             },
         );

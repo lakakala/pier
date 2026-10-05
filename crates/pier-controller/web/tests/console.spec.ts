@@ -121,7 +121,12 @@ test.describe.serial('controller console', () => {
           online: true,
           last_seen: null,
           info: { hostname: 'upgrade-host', architecture: 'amd64', os_release: 'Ubuntu 24.04' },
-          report: { apps: [], result: null, deployment_id: null },
+          report: {
+            capabilities: ['multi_blueprint_v1'],
+            apps: [],
+            result: null,
+            deployment_id: null,
+          },
           software: {
             version: '0.1.0',
             package: { version: '0.1.0', revision: 1 },
@@ -170,7 +175,27 @@ test.describe.serial('controller console', () => {
           last_seen: null,
           info: { hostname: 'terminal-host', architecture: 'amd64', os_release: 'Ubuntu 24.04' },
           report: {
-            capabilities: supported ? ['app_terminal_v1'] : [],
+            capabilities: supported ? ['app_terminal_v1', 'multi_blueprint_v1'] : [],
+            blueprints: [
+              {
+                id: 'web',
+                blueprint: 'blueprints/web',
+                name: 'Web.Site',
+                deployment_id: null,
+                state: 'running',
+                result: null,
+                apps: [
+                  {
+                    id: 'demo',
+                    instance: 'demo-instance',
+                    state: 'running',
+                    pid: 123,
+                    restarts: 0,
+                    exit_code: null,
+                  },
+                ],
+              },
+            ],
             deployment_id: null,
             result: null,
             apps: [
@@ -203,8 +228,8 @@ test.describe.serial('controller console', () => {
       socket.send(
         JSON.stringify({
           type: 'ready',
-          user: 'pier_demo',
-          home: '/var/lib/pier-agent/apps/demo/data',
+          user: 'Web.Site',
+          home: '/var/lib/pier-agent/blueprints/web/data',
         }),
       );
       socket.send(Buffer.from('hello terminal\r\n'));
@@ -218,7 +243,9 @@ test.describe.serial('controller console', () => {
     await page.reload();
     await page.getByRole('button', { name: '终端', exact: true }).click();
     await expect(page.getByText('已连接', { exact: true })).toBeVisible();
-    await expect(page.getByText('pier_demo · /var/lib/pier-agent/apps/demo/data')).toBeVisible();
+    await expect(
+      page.getByText('Web.Site · /var/lib/pier-agent/blueprints/web/data'),
+    ).toBeVisible();
     await page.locator('.xterm-helper-textarea').pressSequentially('echo test');
     await page.locator('.xterm-helper-textarea').press('Enter');
     await expect.poll(() => Buffer.concat(input).toString()).toContain('echo test\r');
@@ -238,6 +265,113 @@ test.describe.serial('controller console', () => {
       .click();
     await expect.poll(() => closed).toBeGreaterThan(before);
     await expect(page.locator('.app-terminal')).toHaveCount(0);
+  });
+  test('blueprints stop independently before their bindings can be removed', async ({ page }) => {
+    await login(page);
+    let stopped = false;
+    let removed = false;
+    const calls: string[] = [];
+    const blueprint = (id: string, state: string) => ({
+      id,
+      blueprint: `blueprints/${id}`,
+      name: `${id}-server`,
+      state,
+      deployment_id: 'previous',
+      result: null,
+      apps:
+        state === 'stopped'
+          ? []
+          : [
+              {
+                id: 'api',
+                instance: `${id}-api`,
+                state: 'running',
+                pid: id === 'web' ? 101 : 202,
+                restarts: 0,
+                exit_code: null,
+              },
+            ],
+    });
+    await page.route('**/v1/agents/multi-browser', (route) =>
+      route.fulfill({
+        json: {
+          id: 'multi-browser',
+          name: 'multiple-blueprints',
+          online: true,
+          info: null,
+          last_seen: null,
+          report: {
+            capabilities: ['multi_blueprint_v1', 'app_terminal_v1'],
+            apps: [],
+            deployment_id: null,
+            result: null,
+            blueprints: [
+              blueprint('web', stopped ? 'stopped' : 'running'),
+              blueprint('other', 'running'),
+            ],
+          },
+        },
+      }),
+    );
+    await page.route('**/v1/agents/multi-browser/bindings', (route) =>
+      route.fulfill({
+        json: {
+          bindings: (removed ? ['other'] : ['web', 'other']).map((id) => ({
+            id,
+            agent_id: 'multi-browser',
+            blueprint: `blueprints/${id}`,
+            variable_names: [],
+          })),
+        },
+      }),
+    );
+    await page.route('**/v1/agents/multi-browser/bindings/web', (route) => {
+      expect(route.request().method()).toBe('DELETE');
+      expect(stopped).toBe(true);
+      calls.push('unbind:web');
+      removed = true;
+      return route.fulfill({ json: { removed: true } });
+    });
+    await page.route('**/v1/deployments', (route) => {
+      if (route.request().method() !== 'POST') return route.continue();
+      expect(route.request().postDataJSON()).toEqual({
+        agent_id: 'multi-browser',
+        blueprint: 'blueprints/web',
+        action: 'stop',
+      });
+      calls.push('stop:web');
+      stopped = true;
+      return route.fulfill({ json: { id: 'stop-web', state: 'ready' } });
+    });
+    await page.route('**/v1/deployments/stop-web', (route) =>
+      route.fulfill({
+        json: {
+          id: 'stop-web',
+          agent_id: 'multi-browser',
+          blueprint: 'blueprints/web',
+          action: 'stop',
+          commit: '',
+          state: 'succeeded',
+          error: null,
+          created_at: 1790467200,
+          plan: null,
+        },
+      }),
+    );
+    await page.goto('/agents/multi-browser');
+    const webRow = page.getByRole('row').filter({ hasText: 'blueprints/web' });
+    const otherRow = page.getByRole('row').filter({ hasText: 'blueprints/other' });
+    await expect(webRow.getByRole('button', { name: '解除绑定' })).toBeDisabled();
+    await expect(otherRow.getByRole('button', { name: '解除绑定' })).toBeDisabled();
+    await webRow.getByRole('button', { name: '停止蓝图' }).click();
+    await expect(page.getByRole('heading', { name: '部署详情' })).toBeVisible();
+    await page.goto('/agents/multi-browser');
+    await expect(webRow.getByRole('button', { name: '停止蓝图' })).toBeDisabled();
+    await expect(otherRow.getByRole('button', { name: '停止蓝图' })).toBeEnabled();
+    await webRow.getByRole('button', { name: '解除绑定' }).click();
+    await expect(webRow).toHaveCount(0);
+    await expect(otherRow).toHaveCount(1);
+    expect(calls).toEqual(['stop:web', 'unbind:web']);
   });
   test('passive enrollment SOCKS5 retry and connection proxy editing', async ({ page }) => {
     await login(page);
@@ -325,8 +459,8 @@ test.describe.serial('controller console', () => {
         },
       }),
     );
-    await page.route('**/v1/agents/passive-browser/binding', (route) =>
-      route.fulfill({ status: 404, json: { error: 'resource not found' } }),
+    await page.route('**/v1/agents/passive-browser/bindings', (route) =>
+      route.fulfill({ json: { bindings: [] } }),
     );
     await page.route('**/v1/agents/passive-browser/connection', (route) => {
       if (busy)
@@ -416,7 +550,8 @@ test.describe.serial('controller console', () => {
     await page.getByRole('button', { name: '保存绑定' }).click();
     const patch = await patchPromise;
     expect(patch.postDataJSON().variables).toEqual({ PORT: '9090' });
-    const binding = await (await page.request.get(`/v1/agents/${id}/binding`)).json();
+    const binding = (await (await page.request.get(`/v1/agents/${id}/bindings`)).json())
+      .bindings[0];
     expect(binding.variable_names).toEqual(['PORT', 'SECRET']);
     expect(JSON.stringify(binding)).not.toContain('keep-this-private');
     // Real binding/API above; emulate an online agent and job here. Rust Docker
@@ -429,6 +564,7 @@ test.describe.serial('controller console', () => {
           ...body,
           online: true,
           info: { hostname: 'fixture', architecture: 'amd64', os_release: 'fixture' },
+          report: { ...body.report, capabilities: ['multi_blueprint_v1'] },
         },
       });
     });
@@ -467,6 +603,8 @@ test.describe.serial('controller console', () => {
     });
     await page.reload();
     await page.getByRole('button', { name: '创建部署' }).click();
+    await page.getByRole('combobox', { name: '部署的蓝图' }).click();
+    await page.locator('.ant-select-item-option[title="web-server · blueprints/web"]').click();
     await page.getByLabel('api 的构建镜像').fill('pier-builder-rust:almalinux8');
     await page.getByRole('button', { name: '确认部署' }).click();
     await expect(
@@ -479,6 +617,7 @@ test.describe.serial('controller console', () => {
     await expect(page.getByText('成功', { exact: true })).toBeVisible({ timeout: 15000 });
     expect(submitted?.images).toEqual({ api: 'pier-builder-rust:almalinux8' });
     expect(submitted?.agent_id).toBe(id);
+    expect(submitted?.blueprint).toBe('blueprints/web');
     expect(submitted?.commit).toMatch(/^[0-9a-f]{40}$/);
     await page.screenshot({ path: testInfo.outputPath('deployment.png'), fullPage: true });
   });

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
+use pier_protocol::BlueprintAccountError;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -17,63 +18,119 @@ pub struct Account {
     pub marker: String,
     pub home: PathBuf,
 }
-fn lookup(name: &str) -> Result<Option<Vec<String>>> {
-    let output = Command::new("getent").args(["passwd", name]).output()?;
+pub fn marker(agent: &str, instance: &str) -> String {
+    format!("pier-agent={agent}/{instance}")
+}
+
+fn lookup(database: &str, name: &str) -> Result<Option<Vec<String>>> {
+    let output = Command::new("getent").args([database, name]).output()?;
     if output.status.code() == Some(2) {
         return Ok(None);
     }
-    ensure!(output.status.success(), "cannot inspect system user");
+    ensure!(output.status.success(), "cannot inspect system account");
     let text = String::from_utf8(output.stdout)?;
     let fields: Vec<_> = text.trim_end().split(':').map(String::from).collect();
-    ensure!(fields.len() == 7, "invalid passwd record");
+    ensure!(
+        fields.len() == if database == "passwd" { 7 } else { 4 },
+        "invalid system account record"
+    );
     Ok(Some(fields))
 }
-pub fn create(agent: &str, instance: &str, home: &Path) -> Result<Account> {
-    let digest = pier_protocol::hash(format!("{agent}/{instance}"));
-    let name = format!("pier_{}", &digest[..20]);
-    let marker = format!("pier-agent={agent}/{instance}");
-    if lookup(&name)?.is_none() {
-        let shell = if Path::new("/usr/sbin/nologin").exists() {
-            "/usr/sbin/nologin"
-        } else {
-            "/sbin/nologin"
-        };
-        let output = Command::new("useradd")
-            .args([
-                "--system",
-                "--user-group",
-                "--no-create-home",
-                "--shell",
-                shell,
-                "--comment",
-                &marker,
-                "--home-dir",
-            ])
-            .arg(home)
-            .arg(&name)
-            .output()?;
-        ensure!(output.status.success(), "cannot create dedicated app user");
+/// Read-only preflight, also recovering a user created before a failed DB write.
+pub fn check(
+    agent: &str,
+    instance: &str,
+    name: &str,
+    home: &Path,
+    saved: Option<&Account>,
+) -> Result<Option<Account>> {
+    ensure!(
+        pier_protocol::valid_system_username(name),
+        BlueprintAccountError::InvalidName
+    );
+    let marker = marker(agent, instance);
+    if let Some(saved) = saved {
+        ensure!(
+            saved.name == name,
+            BlueprintAccountError::NameChanged(name.into())
+        );
+        ensure!(
+            saved.marker == marker && saved.home == home,
+            BlueprintAccountError::OwnershipConflict(name.into())
+        );
+        verify(saved).map_err(|_| BlueprintAccountError::IdentityChanged(name.into()))?;
+        return Ok(Some(saved.clone()));
     }
-    let fields = lookup(&name)?.context("created user missing")?;
+    let Some(fields) = lookup("passwd", name)? else {
+        ensure!(
+            lookup("group", name)?.is_none(),
+            BlueprintAccountError::GroupConflict(name.into())
+        );
+        return Ok(None);
+    };
     ensure!(
         fields[0] == name && fields[4] == marker && Path::new(&fields[5]) == home,
-        "existing user is not owned by this agent app"
+        BlueprintAccountError::UserConflict(name.into())
     );
-    let uid = fields[2].parse()?;
-    let gid = fields[3].parse()?;
-    ensure!(uid != 0 && gid != 0, "app cannot run as root");
-    Ok(Account {
-        name,
+    let account = Account {
+        name: name.into(),
         marker,
-        uid,
-        gid,
+        uid: fields[2].parse()?,
+        gid: fields[3].parse()?,
         home: home.to_path_buf(),
-    })
+    };
+    verify(&account).map_err(|_| BlueprintAccountError::IdentityChanged(name.into()))?;
+    Ok(Some(account))
+}
+
+pub fn create(
+    agent: &str,
+    instance: &str,
+    name: &str,
+    home: &Path,
+    saved: Option<&Account>,
+) -> Result<Account> {
+    // Recheck after the batch preflight, preserving the recorded UID/GID.
+    if let Some(account) = check(agent, instance, name, home, saved)? {
+        return Ok(account);
+    }
+    let shell = if Path::new("/usr/sbin/nologin").exists() {
+        "/usr/sbin/nologin"
+    } else {
+        "/sbin/nologin"
+    };
+    let output = Command::new("useradd")
+        .args([
+            "--system",
+            "--user-group",
+            "--no-create-home",
+            "--shell",
+            shell,
+            "--comment",
+            &marker(agent, instance),
+            "--home-dir",
+        ])
+        .arg(home)
+        .arg(name)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        BlueprintAccountError::CreateFailed(name.into())
+    );
+    check(agent, instance, name, home, None)?.context("created user missing")
 }
 pub fn verify(account: &Account) -> Result<()> {
-    let fields = lookup(&account.name)?.context("app account no longer exists")?;
     ensure!(
-        fields[2].parse::<u32>()? == account.uid
+        account.uid != 0 && account.gid != 0,
+        "app cannot run as root"
+    );
+    let fields = lookup("passwd", &account.name)?.context("app account no longer exists")?;
+    let group = lookup("group", &account.name)?.context("app group no longer exists")?;
+    ensure!(
+        fields[0] == account.name
+            && group[0] == account.name
+            && group[2].parse::<u32>()? == account.gid
+            && fields[2].parse::<u32>()? == account.uid
             && fields[3].parse::<u32>()? == account.gid
             && fields[4] == account.marker
             && Path::new(&fields[5]) == account.home,

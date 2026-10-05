@@ -56,6 +56,15 @@ export interface Agent {
   };
   report: {
     capabilities?: string[];
+    blueprints?: {
+      id: string;
+      blueprint: string;
+      name: string;
+      deployment_id: string | null;
+      state: string;
+      apps: Agent['report']['apps'];
+      result: Agent['report']['result'];
+    }[];
     deployment_id: string | null;
     apps: {
       instance: string;
@@ -100,11 +109,13 @@ export const upgradeLabel = (agent: Agent) => {
   return '已启用自动升级';
 };
 export interface Binding {
+  id: string;
   agent_id: string;
   blueprint: string;
   variable_names: string[];
 }
 export interface Job {
+  action: 'deploy' | 'stop';
   id: string;
   agent_id: string;
   blueprint: string;

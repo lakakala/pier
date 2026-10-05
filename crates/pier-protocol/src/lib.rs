@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 pub const VERSION: u32 = 2;
+pub const MULTI_BLUEPRINT_CAPABILITY: &str = "multi_blueprint_v1";
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 pub type Variables = BTreeMap<String, String>;
 
@@ -45,9 +46,34 @@ pub struct DeploymentPlan {
     pub id: String,
     pub agent_id: String,
     pub blueprint: String,
+    #[serde(default)]
+    pub blueprint_name: String,
+    #[serde(default)]
+    pub action: DeploymentAction,
     pub commit: String,
     pub architecture: Architecture,
     pub apps: Vec<DeploymentApp>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentAction {
+    #[default]
+    Deploy,
+    Stop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlueprintStatus {
+    #[serde(default)]
+    pub account_reserved: bool,
+    pub id: String,
+    pub blueprint: String,
+    pub name: String,
+    pub deployment_id: Option<String>,
+    pub state: String,
+    pub apps: Vec<AppStatus>,
+    pub result: Option<DeploymentResult>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,6 +90,8 @@ pub struct AppStatus {
 pub struct AgentReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub blueprints: Vec<BlueprintStatus>,
     pub deployment_id: Option<String>,
     pub apps: Vec<AppStatus>,
     pub result: Option<DeploymentResult>,
@@ -214,6 +242,95 @@ pub fn safe_id(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
+/// Blueprint names used as Linux user/group names, without normalization or truncation.
+pub fn valid_system_username(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 32
+        && matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+/// Controlled blueprint-account diagnostics safe to include in deployment results.
+/// Never construct this from raw subprocess output or network errors.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlueprintAccountError {
+    InvalidName,
+    DuplicateName(String),
+    ReservedName(String),
+    NameChanged(String),
+    OwnershipConflict(String),
+    IdentityChanged(String),
+    UserConflict(String),
+    GroupConflict(String),
+    CreateFailed(String),
+}
+impl std::fmt::Display for BlueprintAccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidName => f.write_str(
+                "blueprint name must be a system username matching [A-Za-z_][A-Za-z0-9_.-]{0,31}",
+            ),
+            Self::DuplicateName(name) => write!(f, "duplicate blueprint username: {name}"),
+            Self::ReservedName(name) => {
+                write!(
+                    f,
+                    "blueprint username is reserved by another blueprint: {name}"
+                )
+            }
+            Self::NameChanged(name) => {
+                write!(f, "blueprint username cannot change during upgrade: {name}")
+            }
+            Self::OwnershipConflict(name) => {
+                write!(f, "blueprint account ownership conflict: {name}")
+            }
+            Self::IdentityChanged(name) => write!(f, "blueprint account identity changed: {name}"),
+            Self::UserConflict(name) => write!(
+                f,
+                "blueprint username belongs to another blueprint or system user: {name}"
+            ),
+            Self::GroupConflict(name) => {
+                write!(
+                    f,
+                    "blueprint group already exists without an owned user: {name}"
+                )
+            }
+            Self::CreateFailed(name) => {
+                write!(f, "cannot create dedicated blueprint user/group: {name}")
+            }
+        }
+    }
+}
+impl std::error::Error for BlueprintAccountError {}
+impl BlueprintAccountError {
+    pub fn deployment_error(&self) -> String {
+        format!("{self}; existing deployment retained")
+    }
+    /// Allow only known account diagnostics through the existing error string field.
+    pub fn from_deployment_error(value: &str) -> Option<Self> {
+        let reason = value.strip_suffix("; existing deployment retained")?;
+        if reason == Self::InvalidName.to_string() {
+            return Some(Self::InvalidName);
+        }
+        let (_, name) = reason.rsplit_once(": ")?;
+        if !valid_system_username(name) {
+            return None;
+        }
+        let constructors: [fn(String) -> Self; 8] = [
+            Self::DuplicateName,
+            Self::ReservedName,
+            Self::NameChanged,
+            Self::OwnershipConflict,
+            Self::IdentityChanged,
+            Self::UserConflict,
+            Self::GroupConflict,
+            Self::CreateFailed,
+        ];
+        constructors
+            .into_iter()
+            .map(|make| make(name.into()))
+            .find(|error| error.to_string() == reason)
+    }
+}
+
 pub fn relative(value: &str) -> Result<()> {
     if value == "." {
         return Ok(());
@@ -291,6 +408,66 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_controlled_account_errors_are_public() {
+        use BlueprintAccountError::*;
+        for reason in [
+            InvalidName,
+            DuplicateName("Demo.Api".into()),
+            ReservedName("demo".into()),
+            NameChanged("demo".into()),
+            OwnershipConflict("demo".into()),
+            IdentityChanged("demo".into()),
+            UserConflict("root".into()),
+            GroupConflict("demo".into()),
+            CreateFailed("demo".into()),
+        ] {
+            assert_eq!(
+                BlueprintAccountError::from_deployment_error(&reason.deployment_error()),
+                Some(reason)
+            );
+        }
+        for error in [
+            "download failed: https://user:secret@example.com/; existing deployment retained",
+            "blueprint account identity changed: demo\nsecret; existing deployment retained",
+            "blueprint account identity changed: demo; existing deployment retained; secret",
+            "unexpected error: demo; existing deployment retained",
+            "blueprint account identity changed: 123; existing deployment retained",
+            "blueprint account identity changed: demo",
+        ] {
+            assert!(BlueprintAccountError::from_deployment_error(error).is_none());
+        }
+        assert!(
+            BlueprintAccountError::from_deployment_error(
+                &IdentityChanged("a".repeat(33)).deployment_error()
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn system_usernames_preserve_case_and_have_portable_boundaries() {
+        for name in ["a", "_", "CLIProxyAPI", "demo-v2.1_app", &"a".repeat(32)] {
+            assert!(valid_system_username(name), "{name:?}");
+        }
+        for name in [
+            "",
+            "1demo",
+            "-demo",
+            ".demo",
+            "demo+api",
+            "a b",
+            "a:b",
+            "a/b",
+            "a\\b",
+            "a\n",
+            "a\0",
+            "服务",
+            "{{ NAME }}",
+            &"a".repeat(33),
+        ] {
+            assert!(!valid_system_username(name), "{name:?}");
+        }
+    }
     #[tokio::test]
     async fn frames_survive_fragmentation_and_coalescing() {
         let (a, b) = tokio::io::duplex(7);

@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import pty
+import pwd
 import re
 import select
 import signal
@@ -78,6 +79,8 @@ if '--after-boot' in sys.argv:
     wait('app restored from local state after boot', lambda: pathlib.Path(meta['pid_file']).exists())
     app_pid = int(pathlib.Path(meta['pid_file']).read_text())
     assert alive(app_pid)
+    account = pwd.getpwnam('demo')
+    assert [account.pw_uid, account.pw_gid] == meta['app_identity']
     assert checksum('/etc/pier/agent.token') == meta['token_hash']
     if distro == 'ubuntu2404':
         removed = command('apt-get', 'remove', '-y', 'pier-agent')
@@ -234,9 +237,9 @@ assert not pathlib.Path('/etc/pier/agent.init.json').exists()
 command('systemctl', 'is-enabled', '--quiet', 'pier-agent')
 agent = wait('agent online', lambda: next((a for a in api('GET', '/v1/agents')['agents'] if a['online']), None))
 agent_id = agent['id']
-api('PUT', '/v1/agents/' + agent_id + '/binding', {'blueprint':'blueprints/demo','variables':{}})
+api('POST', '/v1/agents/' + agent_id + '/bindings', {'blueprint':'blueprints/demo','variables':{}})
 commit = api('GET', '/v1/repository')['commit']
-job = api('POST', '/v1/deployments', {'agent_id':agent_id,'commit':commit})['id']
+job = api('POST', '/v1/deployments', {'agent_id':agent_id,'blueprint':'blueprints/demo','commit':commit})['id']
 def deployed():
     result = api('GET', '/v1/deployments/' + job)
     assert result['state'] not in ('failed', 'rolled_back', 'rollback_failed'), 'fixture deployment failed: ' + json.dumps(result)
@@ -244,6 +247,9 @@ def deployed():
 wait('deployment succeeds', deployed)
 app = wait('app running', lambda: next((a for a in api('GET', '/v1/agents/' + agent_id)['report']['apps'] if a['state'] == 'running'), None))
 old_pid, app_pid = pid(), app['pid']
+account = pwd.getpwnam('demo')
+app_identity = [account.pw_uid, account.pw_gid]
+assert account.pw_uid != 0 and account.pw_shell.endswith('/nologin')
 token_hash = checksum('/etc/pier/agent.token')
 command(*(installer + upgrade))
 if distro == 'ubuntu2404':
@@ -265,8 +271,10 @@ wizard.send('\x1b[B\x1b[B\n')
 wizard.finish()
 assert len(api('GET', '/v1/agents')['agents']) == 1
 app = wait('app after crash', lambda: next((a for a in api('GET', '/v1/agents/' + agent_id)['report']['apps'] if a['state'] == 'running' and alive(a['pid'])), None))
-pid_file = '/var/lib/pier-agent/apps/%s/data/pid' % app['instance']
-META.write_text(json.dumps({'pid_file':pid_file, 'token_hash':token_hash}))
+pid_file = str(pathlib.Path(pwd.getpwnam('demo').pw_dir) / 'pid')
+account = pwd.getpwnam('demo')
+assert [account.pw_uid, account.pw_gid] == app_identity
+META.write_text(json.dumps({'pid_file':pid_file, 'token_hash':token_hash, 'app_identity':app_identity}))
 # The next phase restarts the container: the app must recreate this file without
 # the controller (which is deliberately not installed as a boot service).
 pathlib.Path(pid_file).unlink()

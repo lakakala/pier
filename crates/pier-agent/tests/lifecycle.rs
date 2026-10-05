@@ -9,7 +9,7 @@ use std::{
     process::{Child, Command},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -20,13 +20,14 @@ struct Process {
     log: PathBuf,
 }
 impl Process {
-    fn spawn(binary: &Path, config: &Path, log: PathBuf) -> Self {
+    fn spawn(binary: &Path, config: &Path, log: PathBuf, args: &[&str]) -> Self {
         let output = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log)
             .unwrap();
         let child = Command::new(binary)
+            .args(args)
             .arg("--config")
             .arg(config)
             .env("RUST_LOG", "info")
@@ -104,6 +105,53 @@ fn wait<T>(label: &str, seconds: u64, mut poll: impl FnMut() -> Option<T>) -> T 
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+fn system_account(name: &str) -> Vec<String> {
+    let result = Command::new("getent")
+        .args(["passwd", name])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "missing user {name}");
+    String::from_utf8(result.stdout)
+        .unwrap()
+        .trim_end()
+        .split(':')
+        .map(str::to_owned)
+        .collect()
+}
+
+fn no_system_user(name: &str) {
+    assert_eq!(
+        Command::new("getent")
+            .args(["passwd", name])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(2)
+    );
+}
+
+fn sync_blueprint(api: &Api, repo: &Path, blueprint: &str) {
+    fs::write(repo.join("blueprints/web/pier-blueprint.yml"), blueprint).unwrap();
+    command(repo, "git", &["add", "."]);
+    command(
+        repo,
+        "git",
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "update blueprint",
+        ],
+    );
+    api.post("/v1/repository/sync", json!({}));
+}
+
 struct Api {
     client: reqwest::blocking::Client,
     base: String,
@@ -143,17 +191,64 @@ impl Api {
         self.call(reqwest::Method::POST, path, Some(body)).unwrap()
     }
     fn bind(&self, agent: &str, message: &str, fail: &str) {
-        self.call(reqwest::Method::PUT, &format!("/v1/agents/{agent}/binding"), Some(json!({"blueprint":"blueprints/web","variables":{"MESSAGE":message,"FAIL_WORKER":fail}}))).unwrap();
+        self.bind_blueprint(agent, "blueprints/web", message, fail);
+    }
+    fn bind_blueprint(&self, agent: &str, blueprint: &str, message: &str, fail: &str) {
+        let key = pier_protocol::hash(blueprint);
+        let exists = self.get(&format!("/v1/agents/{agent}/bindings"))["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["id"] == key);
+        let path = if exists {
+            format!("/v1/agents/{agent}/bindings/{key}")
+        } else {
+            format!("/v1/agents/{agent}/bindings")
+        };
+        self.call(
+            if exists {
+                reqwest::Method::PUT
+            } else {
+                reqwest::Method::POST
+            },
+            &path,
+            Some(json!({"blueprint":blueprint,"variables":{"MESSAGE":message,"FAIL_WORKER":fail}})),
+        )
+        .unwrap();
     }
     fn deploy(&self, agent: &str) -> String {
+        self.deploy_blueprint(agent, "blueprints/web")
+    }
+    fn deploy_blueprint(&self, agent: &str, blueprint: &str) -> String {
         let commit = self.get("/v1/repository")["commit"]
             .as_str()
             .unwrap()
             .to_string();
-        self.post("/v1/deployments", json!({"agent_id":agent,"commit":commit}))["id"]
+        self.post(
+            "/v1/deployments",
+            json!({"agent_id":agent,"blueprint":blueprint,"commit":commit}),
+        )["id"]
             .as_str()
             .unwrap()
             .to_string()
+    }
+    fn stop_blueprint(&self, agent: &str, blueprint: &str) -> String {
+        self.post(
+            "/v1/deployments",
+            json!({"agent_id":agent,"blueprint":blueprint,"action":"stop"}),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    fn blueprint(&self, agent: &str, path: &str) -> Value {
+        self.get(&format!("/v1/agents/{agent}"))["report"]["blueprints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["blueprint"] == path)
+            .unwrap()
+            .clone()
     }
     fn finished(&self, job: &str) -> Value {
         wait("deployment result", 90, || {
@@ -177,6 +272,100 @@ impl Api {
     }
 }
 
+struct Terminal {
+    socket: tokio_tungstenite::tungstenite::WebSocket<
+        tokio_tungstenite::tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+    >,
+    pid: i32,
+}
+impl Terminal {
+    fn open(api: &Api, agent: &str, instance: &str, user: &str, home: &Path) -> Self {
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, connect};
+        let ticket = api.post(
+            &format!("/v1/agents/{agent}/apps/{instance}/terminals"),
+            json!({"cols":80,"rows":24}),
+        );
+        let url = format!(
+            "{}{}",
+            api.base.replace("http://", "ws://"),
+            ticket["websocket_url"].as_str().unwrap()
+        );
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Cookie", api.cookie.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("Origin", "https://pier.example.test".parse().unwrap());
+        let (mut socket, _) = connect(request).unwrap();
+        if let tokio_tungstenite::tungstenite::stream::MaybeTlsStream::Plain(stream) =
+            socket.get_mut()
+        {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+        }
+        let ready: Value = loop {
+            use tokio_tungstenite::tungstenite::Message;
+            match socket.read().unwrap() {
+                Message::Text(text) => break serde_json::from_str(&text).unwrap(),
+                Message::Ping(_) | Message::Pong(_) => (),
+                message => panic!("unexpected terminal handshake: {message:?}"),
+            }
+        };
+        assert_eq!(ready["type"], "ready");
+        assert_eq!(ready["user"], user);
+        assert_eq!(ready["home"].as_str().unwrap(), home.to_str().unwrap());
+        let mut terminal = Self { socket, pid: 0 };
+        terminal.send("stty -echo; printf '\\n__READY__\\n'\n");
+        terminal.until("\r\n__READY__\r\n");
+        let output = terminal.command("printf '__PID__%s__' \"$$\"");
+        terminal.pid = output
+            .split("__PID__")
+            .nth(1)
+            .unwrap()
+            .split("__")
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(alive(terminal.pid));
+        terminal
+    }
+    fn send(&mut self, command: &str) {
+        self.socket
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                command.as_bytes().to_vec().into(),
+            ))
+            .unwrap();
+    }
+    fn until(&mut self, marker: &str) -> String {
+        use tokio_tungstenite::tungstenite::Message;
+        let mut output = Vec::new();
+        while !String::from_utf8_lossy(&output).contains(marker) {
+            match self.socket.read().unwrap() {
+                Message::Binary(bytes) => {
+                    self.socket
+                        .send(Message::Text(
+                            json!({"type":"ack","bytes":bytes.len()}).to_string().into(),
+                        ))
+                        .unwrap();
+                    output.extend_from_slice(&bytes);
+                    assert!(output.len() < 1024 * 1024);
+                }
+                Message::Ping(_) | Message::Pong(_) => (),
+                message => panic!("unexpected terminal event: {message:?}"),
+            }
+        }
+        String::from_utf8(output).unwrap()
+    }
+    fn command(&mut self, command: &str) -> String {
+        let marker = format!("__DONE_{}__", pier_protocol::new_id());
+        self.send(&format!("{command}\nprintf '\\n{marker}\\n'\n"));
+        self.until(&format!("\r\n{marker}\r\n"))
+    }
+}
+
 #[test]
 #[ignore = "requires a disposable root Docker container, git and useradd"]
 fn real_controller_agent_lifecycle() {
@@ -193,7 +382,19 @@ fn real_controller_agent_lifecycle() {
     let source_port = source.local_addr().unwrap().port();
     let source_failure = Arc::new(AtomicBool::new(false));
     let failure = source_failure.clone();
-    let script = b"#!/bin/sh\nset -eu\n[ \"$FAIL\" != yes ] || exit 42\nprintf '%s' \"$MESSAGE\" > \"$PIER_DATA_DIR/value\"\nid -u > \"$PIER_DATA_DIR/uid\"\nid -G > \"$PIER_DATA_DIR/groups\"\nif [ \"$MESSAGE\" = one ]; then dd if=/dev/zero bs=1048576 count=11 2>/dev/null; fi\ntrap 'exit 0' TERM INT\nwhile :; do echo running; sleep 1; done\n";
+    let source_requests = Arc::new(AtomicUsize::new(0));
+    let requests = source_requests.clone();
+    let script = br##"#!/bin/sh
+set -eu
+[ "$FAIL" != yes ] || exit 42
+printf '%s' "$MESSAGE" > "$PIER_DATA_DIR/$ROLE.value"
+id -u > "$PIER_DATA_DIR/$ROLE.uid"
+id -G > "$PIER_DATA_DIR/$ROLE.groups"
+echo $$ > "$PIER_DATA_DIR/$ROLE.pid"
+if [ "$MESSAGE" = one ]; then dd if=/dev/zero bs=1048576 count=11 2>/dev/null; fi
+trap 'exit 0' TERM INT
+while :; do echo running; sleep 1; done
+"##;
     thread::spawn(move || {
         for incoming in source.incoming() {
             let Ok(mut stream) = incoming else {
@@ -204,6 +405,7 @@ fn real_controller_agent_lifecycle() {
                 .unwrap();
             let mut request = [0u8; 8192];
             let _ = stream.read(&mut request);
+            requests.fetch_add(1, Ordering::SeqCst);
             if failure.load(Ordering::SeqCst) {
                 let _ = stream.write_all(
                     b"HTTP/1.1 500 Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -221,9 +423,20 @@ fn real_controller_agent_lifecycle() {
     let repo = dir.join("repo");
     fs::create_dir_all(repo.join("apps/demo/1")).unwrap();
     fs::create_dir_all(repo.join("blueprints/web")).unwrap();
-    fs::write(repo.join("apps/demo/1/pier-pkg.yml"), format!("schema: 2\nname: demo\nversion: '{{{{ MESSAGE }}}}'\nvariables:\n  MESSAGE: {{}}\n  FAIL: {{default: 'no'}}\nsource:\n  type: binary\n  url: http://127.0.0.1:{source_port}/program\n  format: raw\nfiles:\n- from: download\n  to: bin/demo\n  executable: true\nservice:\n  command: [bin/demo]\n  env:\n    MESSAGE: '{{{{ MESSAGE }}}}'\n    FAIL: '{{{{ FAIL }}}}'\n")).unwrap();
-    let blueprint = "schema: 1\nname: web\nvariables:\n  MESSAGE: {}\n  FAIL_WORKER: {default: 'no'}\napps:\n- id: api\n  app: apps/demo/1\n  variables: {MESSAGE: '{{ MESSAGE }}'}\n- id: worker\n  app: apps/demo/1\n  variables: {MESSAGE: '{{ MESSAGE }}', FAIL: '{{ FAIL_WORKER }}'}\n";
+    fs::write(repo.join("apps/demo/1/pier-pkg.yml"), format!("schema: 2\nname: demo+pkg\nversion: '{{{{ MESSAGE }}}}'\nvariables:\n  ROLE: {{}}\n  MESSAGE: {{}}\n  FAIL: {{default: 'no'}}\nsource:\n  type: binary\n  url: http://127.0.0.1:{source_port}/program\n  format: raw\nfiles:\n- from: download\n  to: bin/demo\n  executable: true\nservice:\n  command: [bin/demo]\n  env:\n    ROLE: '{{{{ ROLE }}}}'\n    MESSAGE: '{{{{ MESSAGE }}}}'\n    FAIL: '{{{{ FAIL }}}}'\n")).unwrap();
+    let blueprint = "schema: 1\nname: Web.Site\nvariables:\n  MESSAGE: {}\n  FAIL_WORKER: {default: 'no'}\napps:\n- id: api\n  app: apps/demo/1\n  variables: {ROLE: api, MESSAGE: '{{ MESSAGE }}'}\n- id: worker\n  app: apps/demo/1\n  variables: {ROLE: worker, MESSAGE: '{{ MESSAGE }}', FAIL: '{{ FAIL_WORKER }}'}\n";
     fs::write(repo.join("blueprints/web/pier-blueprint.yml"), blueprint).unwrap();
+    fs::create_dir_all(repo.join("blueprints/other")).unwrap();
+    let other_blueprint = blueprint
+        .split("- id: worker")
+        .next()
+        .unwrap()
+        .replace("name: Web.Site", "name: Other.Site");
+    fs::write(
+        repo.join("blueprints/other/pier-blueprint.yml"),
+        &other_blueprint,
+    )
+    .unwrap();
     command(&repo, "git", &["init", "-q", "-b", "main"]);
     command(&repo, "git", &["add", "."]);
     command(
@@ -250,6 +463,7 @@ fn real_controller_agent_lifecycle() {
         &controller_bin,
         &controller_config,
         dir.join("controller.log"),
+        &[],
     );
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -318,6 +532,7 @@ fn real_controller_agent_lifecycle() {
         &controller_bin,
         &controller_config,
         dir.join("controller.log"),
+        &[],
     );
     wait("controller restarted", 30, || {
         api.call(reqwest::Method::GET, "/v1/agents", None).ok()
@@ -400,7 +615,7 @@ fn real_controller_agent_lifecycle() {
     .unwrap();
     let agent_config = dir.join("agent.yml");
     fs::write(&agent_config, format!("agent_id: {agent_id}\ntoken_file: agent.token\ncontroller_tcp: 127.0.0.1:{tcp_port}\nstate_dir: agent\nheartbeat_seconds: 1\nruntime:\n  startup_grace_seconds: 1\n  stop_timeout_seconds: 1\n")).unwrap();
-    let mut agent = Process::spawn(&agent_bin, &agent_config, dir.join("agent.log"));
+    let mut agent = Process::spawn(&agent_bin, &agent_config, dir.join("agent.log"), &["run"]);
     api.running(agent_id, 0);
     assert!(
         !api.get(&format!("/v1/agents/{agent_id}"))
@@ -409,8 +624,8 @@ fn real_controller_agent_lifecycle() {
     );
     assert!(
         api.call(
-            reqwest::Method::PUT,
-            &format!("/v1/agents/{agent_id}/binding"),
+            reqwest::Method::POST,
+            &format!("/v1/agents/{agent_id}/bindings"),
             Some(json!({"blueprint":"blueprints/web","variables":{}}))
         )
         .is_err()
@@ -423,168 +638,310 @@ fn real_controller_agent_lifecycle() {
             .is_empty(),
         "binding must not deploy"
     );
+    // Names are checked before source acquisition; package names do not name users.
+    for invalid in ["bad+name", &"a".repeat(33)] {
+        sync_blueprint(
+            &api,
+            &repo,
+            &blueprint.replace("name: Web.Site", &format!("name: {invalid}")),
+        );
+        let failed = api.deploy(agent_id);
+        let result = api.finished(&failed);
+        assert_eq!(result["state"], "failed");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("name must be a system username"),
+            "{result}"
+        );
+        assert_eq!(source_requests.load(Ordering::SeqCst), 0);
+    }
+    command(dir, "groupadd", &["--system", "occupied-blueprint-group"]);
+    let original_root = system_account("root");
+    for (name, message) in [
+        ("root", "belongs to another blueprint or system user"),
+        ("occupied-blueprint-group", "group already exists"),
+    ] {
+        sync_blueprint(
+            &api,
+            &repo,
+            &blueprint.replace("name: Web.Site", &format!("name: {name}")),
+        );
+        let result = api.finished(&api.deploy(agent_id));
+        assert_eq!(result["state"], "failed");
+        assert!(
+            result["error"].as_str().unwrap().contains(message),
+            "{result}"
+        );
+        no_system_user("Web.Site");
+        assert_eq!(system_account("root"), original_root);
+        assert_eq!(
+            fs::read_dir(dir.join("agent/blueprints")).unwrap().count(),
+            0
+        );
+    }
+    sync_blueprint(&api, &repo, blueprint);
     let first = api.deploy(agent_id);
     assert_eq!(api.finished(&first)["state"], "succeeded");
     let first_plan: pier_protocol::DeploymentPlan =
         serde_json::from_value(api.get(&format!("/v1/deployments/{first}"))["plan"].clone())
             .unwrap();
-    let running = api.running(agent_id, 2);
-    let apps = running["report"]["apps"].as_array().unwrap();
-    let paths: Vec<_> = apps
-        .iter()
-        .map(|a| {
-            dir.join("agent/apps")
-                .join(a["instance"].as_str().unwrap())
-                .join("data")
-        })
-        .collect();
-    let uids: Vec<_> = paths
-        .iter()
-        .map(|p| {
-            fs::read_to_string(p.join("uid"))
+    api.running(agent_id, 2);
+    let web_id = pier_protocol::hash("blueprints/web");
+    let other_id = pier_protocol::hash("blueprints/other");
+    let data = dir.join("agent/blueprints").join(&web_id).join("data");
+    let other_data = dir.join("agent/blueprints").join(&other_id).join("data");
+    let account = system_account("Web.Site");
+    assert_ne!(account[2], "0");
+    assert!(account[6].ends_with("/nologin"));
+    assert_eq!(Path::new(&account[5]), data);
+    assert_eq!(account[4], format!("pier-agent={agent_id}/{web_id}"));
+    let assert_account = || {
+        assert_eq!(system_account("Web.Site"), account);
+        for role in ["api", "worker"] {
+            assert_eq!(
+                fs::read_to_string(data.join(format!("{role}.uid")))
+                    .unwrap()
+                    .trim(),
+                account[2]
+            );
+            assert_eq!(
+                fs::read_to_string(data.join(format!("{role}.groups")))
+                    .unwrap()
+                    .trim(),
+                account[3]
+            );
+            assert_eq!(
+                fs::metadata(data.join(format!("{role}.value")))
+                    .unwrap()
+                    .uid()
+                    .to_string(),
+                account[2]
+            );
+        }
+        let group = Command::new("getent")
+            .args(["group", "Web.Site"])
+            .output()
+            .unwrap();
+        assert!(group.status.success());
+        assert_eq!(
+            String::from_utf8(group.stdout)
                 .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap()
-        })
-        .collect();
-    assert_ne!(uids[0], 0);
-    assert_ne!(uids[0], uids[1]);
-    let account = Command::new("getent")
-        .args(["passwd", &uids[0].to_string()])
-        .output()
-        .unwrap();
-    let name = String::from_utf8(account.stdout)
-        .unwrap()
-        .split(':')
-        .next()
+                .split(':')
+                .nth(2)
+                .unwrap(),
+            account[3]
+        );
+    };
+    assert_account();
+    no_system_user("demo+pkg");
+    fs::write(data.join("persistent"), "keep shared data").unwrap();
+    for role in ["api", "worker"] {
+        let log = dir
+            .join("agent/blueprints")
+            .join(&web_id)
+            .join("apps")
+            .join(role)
+            .join("logs/stdout.log.1");
+        wait("separate rotated logs", 30, || log.exists().then_some(()));
+    }
+    // Same app id and package name on a second blueprint are independent.
+    api.bind_blueprint(agent_id, "blueprints/other", "other", "no");
+    let other_job = api.deploy_blueprint(agent_id, "blueprints/other");
+    assert_eq!(api.finished(&other_job)["state"], "succeeded");
+    api.running(agent_id, 3);
+    let other_account = system_account("Other.Site");
+    assert_ne!(other_account[2], account[2]);
+    let other_pid = api.blueprint(agent_id, "blueprints/other")["apps"][0]["pid"]
+        .as_i64()
+        .unwrap() as i32;
+    let other_instance = api.blueprint(agent_id, "blueprints/other")["apps"][0]["instance"]
+        .as_str()
         .unwrap()
         .to_string();
+    let mut other_terminal =
+        Terminal::open(&api, agent_id, &other_instance, "Other.Site", &other_data);
+    let assert_other = || {
+        assert!(alive(other_pid));
+        assert_eq!(
+            api.blueprint(agent_id, "blueprints/other")["apps"][0]["pid"],
+            other_pid
+        );
+        assert_eq!(system_account("Other.Site"), other_account);
+        assert_eq!(
+            fs::read_to_string(other_data.join("api.value")).unwrap(),
+            "other"
+        );
+    };
     let denied = Command::new("runuser")
-        .args(["-u", &name, "--", "cat"])
-        .arg(paths[1].join("value"))
+        .args(["-u", "Web.Site", "--", "cat"])
+        .arg(other_data.join("api.value"))
         .output()
         .unwrap();
-    assert!(
-        !denied.status.success(),
-        "app user must not read another app's data"
-    );
-    for (path, uid) in paths.iter().zip(&uids) {
-        assert_eq!(fs::metadata(path.join("value")).unwrap().uid(), *uid);
-        assert_eq!(
-            fs::read_to_string(path.join("groups"))
-                .unwrap()
-                .split_whitespace()
-                .count(),
-            1
+    assert!(!denied.status.success());
+    // Reject same-name blueprints before acquiring sources, and refuse renaming.
+    for (name, message) in [
+        ("Other.Site", "blueprint"),
+        ("Renamed.Site", "cannot change"),
+    ] {
+        let fetched = source_requests.load(Ordering::SeqCst);
+        sync_blueprint(
+            &api,
+            &repo,
+            &blueprint.replace("name: Web.Site", &format!("name: {name}")),
         );
-        assert_eq!(fs::read_to_string(path.join("value")).unwrap(), "one");
-        fs::write(path.join("persistent"), "keep me").unwrap();
-        let log_dir = path.parent().unwrap().join("logs");
-        wait("log rotation", 30, || {
-            log_dir.join("stdout.log.1").exists().then_some(())
-        });
-        assert!(fs::metadata(log_dir.join("stdout.log")).unwrap().len() <= 10 * 1024 * 1024);
+        let result = api.finished(&api.deploy(agent_id));
+        assert_eq!(result["state"], "failed");
+        assert!(
+            result["error"].as_str().unwrap().contains(message),
+            "{result}"
+        );
+        assert_eq!(source_requests.load(Ordering::SeqCst), fetched);
+        assert_other();
+        assert_account();
     }
-    let killed_pid = apps[0]["pid"].as_i64().unwrap() as i32;
-    unsafe {
-        libc::kill(killed_pid, libc::SIGKILL);
+    no_system_user("Renamed.Site");
+    sync_blueprint(&api, &repo, blueprint);
+    let store = pier_protocol::store::Store::open(&dir.join("agent/agent.db")).unwrap();
+    let saved: Value = store.get("blueprint_accounts", &web_id).unwrap().unwrap();
+    for field in ["uid", "gid", "marker", "home"] {
+        let mut changed = saved.clone();
+        changed[field] = match field {
+            "uid" | "gid" => json!(saved[field].as_u64().unwrap() + 100_000),
+            _ => json!("changed"),
+        };
+        store.put("blueprint_accounts", &web_id, &changed).unwrap();
+        let result = api.finished(&api.deploy(agent_id));
+        store.put("blueprint_accounts", &web_id, &saved).unwrap();
+        assert_eq!(result["state"], "failed", "{result}");
+        assert!(
+            result["error"].as_str().unwrap().contains("account"),
+            "{result}"
+        );
+        assert_other();
+        assert_account();
     }
-    wait("automatic app restart", 30, || {
-        let value = api.get(&format!("/v1/agents/{agent_id}"));
-        let app = &value["report"]["apps"][0];
-        (app["state"] == "running"
-            && app["pid"].as_i64().is_some_and(|p| p != killed_pid as i64)
-            && app["restarts"].as_u64().unwrap_or(0) > 0)
-            .then_some(())
-    });
+    drop(store);
+    // Version-directory changes reuse the blueprint account and shared data.
+    fs::create_dir_all(repo.join("apps/demo/2")).unwrap();
+    fs::copy(
+        repo.join("apps/demo/1/pier-pkg.yml"),
+        repo.join("apps/demo/2/pier-pkg.yml"),
+    )
+    .unwrap();
+    let upgraded_blueprint = blueprint.replace("app: apps/demo/1", "app: apps/demo/2");
+    sync_blueprint(&api, &repo, &upgraded_blueprint);
     api.bind(agent_id, "two", "no");
-    assert_eq!(fs::read_to_string(paths[0].join("value")).unwrap(), "one");
     let second = api.deploy(agent_id);
     assert_eq!(api.finished(&second)["state"], "succeeded");
-    api.running(agent_id, 2);
+    api.running(agent_id, 3);
+    assert_account();
+    assert_other();
+    assert_eq!(fs::read_to_string(data.join("api.value")).unwrap(), "two");
+    assert_eq!(
+        fs::read_to_string(data.join("worker.value")).unwrap(),
+        "two"
+    );
     api.bind(agent_id, "bad", "yes");
     let failed = api.deploy(agent_id);
     assert_eq!(api.finished(&failed)["state"], "rolled_back");
-    api.running(agent_id, 2);
-    for path in &paths {
-        assert_eq!(fs::read_to_string(path.join("value")).unwrap(), "two");
-        assert_eq!(
-            fs::read_to_string(path.join("persistent")).unwrap(),
-            "keep me"
-        );
-    }
+    api.running(agent_id, 3);
+    assert_eq!(
+        api.blueprint(agent_id, "blueprints/web")["deployment_id"],
+        second
+    );
+    assert_eq!(
+        fs::read_to_string(data.join("worker.value")).unwrap(),
+        "two"
+    );
+    assert_account();
+    assert_other();
     source_failure.store(true, Ordering::SeqCst);
     api.bind(agent_id, "three", "no");
-    let failed_build = api.deploy(agent_id);
-    assert_eq!(api.finished(&failed_build)["state"], "failed");
+    assert_eq!(api.finished(&api.deploy(agent_id))["state"], "failed");
     source_failure.store(false, Ordering::SeqCst);
-    assert_eq!(fs::read_to_string(paths[0].join("value")).unwrap(), "two");
-    // Invalid Git snapshots must leave the usable catalog and services intact.
-    let previous = api.get("/v1/repository")["commit"].clone();
-    fs::write(
-        repo.join("blueprints/web/pier-blueprint.yml"),
-        "schema: 999\nname: bad\napps: []\n",
-    )
-    .unwrap();
-    command(&repo, "git", &["add", "."]);
-    command(
-        &repo,
-        "git",
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.invalid",
-            "commit",
-            "-qm",
-            "invalid",
-        ],
-    );
+    assert_other();
+    let web_instance = api.blueprint(agent_id, "blueprints/web")["apps"][0]["instance"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut web_terminal = Terminal::open(&api, agent_id, &web_instance, "Web.Site", &data);
     assert!(
-        api.call(
-            reqwest::Method::POST,
-            "/v1/repository/sync",
-            Some(json!({}))
+        other_terminal
+            .command("echo OTHER_ALIVE")
+            .contains("OTHER_ALIVE")
+    );
+    // Exiting either child restarts the whole blueprint and cleans orphan services.
+    for signal in [libc::SIGKILL, libc::SIGTERM] {
+        let old = api.blueprint(agent_id, "blueprints/web")["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["pid"].as_i64().unwrap() as i32)
+            .collect::<Vec<_>>();
+        let mut orphan = Command::new("runuser")
+            .args([
+                "-u",
+                "Web.Site",
+                "--",
+                "/bin/sh",
+                "-c",
+                "setsid sleep 300 & echo $!; wait",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(orphan.stdout.take().unwrap()),
+            &mut line,
         )
-        .is_err()
+        .unwrap();
+        let orphan_pid: i32 = line.trim().parse().unwrap();
+        assert!(alive(orphan_pid));
+        unsafe {
+            libc::kill(old[1], signal);
+        }
+        wait("whole blueprint automatic restart", 30, || {
+            let bp = api.blueprint(agent_id, "blueprints/web");
+            (bp["state"] == "running"
+                && bp["apps"].as_array().unwrap().iter().all(|a| {
+                    a["pid"]
+                        .as_i64()
+                        .is_some_and(|p| !old.contains(&(p as i32)))
+                        && a["restarts"].as_u64().unwrap() > 0
+                }))
+            .then_some(())
+        });
+        assert!(old.iter().all(|p| !alive(*p)));
+        assert!(
+            !alive(orphan_pid),
+            "escaped service descendant was not cleaned"
+        );
+        orphan.wait().unwrap();
+        assert!(alive(web_terminal.pid));
+        assert!(
+            web_terminal
+                .command("echo SAME_BLUEPRINT_ALIVE")
+                .contains("SAME_BLUEPRINT_ALIVE")
+        );
+        assert!(
+            other_terminal
+                .command("echo OTHER_ALIVE")
+                .contains("OTHER_ALIVE")
+        );
+        assert_account();
+        assert_other();
+    }
+    let binding_path = format!("/v1/agents/{agent_id}/bindings/{web_id}");
+    assert!(
+        api.call(reqwest::Method::DELETE, &binding_path, None)
+            .is_err()
     );
-    assert_eq!(api.get("/v1/repository")["commit"], previous);
-    // Controller downtime must not stop apps; it can restart without redeploying.
-    let before = api.running(agent_id, 2);
-    let survivor = before["report"]["apps"][0]["pid"].as_i64().unwrap() as i32;
-    controller.stop(libc::SIGTERM);
-    thread::sleep(Duration::from_secs(2));
-    assert_eq!(unsafe { libc::kill(survivor, 0) }, 0);
-    controller = Process::spawn(
-        &controller_bin,
-        &controller_config,
-        dir.join("controller.log"),
-    );
-    wait("controller restart", 30, || {
-        api.call(reqwest::Method::GET, "/v1/repository", None).ok()
-    });
-    let restored = api.running(agent_id, 2);
-    assert_eq!(restored["report"]["deployment_id"], second);
-    // Abrupt agent death leaves processes until recovery; recovery replaces them.
-    let old_pid = restored["report"]["apps"][0]["pid"].as_i64().unwrap() as i32;
-    agent.stop(libc::SIGKILL);
-    agent = Process::spawn(&agent_bin, &agent_config, dir.join("agent.log"));
-    wait("agent crash recovery", 40, || {
-        let value = api.get(&format!("/v1/agents/{agent_id}"));
-        (value["online"] == true
-            && value["report"]["apps"].as_array().is_some_and(|apps| {
-                apps.len() == 2 && apps.iter().all(|a| a["state"] == "running")
-            })
-            && value["report"]["apps"][0]["pid"]
-                .as_i64()
-                .is_some_and(|p| p != old_pid as i64))
-        .then_some(())
-    });
-    assert!(!alive(old_pid));
-    // Remove an app, preserve its user/data, then interrupt a later deployment.
-    let one_app = blueprint.split("- id: worker").next().unwrap();
-    fs::write(repo.join("blueprints/web/pier-blueprint.yml"), one_app).unwrap();
+    // Stop does not depend on a still-present Git recipe or catalog entry.
+    fs::remove_file(repo.join("blueprints/web/pier-blueprint.yml")).unwrap();
     command(&repo, "git", &["add", "."]);
     command(
         &repo,
@@ -596,72 +953,137 @@ fn real_controller_agent_lifecycle() {
             "user.email=test@example.invalid",
             "commit",
             "-qm",
-            "remove worker",
+            "remove definition",
         ],
     );
     api.post("/v1/repository/sync", json!({}));
-    api.bind(agent_id, "four", "no");
-    let removed = api.deploy(agent_id);
-    assert_eq!(api.finished(&removed)["state"], "succeeded");
+    assert_eq!(
+        api.finished(&api.stop_blueprint(agent_id, "blueprints/web"))["state"],
+        "succeeded"
+    );
+    wait("stopped blueprint terminal closes", 10, || {
+        (!alive(web_terminal.pid)).then_some(())
+    });
+    drop(web_terminal);
+    assert!(alive(other_terminal.pid));
+    assert!(
+        other_terminal
+            .command("echo OTHER_AFTER_STOP")
+            .contains("OTHER_AFTER_STOP")
+    );
     api.running(agent_id, 1);
-    assert!(paths.iter().all(|p| p.join("persistent").exists()));
+    assert_eq!(
+        api.blueprint(agent_id, "blueprints/web")["state"],
+        "stopped"
+    );
+    assert_other();
+    assert_account();
+    api.call(reqwest::Method::DELETE, &binding_path, None)
+        .unwrap();
+    assert_eq!(
+        api.get(&format!("/v1/agents/{agent_id}/bindings"))["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    sync_blueprint(&api, &repo, blueprint);
+    api.bind(agent_id, "four", "no");
+    let readded = api.deploy(agent_id);
+    assert_eq!(api.finished(&readded)["state"], "succeeded");
+    api.running(agent_id, 3);
+    assert_eq!(
+        fs::read_to_string(data.join("persistent")).unwrap(),
+        "keep shared data"
+    );
+    assert_account();
+    assert_other();
+    assert!(
+        other_terminal
+            .command("echo OTHER_AFTER_REBIND")
+            .contains("OTHER_AFTER_REBIND")
+    );
+    drop(other_terminal);
+    // Journal rollback only replaces the targeted blueprint's snapshot.
     api.bind(agent_id, "interrupted", "no");
     let interrupted = api.deploy(agent_id);
-    wait("deployment reaches activation", 30, || {
-        let job = api.get(&format!("/v1/deployments/{interrupted}"));
-        (job["state"] == "applying").then_some(())
+    wait("deployment activation", 30, || {
+        (api.get(&format!("/v1/deployments/{interrupted}"))["state"] == "applying").then_some(())
     });
     agent.stop(libc::SIGKILL);
-    agent = Process::spawn(&agent_bin, &agent_config, dir.join("agent.log"));
+    agent = Process::spawn(&agent_bin, &agent_config, dir.join("agent.log"), &["run"]);
     assert_eq!(api.finished(&interrupted)["state"], "rolled_back");
-    let final_state = api.running(agent_id, 1);
-    assert_eq!(final_state["report"]["deployment_id"], removed);
-    // Graceful stop must stop apps and restart from local state without controller.
-    let final_pid = final_state["report"]["apps"][0]["pid"].as_i64().unwrap() as i32;
+    api.running(agent_id, 3);
+    assert_eq!(
+        api.blueprint(agent_id, "blueprints/web")["deployment_id"],
+        readded
+    );
+    assert_eq!(
+        api.blueprint(agent_id, "blueprints/other")["deployment_id"],
+        other_job
+    );
+    assert_account();
+    assert_eq!(system_account("Other.Site"), other_account);
+    // Both blueprints recover from local state without a controller.
     controller.stop(libc::SIGTERM);
     agent.stop(libc::SIGTERM);
-    assert!(!alive(final_pid));
-    let active_instance = final_state["report"]["apps"][0]["instance"]
-        .as_str()
-        .unwrap();
-    let value = dir
-        .join("agent/apps")
-        .join(active_instance)
-        .join("data/value");
-    fs::remove_file(&value).unwrap();
-    agent = Process::spawn(&agent_bin, &agent_config, dir.join("agent.log"));
-    wait("offline local recovery", 20, || {
-        fs::read_to_string(&value).ok().filter(|v| v == "four")
+    fs::remove_file(data.join("api.value")).unwrap();
+    fs::remove_file(other_data.join("api.value")).unwrap();
+    agent = Process::spawn(&agent_bin, &agent_config, dir.join("agent.log"), &["run"]);
+    wait("offline multi-blueprint recovery", 25, || {
+        (fs::read_to_string(data.join("api.value")).ok().as_deref() == Some("four")
+            && fs::read_to_string(other_data.join("api.value"))
+                .ok()
+                .as_deref()
+                == Some("other"))
+        .then_some(())
     });
+    assert_account();
     agent.stop(libc::SIGTERM);
-    // Replaying a completed plan must neither download nor replace the current
-    // snapshot, and reusing its ID with different content must be rejected.
-    source_failure.store(true, Ordering::SeqCst);
     let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    let local = pier_agent::Runtime::open(
-        pier_agent::Config {
-            connection_mode: Default::default(),
-            listen: None,
-            agent_id: agent_id.into(),
-            token_file: dir.join("agent.token"),
-            controller_tcp: format!("127.0.0.1:{tcp_port}"),
-            state_dir: dir.join("agent"),
-            heartbeat_seconds: 1,
-            runtime: pier_agent::RuntimeOptions {
-                startup_grace_seconds: 1,
-                stop_timeout_seconds: 1,
-            },
+    let config = pier_agent::Config {
+        connection_mode: Default::default(),
+        listen: None,
+        agent_id: agent_id.into(),
+        token_file: dir.join("agent.token"),
+        controller_tcp: format!("127.0.0.1:{tcp_port}"),
+        state_dir: dir.join("agent"),
+        heartbeat_seconds: 1,
+        runtime: pier_agent::RuntimeOptions {
+            startup_grace_seconds: 1,
+            stop_timeout_seconds: 1,
         },
-        events,
-    )
-    .unwrap();
+    };
+    let local = pier_agent::Runtime::open(config.clone(), events).unwrap();
     assert_eq!(local.apply(first_plan.clone()).unwrap().state, "succeeded");
+    let report = local.report().unwrap();
+    assert_eq!(report.blueprints.len(), 2);
     assert_eq!(
-        local.report().unwrap().deployment_id.as_deref(),
-        Some(removed.as_str())
+        report
+            .blueprints
+            .iter()
+            .find(|b| b.id == web_id)
+            .unwrap()
+            .deployment_id
+            .as_deref(),
+        Some(readded.as_str())
     );
     let mut changed = first_plan;
     changed.commit = "different".into();
     assert!(local.apply(changed).is_err());
     local.shutdown();
+    drop(local);
+    // Legacy accounts must not be silently adopted or their data re-owned.
+    let store = pier_protocol::store::Store::open(&dir.join("agent/agent.db")).unwrap();
+    store.put("accounts", "old-app", &saved).unwrap();
+    drop(store);
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    assert!(
+        pier_agent::Runtime::open(config, events)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("legacy per-app deployment")
+    );
+    assert_eq!(system_account("Web.Site"), account);
 }
