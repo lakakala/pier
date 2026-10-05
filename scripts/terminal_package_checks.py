@@ -51,7 +51,7 @@ class TerminalSocket:
     def control(self, value):
         self.send(json.dumps(value).encode(), 1)
 
-    def receive(self):
+    def receive(self, closing=False):
         while True:
             first, second = self.exact(2)
             assert first & 0x80 and not second & 0x80
@@ -64,13 +64,15 @@ class TerminalSocket:
             data = self.exact(size)
             opcode = first & 15
             if opcode == 9:
-                self.send(data, 10)
+                if not closing:
+                    self.send(data, 10)
             elif opcode == 10:
                 continue
             elif opcode == 1:
                 return json.loads(data)
             elif opcode == 2:
-                self.control({'type': 'ack', 'bytes': len(data)})
+                if not closing:
+                    self.control({'type': 'ack', 'bytes': len(data)})
                 return data
             else:
                 raise EOFError('WebSocket closed')
@@ -170,7 +172,9 @@ def run_terminal_checks(api, jar, root, agent_path, wait, deploy):
     deadline = time.monotonic() + 15
     while True:
         assert time.monotonic() < deadline
-        event = ws.receive()
+        # Deployment has already terminated the shell. Drain buffered frames
+        # without writing ACKs/Pongs to a transport the server may have closed.
+        event = ws.receive(closing=True)
         if isinstance(event, dict) and event['type'] == 'exit':
             assert event['reason'] == 'deployment_started', event
             break
