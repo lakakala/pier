@@ -939,7 +939,8 @@ interface InitRequest {
   info: { architecture: string; hostname: string; os_release: string };
 }
 function decodeRequest(hash: string): InitRequest {
-  if (location.protocol !== 'https:') throw new Error('请通过 HTTPS 访问授权页面');
+  if (!['http:', 'https:'].includes(location.protocol))
+    throw new Error('请通过 HTTP 或 HTTPS 访问授权页面');
   const encoded = hash.slice(1);
   if (!encoded || encoded.length > 16384) throw new Error('请使用 pier-agent init 显示的授权链接');
   const value = JSON.parse(

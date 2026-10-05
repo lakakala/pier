@@ -1,4 +1,6 @@
 # Startup settings only. Configure the repository, agent listener, public
 # addresses, build concurrency and proxies in the web console at /init.
+# For remote HTTP access, set http_listen to 0.0.0.0:8080 and open
+# http://<server>:8080/init. An HTTPS reverse proxy is optional.
 http_listen: 127.0.0.1:8080
 state_dir: /var/lib/pier-controller

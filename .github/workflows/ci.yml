@@ -42,7 +42,10 @@ jobs:
           npm run typecheck
           npm run build:check
           npx playwright install --with-deps chromium
-          npm test
+          printf '127.0.0.1 pier-http.test\n' | sudo tee -a /etc/hosts >/dev/null
+          for pier_scheme in http https; do
+            PIER_E2E_SCHEME="$pier_scheme" npm test
+          done
       - name: Save browser diagnostics
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

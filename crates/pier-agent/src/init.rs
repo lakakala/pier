@@ -369,11 +369,11 @@ fn initial_request() -> Result<Option<PendingInit>> {
     let info = crate::network::host_info()?;
     loop {
         let public_url: String = Input::new()
-            .with_prompt("Controller 网页地址，例如 https://pier.example.com")
+            .with_prompt("Controller 网页地址，例如 http://pier.example.com:8080（也支持 HTTPS）")
             .validate_with(|s: &String| {
                 pier_protocol::enrollment::origin(s)
                     .map(|_| ())
-                    .map_err(|_| "请输入 HTTPS 地址，不含路径、账号或查询参数")
+                    .map_err(|_| "请输入 HTTP 或 HTTPS 地址，不含路径、账号或查询参数")
             })
             .interact_text()?;
         let Some(mode) = select(

@@ -27,7 +27,7 @@ sudo pier-agent init
 
 首次安装只安装程序、unit 和文档，不启动或启用 agent，也不要求在软件包安装脚本中输入信息。`init` 需要 root、交互终端和运行中的 systemd；SSH 场景可使用 `ssh -t`。界面支持方向键和回车，`TERM=dumb` 使用数字菜单。
 
-向导依次填写 controller 的 **HTTPS 网页地址**、选择连接方式、agent 名称（默认主机名），选择数据目录，确认后显示授权链接。可在另一台电脑打开链接，也可选择尝试打开本机浏览器。网页登录管理员账号后核对服务器信息，并批准接入，然后将一次性配对凭据粘贴回终端。配对输入不回显。初始化成功后自动执行 `systemctl enable --now pier-agent` 并退出向导，服务在后台运行。
+向导依次填写 controller 的 **HTTP 或 HTTPS 网页地址**、选择连接方式、agent 名称（默认主机名），选择数据目录，确认后显示授权链接。可在另一台电脑打开链接，也可选择尝试打开本机浏览器。网页登录管理员账号后核对服务器信息，并批准接入，然后将一次性配对凭据粘贴回终端。配对输入不回显。初始化成功后自动执行 `systemctl enable --now pier-agent` 并退出向导，服务在后台运行。
 
 连接方式默认“Agent 主动连接 Controller”，沿用现有网络要求。选择“Controller 主动连接 Agent”时，向导要求本机监听地址（默认 `0.0.0.0:7444`），Web 授权页要求填写 controller 能访问的 agent 地址，例如 `agent.example.com:7444` 或 `[2001:db8::1]:7444`。本机监听地址与可达地址可以不同，支持 NAT 端口映射。两种模式可同时接入一个 controller；已有 agent 缺少模式配置时继续主动连接。本次不提供已有身份切换模式的向导。
 
@@ -100,7 +100,7 @@ sudo systemctl restart pier-agent
 
 应用崩溃并被自动拉起时，终端继续保留。关闭终端只结束该终端的 Bash 和会话内作业；部署、回滚、agent 升级/停止、控制连接丢失或 Web 登录失效会结束关联终端，并显示原因。网络中断最长 45 秒检测，重连创建新会话，不恢复旧 Bash。
 
-每个 agent 最多 8 个终端，controller 最多 64 个。浏览器使用同源 WSS，根据连接模式由 agent 或 controller 发起独立 Noise 连接，复用对应接收方的通信监听端口。HTTPS 反向代理须支持 WebSocket Upgrade，见 [Nginx 示例](../examples/services/controller.nginx.conf)。服务端不记录终端输入输出；Bash 历史由账户配置决定。
+每个 agent 最多 8 个终端，controller 最多 64 个。浏览器使用同源 WebSocket（HTTP 对应 WS，HTTPS 对应 WSS），根据连接模式由 agent 或 controller 发起独立 Noise 连接，复用对应接收方的通信监听端口。使用反向代理时须支持 WebSocket Upgrade，见 [Nginx 示例](../examples/services/controller.nginx.conf)。服务端不记录终端输入输出；Bash 历史由账户配置决定。
 
 新 controller 与旧 agent 继续使用协议 v2，原部署和自动升级流程不变；agent 升级并上报 `app_terminal_v1` 能力后启用终端按钮。接口及帧格式见 [应用终端 API](api.md#应用-bash-终端)。GitHub Actions 的六个平台安装测试覆盖真实 PTY、账户环境、流控和进程清理。
 
@@ -116,7 +116,7 @@ sudo dnf install ./pier-controller-0.1.0-1.el8.x86_64.rpm
 # AlmaLinux 9
 sudo dnf install ./pier-controller-0.1.0-1.el9.x86_64.rpm
 
-# 配置自己的 HTTPS 反向代理后启动
+# 启动后可直接通过 HTTP 访问；HTTPS 反向代理可选
 sudo systemctl enable --now pier-controller
 sudo journalctl -u pier-controller -f
 ```
@@ -130,13 +130,13 @@ http_listen: 127.0.0.1:8080
 state_dir: /var/lib/pier-controller
 ```
 
-未初始化时只启动 Web，不监听 agent TCP。Git 和 CA 证书通过包依赖安装。网页已内嵌，无需 Node.js；HTTPS 代理和 Docker 自行准备。随包的默认配置与 Nginx 示例位于 `/usr/share/doc/pier-controller/examples/`。
+未初始化时只启动 Web，不监听 agent TCP。Git 和 CA 证书通过包依赖安装。网页已内嵌，无需 Node.js 或 HTTPS 代理；源码构建所需的 Docker 自行准备。远程直接访问时，将 `http_listen` 改为 `0.0.0.0:8080` 或指定网卡地址，再打开 `http://服务器地址:8080/init`。随包的默认配置与 Nginx 示例位于 `/usr/share/doc/pier-controller/examples/`。
 
-通过实际 HTTPS 地址打开 `/init`，填写管理员账号、密码、仓库地址和分支（默认 `main`）。展开“运行设置”可配置 agent TCP 监听地址（默认 `0.0.0.0:7443`）、公开 HTTPS 地址、agent 公布地址、并行构建数（默认 2，范围 1–64）及构建代理。公开地址默认采用当前网页来源，初始化时必须与它一致；agent 公布地址留空时取同一主机及所选 TCP 端口，支持 IPv6。反向代理必须保留包含端口的 Host。
+通过实际 HTTP 或 HTTPS 地址打开 `/init`，填写管理员账号、密码、仓库地址和分支（默认 `main`）。展开“运行设置”可配置 agent TCP 监听地址（默认 `0.0.0.0:7443`）、公开 HTTP 或 HTTPS 地址、agent 公布地址、并行构建数（默认 2，范围 1–64）及构建代理。公开地址默认采用当前网页来源，初始化时必须与它一致；agent 公布地址留空时取同一主机及所选 TCP 端口，支持 IPv6。使用反向代理时必须保留包含端口的 Host。
 
 初始化先尝试绑定 agent 端口，再将账号、会话、仓库和运行设置在同一事务中保存，成功后立即启用 agent 通信，无需重启。端口被占用时初始化失败，可修改端口重试，不会留下半完成的管理员。初始化不拉取 Git，完成后到“定义仓库”页面点击“立即同步”。
 
-后续在“控制器设置”（`/settings/controller`）修改运行设置。页面分别显示当前生效值和已保存值；保存后提示“待重启”，现有监听、来源校验和构建参数继续使用当前值，执行 `sudo systemctl restart pier-controller` 后切换。修改公开地址后，重启前仍用旧地址，重启后使用新地址；修改 agent 公布地址不会自动重写已注册 agent 的本地配置。代理可选择保留、替换或清除，页面不回填已有代理凭据。仓库地址和分支仍在“定义仓库”单独保存、手动同步。
+后续在“控制器设置”（`/settings/controller`）修改运行设置。页面分别显示当前生效值和已保存值；保存后提示“待重启”，现有监听、来源校验和构建参数继续使用当前值，执行 `sudo systemctl restart pier-controller` 后切换。修改公开地址后，重启前仍用旧地址，重启后使用新地址；HTTP 与 HTTPS 切换后需重新登录。修改 agent 公布地址不会自动重写已注册 agent 的本地配置。代理可选择保留、替换或清除，页面不回填已有代理凭据。仓库地址和分支仍在“定义仓库”单独保存、手动同步。
 
 重启时如果 agent 端口无法绑定，Web 仍可登录并修改设置，概览和设置页显示错误；接入授权和新部署暂时不可用。修正监听地址并再次重启即可恢复。
 
@@ -253,31 +253,23 @@ cd ../../..
 cargo build -p pier-controller --locked
 ```
 
-`npm run dev` 启动本地 Vite 开发服务，`/v1` 转发到 `127.0.0.1:8080`。开发时也通过 HTTPS 反向代理访问 Vite，并让 controller 的 `public_url` 与该 HTTPS 来源一致；热更新连接由代理支持 WebSocket。生产环境始终代理 controller，无需独立静态目录。
+`npm run dev` 启动本地 Vite 开发服务，`/v1` 转发到 `127.0.0.1:8080`。开发时可直接通过 HTTP 访问 Vite，也可使用 HTTPS 代理；controller 的 `public_url` 须与浏览器来源一致。使用代理时需支持 WebSocket 热更新。生产环境由 controller 提供嵌入式网页，无需独立静态目录。
 
-浏览器回归会启动临时 Git 仓库、controller 和本地 HTTPS 代理，数据在退出后清理：
-
-```sh
-cargo build -p pier-controller --locked
-cd crates/pier-controller/web
-npm ci
-npx playwright install chromium
-npm test
-```
+GitHub Actions 在独立的临时仓库和 controller 状态下，依次运行 HTTP、HTTPS 两套浏览器回归。HTTP 直接连接 controller，使用映射到本机的 `pier-http.test` 域名，避免 localhost 的安全上下文特例；HTTPS 使用测试反向代理。两套验证均覆盖初始化、Cookie/CSRF、接入授权、代理编辑、终端、退出和改密，HTTP 额外验证剪贴板不可用时的手动复制提示。测试结束后清理状态；协议由 `PIER_E2E_SCHEME=http|https` 选择，诊断文件按协议分别保留。
 
 页面深层路径支持刷新；不存在的 API 和静态资源返回 404。HTML 使用每次请求生成的 CSP nonce，Ant Design 动态样式沿用该 nonce；脚本仅允许同源资源。API 和页面响应均禁止缓存。
 
 ## 网页授权与无证书通信
 
-浏览器访问的 HTTPS 由反向代理处理，controller 本身提供 HTTP，默认 `127.0.0.1:8080`。网页运行设置中的 `public_url` 是规范的 HTTPS 来源地址，例如 `https://pier.example.com`，不含路径或末尾斜杠；`agent_endpoint` 是服务器实际可连接的 `host:port`，例如 `pier.example.com:7443`。监听地址和公开地址分开配置。未迁移旧公开地址时，首次初始化要求规范 HTTPS Origin 与保留端口的 Host 一致；初始化后固定使用当前生效的来源，不按后续请求或转发头重新推断地址。反向代理示例见 [controller.nginx.conf](../examples/services/controller.nginx.conf)。根据连接模式开放代理 HTTPS，以及 controller 或 agent 的加密 TCP 监听端口；后端 HTTP 应限制在本机或受保护的代理网络。
+controller 本身提供 HTTP，默认监听 `127.0.0.1:8080`。可直接使用 HTTP，或通过可选的 HTTPS 反向代理访问。网页运行设置中的 `public_url` 是规范的 HTTP 或 HTTPS 来源地址，例如 `http://pier.example.com:8080` 或 `https://pier.example.com`，不含路径或末尾斜杠；`agent_endpoint` 是服务器实际可连接的 `host:port`，例如 `pier.example.com:7443`。监听地址和公开地址分开配置。未迁移旧公开地址时，首次初始化要求规范 Origin 与保留端口的 Host 一致，校验协议取自 Origin；初始化后固定使用当前生效的来源，不按后续请求或转发头重新推断地址。反向代理示例见 [controller.nginx.conf](../examples/services/controller.nginx.conf)。根据访问方式开放 Web 端口，以及对应连接模式的 controller 或 agent 加密 TCP 端口。
 
 首次打开 controller 的 `/init` 页面，设置唯一管理员用户名、密码、确认密码和定义仓库，成功后自动登录。已有 YAML 仓库配置迁移后无需重复填写。初始化不需要初始化码，只允许成功一次；后续访问 `/login`。管理员账号和会话保存在 SQLite，密码使用 Argon2id 随机盐哈希；controller 重启不会重新开放初始化。
 
 完整管理控制台使用 React、TypeScript 与 Ant Design，支持运行设置、仓库同步、app/blueprint 声明查看、agent 绑定及变量编辑、创建部署、查询任务和进程状态、接入授权、修改密码。Git 定义仍在仓库中修改。修改密码会使所有浏览器会话失效。
 
-浏览器认证使用 HttpOnly、Secure、SameSite=Strict 的 Cookie，固定 8 小时有效；所有管理 API 写操作校验同源 Origin 和会话 CSRF token。客户端不保存管理员密码或长期管理 token。退出立即撤销当前会话。脚本同样先登录并保存 Cookie，调用示例见 [API 文档](api.md)。
+浏览器认证使用 HttpOnly、SameSite=Strict、Path=/ 的 Cookie，固定 8 小时有效；HTTP 使用 `pier_session`，HTTPS 使用带 Secure 的 `__Host-pier_session`。Cookie 策略以当前生效的公开地址为准；所有管理 API 写操作校验同源 Origin 和会话 CSRF token。客户端不保存管理员密码或长期管理 token。退出立即撤销当前会话。脚本同样先登录并保存 Cookie，调用示例见 [API 文档](api.md)。
 
-agent 授权链接 fragment 只携带请求 ID 和待确认的服务器信息。登录或首次初始化时保留原 fragment，不转为查询参数；登录后仍需点击授权。授权响应包含随机的 256 位配对秘密，10 分钟后失效，复制回终端完成配对；凭据只留在当前页面内存，完成或过期后清除。
+agent 授权链接 fragment 只携带请求 ID 和待确认的服务器信息。登录或首次初始化时保留原 fragment，不转为查询参数；登录后仍需点击授权。授权响应包含随机的 256 位配对秘密，10 分钟后失效，复制回终端完成配对；HTTP 下剪贴板 API 不可用时可手动选中并复制。凭据只留在当前页面内存，完成或过期后清除。
 
 ### 从管理员 Bearer 认证迁移
 
@@ -295,7 +287,7 @@ agent **不进行 HTTPS 连接，也不配置 CA 或证书**。初次连接使�
 
 controller 和 agent 必须一起升级，v2 不接受旧 TLS 连接，也不自动降级。
 
-- controller 将 `https_listen` 替换为 `http_listen`，移除 `tls_cert`、`tls_key`，设置 HTTPS 反向代理；在 Web 初始化或设置页配置 `public_url` 和 `agent_endpoint`。
+- controller 将 `https_listen` 替换为 `http_listen`，移除 `tls_cert`、`tls_key`，直接通过 HTTP 访问或设置可选 HTTPS 反向代理；在 Web 初始化或设置页配置 `public_url` 和 `agent_endpoint`。
 - agent 移除 `ca_cert`、`controller_https`、`controller_server_name`；保留 `agent_id`、`token_file`、`controller_tcp`、`state_dir` 和运行选项。
 - 保留原 token、SQLite 数据、app 用户和数据目录，无需重新注册。Rust 调用方相应更新 `Config` 字段。
 - 安排维护窗口重启双方；agent 本地 app 在 controller 暂时离线期间继续运行。

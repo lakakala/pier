@@ -8,7 +8,7 @@ async function login(page: Page, value = password) {
   await page.getByRole('button', { name: '登录', exact: true }).click();
   await expect(page.getByRole('button', { name: '退出', exact: true })).toBeVisible();
 }
-test.describe.serial('controller console over HTTPS', () => {
+test.describe.serial('controller console', () => {
   let violations: string[] = [];
   test.beforeEach(async ({ page }) => {
     violations = [];
@@ -38,7 +38,7 @@ test.describe.serial('controller console over HTTPS', () => {
     await page.getByRole('button', { name: '运行设置', exact: true }).click();
     await page.getByLabel('Agent 通信监听地址', { exact: true }).fill('127.0.0.1:17444');
     await expect(page.getByLabel('Web 公开地址', { exact: true })).toHaveValue(
-      'https://localhost:8444',
+      test.info().project.use.baseURL!,
     );
     await page.getByLabel('构建并发数', { exact: true }).fill('3');
     await page.getByRole('button', { name: '创建管理员' }).click();
@@ -48,20 +48,24 @@ test.describe.serial('controller console over HTTPS', () => {
     expect(beforeSync.needs_sync).toBe(true);
     const runtime = await (await page.request.get('/v1/settings')).json();
     expect(runtime.active.tcp_listen).toBe('127.0.0.1:17444');
-    expect(runtime.active.agent_endpoint).toBe('localhost:17444');
+    expect(runtime.active.agent_endpoint).toBe(`${new URL(page.url()).hostname}:17444`);
     expect(runtime.active.max_concurrent_builds).toBe(3);
     expect(runtime.agent_listener.listening).toBe(true);
     expect(runtime.restart_required).toBe(false);
-    const cookie = (await context.cookies()).find((c) => c.name === '__Host-pier_session')!;
+    const secure = new URL(page.url()).protocol === 'https:';
+    expect(await page.evaluate(() => window.isSecureContext)).toBe(secure);
+    const cookie = (await context.cookies()).find(
+      (c) => c.name === (secure ? '__Host-pier_session' : 'pier_session'),
+    )!;
     expect(cookie.httpOnly).toBe(true);
-    expect(cookie.secure).toBe(true);
+    expect(cookie.secure).toBe(secure);
     expect(cookie.sameSite).toBe('Strict');
     expect(await page.evaluate(() => document.cookie)).not.toContain('pier_session');
     expect(await page.evaluate(() => Object.keys(localStorage))).toEqual([]);
     expect(
       (
         await page.request.post('/v1/agents', {
-          headers: { Origin: 'https://localhost:8444' },
+          headers: { Origin: test.info().project.use.baseURL! },
           data: { name: 'blocked' },
         })
       ).status(),
@@ -471,7 +475,7 @@ test.describe.serial('controller console over HTTPS', () => {
     const request = {
       request_id: 'a'.repeat(64),
       name: 'enroll-browser',
-      public_url: 'https://localhost:8444',
+      public_url: test.info().project.use.baseURL!,
       info: { hostname: 'test-host', architecture: 'amd64', os_release: 'test-system' },
     };
     const hash = Buffer.from(JSON.stringify(request)).toString('base64url');
@@ -488,9 +492,16 @@ test.describe.serial('controller console over HTTPS', () => {
     await expect(page.getByRole('button', { name: '授权接入' })).toBeVisible();
     await page.getByRole('button', { name: '授权接入' }).click();
     await expect(page.getByLabel('一次性配对凭据')).toHaveValue(/^pier-pair-v2\./);
-    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
-    await page.getByRole('button', { name: '复制配对凭据' }).click();
-    expect(await page.evaluate(() => navigator.clipboard.readText())).toMatch(/^pier-pair-v2\./);
+    if (new URL(page.url()).protocol === 'https:') {
+      await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+      await page.getByRole('button', { name: '复制配对凭据' }).click();
+      expect(await page.evaluate(() => navigator.clipboard.readText())).toMatch(/^pier-pair-v2\./);
+    } else {
+      expect(await page.evaluate(() => navigator.clipboard)).toBeUndefined();
+      await page.getByRole('button', { name: '复制配对凭据' }).click();
+      await expect(page.getByText('请手动选中并复制配对凭据')).toBeVisible();
+      await expect(page.getByLabel('一次性配对凭据')).toHaveValue(/^pier-pair-v2\./);
+    }
     await page.goto('/agent/init#invalid');
     await expect(page.getByRole('button', { name: '授权接入' })).toHaveCount(0);
     await page.goto('/settings');

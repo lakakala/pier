@@ -17,8 +17,35 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const COOKIE: &str = "__Host-pier_session";
 const LIFETIME: u64 = 8 * 60 * 60;
+
+#[derive(Clone, Copy)]
+struct SessionCookie {
+    name: &'static str,
+    secure: bool,
+}
+impl SessionCookie {
+    fn for_origin(origin: &str) -> Result<Self, ApiError> {
+        match origin.split_once("://").map(|(scheme, _)| scheme) {
+            Some("http") => Ok(Self {
+                name: "pier_session",
+                secure: false,
+            }),
+            Some("https") => Ok(Self {
+                name: "__Host-pier_session",
+                secure: true,
+            }),
+            _ => Err(unauthorized()),
+        }
+    }
+    fn header(self, token: &str, max_age: u64) -> String {
+        let secure = if self.secure { "; Secure" } else { "" };
+        format!(
+            "{}={token}; Path=/; HttpOnly{secure}; SameSite=Strict; Max-Age={max_age}",
+            self.name
+        )
+    }
+}
 pub(crate) struct Auth {
     lock: Mutex<()>,
     attempts: Mutex<(Instant, u32)>,
@@ -165,7 +192,7 @@ fn initialization_origin(state: &Controller, headers: &HeaderMap) -> Result<Stri
     let invalid = || {
         ApiError(
             StatusCode::FORBIDDEN,
-            "initialization requires matching HTTPS Origin and Host".into(),
+            "initialization requires matching HTTP(S) Origin and Host".into(),
         )
     };
     if headers.get_all(header::ORIGIN).iter().count() != 1
@@ -182,8 +209,9 @@ fn initialization_origin(state: &Controller, headers: &HeaderMap) -> Result<Stri
         .and_then(|v| v.to_str().ok())
         .ok_or_else(invalid)?;
     let canonical = pier_protocol::enrollment::origin(origin).map_err(|_| invalid())?;
-    let host_origin =
-        pier_protocol::enrollment::origin(&format!("https://{host}")).map_err(|_| invalid())?;
+    let url = url::Url::parse(&canonical).map_err(|_| invalid())?;
+    let host_origin = pier_protocol::enrollment::origin(&format!("{}://{host}", url.scheme()))
+        .map_err(|_| invalid())?;
     if origin != canonical || canonical != host_origin {
         return Err(invalid());
     }
@@ -206,12 +234,12 @@ pub(crate) fn check_write(
     }
     Ok(())
 }
-fn cookie_value(headers: &HeaderMap) -> Option<&str> {
+fn cookie_value(headers: &HeaderMap, policy: SessionCookie) -> Option<&str> {
     let mut found = None;
     for line in headers.get_all(header::COOKIE) {
         for part in line.to_str().ok()?.split(';') {
             if let Some((key, value)) = part.trim().split_once('=') {
-                if key == COOKIE {
+                if key == policy.name {
                     if found.is_some()
                         || value.len() != 64
                         || !value.bytes().all(|c| c.is_ascii_hexdigit())
@@ -236,24 +264,23 @@ fn fresh_session(admin: &Admin) -> (String, WebSession) {
     };
     (token, session)
 }
-fn session_response(token: &str, session: &WebSession) -> Response {
-    let cookie =
-        format!("{COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={LIFETIME}");
+fn session_response(token: &str, session: &WebSession, policy: SessionCookie) -> Response {
+    let cookie = policy.header(token, LIFETIME);
     ([(header::SET_COOKIE, cookie)], Json(session.public())).into_response()
 }
-fn cleared() -> Response {
+fn cleared(policy: SessionCookie) -> Response {
     (
         StatusCode::NO_CONTENT,
-        [(
-            header::SET_COOKIE,
-            format!("{COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"),
-        )],
+        [(header::SET_COOKIE, policy.header("", 0))],
     )
         .into_response()
 }
 impl Controller {
+    fn session_cookie(&self) -> Result<SessionCookie, ApiError> {
+        SessionCookie::for_origin(&self.public_url().ok_or_else(unauthorized)?)
+    }
     pub(crate) fn authenticate(&self, headers: &HeaderMap) -> Result<WebSession, ApiError> {
-        let token = cookie_value(headers).ok_or_else(unauthorized)?;
+        let token = cookie_value(headers, self.session_cookie()?).ok_or_else(unauthorized)?;
         let session: WebSession = self
             .store
             .get("web_sessions", &pier_protocol::hash(token))?
@@ -294,6 +321,8 @@ async fn initialize(
     Json(input): Json<Initialization>,
 ) -> Result<Response, ApiError> {
     let origin = initialization_origin(&state, &headers)?;
+    // Capture the policy before taking settings/runtime write locks below.
+    let cookie = SessionCookie::for_origin(&origin)?;
     if state.store.get::<Admin>("auth", "admin")?.is_some() {
         return Err(conflict("already initialized"));
     }
@@ -355,7 +384,7 @@ async fn initialize(
     *settings = updated;
     *state.runtime.write().unwrap() = Some(active);
     state.install_listener(listener);
-    Ok(session_response(&token, &session))
+    Ok(session_response(&token, &session, cookie))
 }
 async fn login(
     State(state): State<Arc<Controller>>,
@@ -363,6 +392,7 @@ async fn login(
     Json(input): Json<Credentials>,
 ) -> Result<Response, ApiError> {
     check_origin(&state, &headers)?;
+    let cookie = state.session_cookie()?;
     if input.password.len() > 1024 || input.username.len() > 64 {
         return Err(unauthorized());
     }
@@ -390,7 +420,7 @@ async fn login(
         return Err(unauthorized());
     }
     // A successful login rotates the browser's existing session.
-    if let Some(token) = cookie_value(&headers) {
+    if let Some(token) = cookie_value(&headers, cookie) {
         state.terminals.revoke_owner(&pier_protocol::hash(token));
         state
             .store
@@ -398,7 +428,7 @@ async fn login(
     }
     let (token, session) = fresh_session(&admin);
     state.store.put("web_sessions", &session.digest, &session)?;
-    Ok(session_response(&token, &session))
+    Ok(session_response(&token, &session, cookie))
 }
 pub(crate) async fn session(
     State(state): State<Arc<Controller>>,
@@ -410,17 +440,19 @@ pub(crate) async fn logout(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let cookie = state.session_cookie()?;
     let _lock = state.auth.lock.lock().unwrap();
     let session = state.authenticate(&headers)?;
     state.store.delete("web_sessions", &session.digest)?;
     state.terminals.revoke_owner(&session.digest);
-    Ok(cleared())
+    Ok(cleared(cookie))
 }
 pub(crate) async fn password(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
     Json(input): Json<PasswordChange>,
 ) -> Result<Response, ApiError> {
+    let cookie = state.session_cookie()?;
     validate_password(&input.new_password)?;
     if input.current_password.len() > 1024 {
         return Err(unauthorized());
@@ -453,7 +485,7 @@ pub(crate) async fn password(
         },
     )?;
     state.terminals.revoke_all();
-    Ok(cleared())
+    Ok(cleared(cookie))
 }
 
 #[cfg(test)]

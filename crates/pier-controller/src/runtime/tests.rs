@@ -87,7 +87,7 @@ async fn edits_require_auth_are_atomic_and_apply_only_on_restart() {
         json!({"tcp_listen":"127.0.0.1:0"}),
         json!({"max_concurrent_builds":0}),
         json!({"max_concurrent_builds":65}),
-        json!({"public_url":"http://bad.test"}),
+        json!({"public_url":"ftp://bad.test"}),
         json!({"agent_endpoint":"missing-port"}),
         json!({"build_proxy":{"http_proxy":"http://proxy.test/path"}}),
     ] {

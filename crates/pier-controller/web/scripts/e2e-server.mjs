@@ -4,6 +4,8 @@ import { join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
+const scheme = process.env.PIER_E2E_SCHEME ?? 'https';
+if (!['http', 'https'].includes(scheme)) throw new Error('PIER_E2E_SCHEME must be http or https');
 const root = resolve(import.meta.dirname, '../../../../');
 const temporary = mkdtempSync(join(tmpdir(), 'pier-web-e2e-'));
 const repository = join(temporary, 'repo');
@@ -49,95 +51,100 @@ writeFileSync(
 http_listen: 127.0.0.1:18084
 `,
 );
-execFileSync(
-  'openssl',
-  [
-    'req',
-    '-x509',
-    '-newkey',
-    'rsa:2048',
-    '-nodes',
-    '-days',
-    '1',
-    '-subj',
-    '/CN=localhost',
-    '-addext',
-    'subjectAltName=DNS:localhost',
-    '-keyout',
-    join(temporary, 'key.pem'),
-    '-out',
-    join(temporary, 'cert.pem'),
-  ],
-  { stdio: 'ignore' },
-);
+if (scheme === 'https') {
+  execFileSync(
+    'openssl',
+    [
+      'req',
+      '-x509',
+      '-newkey',
+      'rsa:2048',
+      '-nodes',
+      '-days',
+      '1',
+      '-subj',
+      '/CN=localhost',
+      '-addext',
+      'subjectAltName=DNS:localhost',
+      '-keyout',
+      join(temporary, 'key.pem'),
+      '-out',
+      join(temporary, 'cert.pem'),
+    ],
+    { stdio: 'ignore' },
+  );
+}
 const controller = spawn(
   join(root, 'target/debug/pier-controller'),
   ['--config', join(temporary, 'controller.yml')],
   { stdio: ['ignore', 'inherit', 'inherit'] },
 );
-const proxy = https.createServer(
-  {
-    key: readFileSync(join(temporary, 'key.pem')),
-    cert: readFileSync(join(temporary, 'cert.pem')),
-  },
-  (req, res) => {
-    const upstream = http.request(
-      { host: '127.0.0.1', port: 18084, path: req.url, method: req.method, headers: req.headers },
-      (response) => {
-        res.writeHead(response.statusCode, response.headers);
-        response.pipe(res);
-      },
-    );
-    upstream.on('error', () => {
-      res.writeHead(502);
-      res.end();
+let proxy;
+if (scheme === 'https') {
+  proxy = https.createServer(
+    {
+      key: readFileSync(join(temporary, 'key.pem')),
+      cert: readFileSync(join(temporary, 'cert.pem')),
+    },
+    (req, res) => {
+      const upstream = http.request(
+        { host: '127.0.0.1', port: 18084, path: req.url, method: req.method, headers: req.headers },
+        (response) => {
+          res.writeHead(response.statusCode, response.headers);
+          response.pipe(res);
+        },
+      );
+      upstream.on('error', () => {
+        res.writeHead(502);
+        res.end();
+      });
+      req.pipe(upstream);
+    },
+  );
+  proxy.listen(8444, '127.0.0.1');
+  proxy.on('upgrade', (req, socket, head) => {
+    const upstream = http.request({
+      host: '127.0.0.1',
+      port: 18084,
+      path: req.url,
+      method: req.method,
+      headers: req.headers,
     });
-    req.pipe(upstream);
-  },
-);
-proxy.listen(8444, '127.0.0.1');
-proxy.on('upgrade', (req, socket, head) => {
-  const upstream = http.request({
-    host: '127.0.0.1',
-    port: 18084,
-    path: req.url,
-    method: req.method,
-    headers: req.headers,
+    upstream.on('upgrade', (response, peer, upstreamHead) => {
+      socket.write(
+        `HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\n` +
+          Object.entries(response.headers)
+            .map(([key, value]) => `${key}: ${value}\r\n`)
+            .join('') +
+          '\r\n',
+      );
+      if (head.length) peer.write(head);
+      if (upstreamHead.length) socket.write(upstreamHead);
+      socket.pipe(peer).pipe(socket);
+      socket.on('error', () => peer.destroy());
+      peer.on('error', () => socket.destroy());
+      socket.on('close', () => peer.destroy());
+      peer.on('close', () => socket.destroy());
+    });
+    upstream.on('response', (response) => {
+      response.resume();
+      socket.end(`HTTP/1.1 ${response.statusCode} Rejected\r\nConnection: close\r\n\r\n`);
+    });
+    upstream.on('error', () => socket.destroy());
+    upstream.end();
   });
-  upstream.on('upgrade', (response, peer, upstreamHead) => {
-    socket.write(
-      `HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\n` +
-        Object.entries(response.headers)
-          .map(([key, value]) => `${key}: ${value}\r\n`)
-          .join('') +
-        '\r\n',
-    );
-    if (head.length) peer.write(head);
-    if (upstreamHead.length) socket.write(upstreamHead);
-    socket.pipe(peer).pipe(socket);
-    socket.on('error', () => peer.destroy());
-    peer.on('error', () => socket.destroy());
-    socket.on('close', () => peer.destroy());
-    peer.on('close', () => socket.destroy());
-  });
-  upstream.on('response', (response) => {
-    response.resume();
-    socket.end(`HTTP/1.1 ${response.statusCode} Rejected\r\nConnection: close\r\n\r\n`);
-  });
-  upstream.on('error', () => socket.destroy());
-  upstream.end();
-});
+}
 let stopping = false;
 function stop() {
   if (stopping) return;
   stopping = true;
-  proxy.close();
+  proxy?.close();
   controller.kill('SIGTERM');
 }
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
 controller.on('exit', (code) => {
-  proxy.close();
+  proxy?.close();
   rmSync(temporary, { recursive: true, force: true });
   rmSync(join(root, 'target/web-e2e-repository.txt'), { force: true });
   process.exit(stopping ? 0 : code || 1);

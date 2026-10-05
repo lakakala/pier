@@ -82,8 +82,8 @@ export function RuntimeFields({
         rules={[{ required: true, whitespace: true }, { max: 4096 }]}
         extra={
           initialization
-            ? '首次初始化须与当前 HTTPS 访问来源一致，不含路径或末尾斜杠。'
-            : '重启后请使用此 HTTPS 地址访问控制台。'
+            ? '支持 HTTP 和 HTTPS；首次初始化须与当前访问来源一致，不含路径或末尾斜杠。'
+            : '支持 HTTP 和 HTTPS；重启后请使用此地址访问控制台。'
         }
       >
         <Input autoComplete="off" />

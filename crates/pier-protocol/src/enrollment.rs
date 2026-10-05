@@ -115,14 +115,14 @@ pub struct Credentials {
 pub fn origin(value: &str) -> Result<String> {
     let url = url::Url::parse(value)?;
     ensure!(
-        url.scheme() == "https"
+        matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
             && url.path() == "/",
-        "enter an HTTPS origin, e.g. https://pier.example.com"
+        "enter an HTTP or HTTPS origin, e.g. http://pier.example.com:8080"
     );
     Ok(url.origin().ascii_serialization())
 }
@@ -175,10 +175,13 @@ mod tests {
         pairing.expires_at = 0;
         assert!(Pairing::decode(&pairing.encode().unwrap(), &request).is_err());
         for bad in [
-            "http://example.test",
+            "ftp://example.test",
             "https://user@example.test",
+            "http://user:password@example.test",
             "https://example.test/path",
+            "http://example.test/path",
             "https://example.test?secret=x",
+            "http://example.test#fragment",
         ] {
             assert!(origin(bad).is_err());
         }
@@ -189,6 +192,38 @@ mod tests {
             "example.test:0",
         ] {
             assert!(endpoint(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn http_and_https_origins_preserve_scheme_and_nondefault_ports() {
+        for (input, expected) in [
+            ("http://example.test:80/", "http://example.test"),
+            ("https://example.test:443/", "https://example.test"),
+            ("http://example.test:8080", "http://example.test:8080"),
+            ("https://example.test:8443", "https://example.test:8443"),
+            ("http://[::1]:8080", "http://[::1]:8080"),
+            ("https://[::1]:8443", "https://[::1]:8443"),
+        ] {
+            assert_eq!(origin(input).unwrap(), expected);
+            let request = InitRequest {
+                connection_mode: ConnectionMode::default(),
+                listen: None,
+                request_id: crate::new_token(),
+                name: "host".into(),
+                public_url: expected.into(),
+                info: crate::AgentInfo {
+                    architecture: pier_pkg::Architecture::Amd64,
+                    hostname: "host".into(),
+                    os_release: String::new(),
+                },
+            };
+            assert!(
+                request
+                    .link()
+                    .unwrap()
+                    .starts_with(&format!("{expected}/agent/init#"))
+            );
         }
     }
 }

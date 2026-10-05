@@ -67,35 +67,39 @@ async fn json_body(response: Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
 }
 pub(crate) async fn initialize(router: &Router) -> (String, Value) {
+    initialize_at(router, "https://pier.example.test").await
+}
+async fn initialize_at(router: &Router, origin: &str) -> (String, Value) {
     let response = send(
         router,
         "POST",
         "/v1/auth/init",
         "",
         "",
-        "https://pier.example.test",
+        origin,
         Some(json!({"username":"admin","password":"test-password-123"})),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let cookie = response.headers()[header::SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .to_string();
-    for attribute in [
-        "HttpOnly",
-        "Secure",
-        "SameSite=Strict",
-        "Path=/",
-        "Max-Age=28800",
-    ] {
-        assert!(cookie.contains(attribute));
+    let cookie = response_cookie(&response, origin, LIFETIME);
+    (cookie, json_body(response).await)
+}
+fn response_cookie(response: &Response, origin: &str, max_age: u64) -> String {
+    let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+    let attributes: Vec<_> = cookie.split("; ").collect();
+    for attribute in ["HttpOnly", "SameSite=Strict", "Path=/"] {
+        assert!(attributes.contains(&attribute));
     }
+    assert!(attributes.contains(&format!("Max-Age={max_age}").as_str()));
+    let secure = origin.starts_with("https://");
+    assert_eq!(attributes.contains(&"Secure"), secure);
+    assert!(cookie.starts_with(if secure {
+        "__Host-pier_session="
+    } else {
+        "pier_session="
+    }));
     assert!(!cookie.contains("Domain="));
-    (
-        cookie.split(';').next().unwrap().to_string(),
-        json_body(response).await,
-    )
+    attributes[0].to_string()
 }
 #[tokio::test]
 async fn first_initialization_is_atomic_and_sessions_survive_restart() {
@@ -168,10 +172,17 @@ async fn first_initialization_is_atomic_and_sessions_survive_restart() {
 }
 #[tokio::test]
 async fn origin_csrf_and_cookie_are_required_and_bearer_is_rejected() {
+    for origin in ["http://pier.example.test:8080", "https://pier.example.test"] {
+        origin_csrf_and_cookie_are_required_and_bearer_is_rejected_at(origin).await;
+    }
+}
+async fn origin_csrf_and_cookie_are_required_and_bearer_is_rejected_at(origin: &str) {
     let root = tempfile::tempdir().unwrap();
-    let state = Controller::open(config(root.path())).unwrap();
+    let mut cfg = config(root.path());
+    cfg.public_url = origin.into();
+    let state = Controller::open(cfg).unwrap();
     let router = crate::api::router(state);
-    for origin in ["", "https://evil.test"] {
+    for bad_origin in ["", "https://evil.test"] {
         assert_eq!(
             send(
                 &router,
@@ -179,7 +190,7 @@ async fn origin_csrf_and_cookie_are_required_and_bearer_is_rejected() {
                 "/v1/auth/init",
                 "",
                 "",
-                origin,
+                bad_origin,
                 Some(json!({"username":"admin","password":"test-password-123"}))
             )
             .await
@@ -187,14 +198,14 @@ async fn origin_csrf_and_cookie_are_required_and_bearer_is_rejected() {
             StatusCode::FORBIDDEN
         );
     }
-    let (cookie, session) = initialize(&router).await;
+    let (cookie, session) = initialize_at(&router, origin).await;
     let csrf = session["csrf_token"].as_str().unwrap();
     for (c, token, origin, status) in [
-        ("", csrf, "https://pier.example.test", 401),
-        (&*cookie, "", "https://pier.example.test", 403),
+        ("", csrf, origin, 401),
+        (&*cookie, "", origin, 403),
         (&*cookie, csrf, "", 403),
         (&*cookie, csrf, "https://evil.test", 403),
-        (&*cookie, csrf, "https://pier.example.test", 200),
+        (&*cookie, csrf, origin, 200),
     ] {
         assert_eq!(
             send(
@@ -234,10 +245,17 @@ async fn origin_csrf_and_cookie_are_required_and_bearer_is_rejected() {
 }
 #[tokio::test]
 async fn login_rotates_logout_revokes_and_password_invalidates_all_sessions() {
+    for origin in ["http://pier.example.test:8080", "https://pier.example.test"] {
+        login_rotates_logout_revokes_and_password_invalidates_all_sessions_at(origin).await;
+    }
+}
+async fn login_rotates_logout_revokes_and_password_invalidates_all_sessions_at(origin: &str) {
     let root = tempfile::tempdir().unwrap();
-    let state = Controller::open(config(root.path())).unwrap();
+    let mut cfg = config(root.path());
+    cfg.public_url = origin.into();
+    let state = Controller::open(cfg).unwrap();
     let router = crate::api::router(state);
-    let (cookie, session) = initialize(&router).await;
+    let (cookie, session) = initialize_at(&router, origin).await;
     assert_eq!(
         send(
             &router,
@@ -245,7 +263,7 @@ async fn login_rotates_logout_revokes_and_password_invalidates_all_sessions() {
             "/v1/auth/login",
             "",
             "",
-            "https://pier.example.test",
+            origin,
             Some(json!({"username":"admin","password":"wrong"}))
         )
         .await
@@ -258,18 +276,12 @@ async fn login_rotates_logout_revokes_and_password_invalidates_all_sessions() {
         "/v1/auth/login",
         &cookie,
         "",
-        "https://pier.example.test",
+        origin,
         Some(json!({"username":"admin","password":"test-password-123"})),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let rotated = response.headers()[header::SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let rotated = response_cookie(&response, origin, LIFETIME);
     let rotated_session = json_body(response).await;
     assert_ne!(cookie, rotated);
     assert_eq!(
@@ -284,28 +296,23 @@ async fn login_rotates_logout_revokes_and_password_invalidates_all_sessions() {
         "/v1/auth/login",
         "",
         "",
-        "https://pier.example.test",
+        origin,
         Some(json!({"username":"admin","password":"test-password-123"})),
     )
     .await;
-    let other = response.headers()[header::SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let other = response_cookie(&response, origin, LIFETIME);
     let response = send(
         &router,
         "POST",
         "/v1/auth/password",
         &rotated,
         rotated_session["csrf_token"].as_str().unwrap(),
-        "https://pier.example.test",
+        origin,
         Some(json!({"current_password":"test-password-123","new_password":"new-password-456"})),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    response_cookie(&response, origin, 0);
     assert!(
         response.headers()[header::SET_COOKIE]
             .to_str()
@@ -326,40 +333,133 @@ async fn login_rotates_logout_revokes_and_password_invalidates_all_sessions() {
         "/v1/auth/login",
         "",
         "",
-        "https://pier.example.test",
+        origin,
         Some(json!({"username":"admin","password":"new-password-456"})),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let current = response.headers()[header::SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let current = response_cookie(&response, origin, LIFETIME);
     let current_session = json_body(response).await;
     assert_ne!(session["csrf_token"], current_session["csrf_token"]);
-    assert_eq!(
-        send(
-            &router,
-            "POST",
-            "/v1/auth/logout",
-            &current,
-            current_session["csrf_token"].as_str().unwrap(),
-            "https://pier.example.test",
-            None
-        )
-        .await
-        .status(),
-        StatusCode::NO_CONTENT
-    );
+    let response = send(
+        &router,
+        "POST",
+        "/v1/auth/logout",
+        &current,
+        current_session["csrf_token"].as_str().unwrap(),
+        origin,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    response_cookie(&response, origin, 0);
     assert_eq!(
         send(&router, "GET", "/v1/agents", &current, "", "", None)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn cookie_and_websocket_policy_change_only_when_public_origin_becomes_active() {
+    for (origin, next) in [
+        ("https://pier.example.test", "http://pier.example.test:8080"),
+        ("http://pier.example.test:8080", "https://pier.example.test"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path());
+        cfg.public_url = origin.into();
+        let state = Controller::open(cfg.clone()).unwrap();
+        let router = crate::api::router(state.clone());
+        let (cookie, session) = initialize_at(&router, origin).await;
+        let credentials = json!({"username":"admin", "password":"test-password-123"});
+        let response = send(
+            &router,
+            "PUT",
+            "/v1/settings",
+            &cookie,
+            session["csrf_token"].as_str().unwrap(),
+            origin,
+            Some(json!({"public_url":next})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.public_url().as_deref(), Some(origin));
+        let response = send(
+            &router,
+            "POST",
+            "/v1/auth/login",
+            "",
+            "",
+            origin,
+            Some(credentials.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response_cookie(&response, origin, LIFETIME);
+        assert_eq!(
+            send(
+                &router,
+                "POST",
+                "/v1/auth/login",
+                "",
+                "",
+                next,
+                Some(credentials.clone())
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        drop(router);
+        drop(state);
+        let state = Controller::open(cfg).unwrap();
+        assert_eq!(state.public_url().as_deref(), Some(next));
+        let router = crate::api::router(state);
+        assert_eq!(
+            send(&router, "GET", "/v1/auth/session", &cookie, "", "", None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Forwarding headers never override the configured Cookie policy.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ORIGIN, next)
+                    .header(
+                        "x-forwarded-proto",
+                        if next.starts_with("http:") {
+                            "https"
+                        } else {
+                            "http"
+                        },
+                    )
+                    .body(Body::from(credentials.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response_cookie(&response, next, LIFETIME);
+        assert_eq!(
+            send(&router, "GET", "/v1/auth/session", &cookie, "", "", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let response = send(&router, "GET", "/login", "", "", "", None).await;
+        let csp = response.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap();
+        let websocket_origin = next.replacen("http", "ws", 1);
+        assert!(csp.contains(&format!("connect-src 'self' {websocket_origin};")));
+    }
 }
 #[tokio::test]
 async fn expired_sessions_are_rejected_and_auth_work_is_bounded() {
@@ -554,7 +654,14 @@ async fn spa_routes_assets_and_security_headers_do_not_mask_api_errors() {
 
 #[tokio::test]
 async fn browser_bootstrap_persists_repository_origin_and_ipv6_endpoint_without_fetching() {
-    for origin in ["https://pier.example.test:8443", "https://[::1]:8443"] {
+    for origin in [
+        "http://pier.example.test",
+        "http://pier.example.test:8080",
+        "http://[::1]:8080",
+        "https://pier.example.test",
+        "https://pier.example.test:8443",
+        "https://[::1]:8443",
+    ] {
         let root = tempfile::tempdir().unwrap();
         let mut cfg = config(root.path());
         cfg.public_url.clear();
@@ -565,7 +672,10 @@ async fn browser_bootstrap_persists_repository_origin_and_ipv6_endpoint_without_
         let body = json!({"username":"admin","password":"test-password-123", "repository":{"url":"https://example.invalid/repo.git"}});
         for (sent_origin, host) in [
             (origin, "evil.test"),
-            ("http://pier.example.test", "pier.example.test"),
+            (origin, "pier.example.test:1"),
+            ("ftp://pier.example.test", "pier.example.test"),
+            ("", "pier.example.test"),
+            (origin, ""),
         ] {
             let response = router
                 .clone()
@@ -591,13 +701,14 @@ async fn browser_bootstrap_persists_repository_origin_and_ipv6_endpoint_without_
                     .uri("/v1/auth/init")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::ORIGIN, origin)
-                    .header(header::HOST, origin.strip_prefix("https://").unwrap())
+                    .header(header::HOST, origin.split_once("://").unwrap().1)
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        response_cookie(&response, origin, LIFETIME);
         assert_eq!(state.public_url().as_deref(), Some(origin));
         assert_eq!(
             state.agent_endpoint().unwrap(),

@@ -30,7 +30,7 @@ impl RuntimeSettings {
         if initialized || !self.public_url.is_empty() {
             ensure!(
                 pier_protocol::enrollment::origin(&self.public_url)? == self.public_url,
-                "public_url must be a canonical HTTPS origin"
+                "public_url must be a canonical HTTP or HTTPS origin"
             );
         }
         if initialized || !self.agent_endpoint.is_empty() {
@@ -105,7 +105,7 @@ impl RuntimePatch {
             }
             ensure!(
                 value.public_url == origin,
-                "public_url must match the initialization HTTPS origin"
+                "public_url must match the initialization origin"
             );
             if value.agent_endpoint.is_empty() {
                 let url = url::Url::parse(origin)?;

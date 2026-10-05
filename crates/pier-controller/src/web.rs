@@ -63,7 +63,11 @@ pub(crate) async fn serve(
     if page {
         let websocket_origin = state
             .public_url()
-            .map(|origin| origin.replacen("https://", "wss://", 1))
+            .map(|origin| {
+                origin
+                    .replacen("https://", "wss://", 1)
+                    .replacen("http://", "ws://", 1)
+            })
             .unwrap_or_default();
         response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, format!("default-src 'none'; script-src 'self'; style-src 'self' 'nonce-{nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' {websocket_origin}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'").parse().unwrap());
     }

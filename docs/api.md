@@ -1,19 +1,19 @@
 # pier-controller HTTP API
 
-本文描述 controller 当前实现的 HTTP 接口。HTTP 服务默认监听 `127.0.0.1:8080`，对外通过 HTTPS 反向代理访问；示例使用 `https://pier.example.com`。agent 的控制连接、凭据兑换和日常部署包下载使用独立的 Noise 加密 TCP 连接。
+本文描述 controller 当前实现的 HTTP 接口。HTTP 服务默认监听 `127.0.0.1:8080`，支持直接 HTTP 访问，也可通过 HTTPS 反向代理访问；示例使用 `http://pier.example.com:8080`。远程直连时需将 `http_listen` 配置为服务器可达的监听地址。agent 的控制连接、凭据兑换和日常部署包下载使用独立的 Noise 加密 TCP 连接。
 
 ## 请求与响应约定
 
-管理接口统一使用登录后由服务器设置的 `__Host-pier_session` Cookie，不接受管理员 Bearer token。制品下载接口仍使用部署所属 agent 的 Bearer token。
+管理接口使用登录后由服务器设置的 Cookie：HTTP 为 `pier_session`，HTTPS 为 `__Host-pier_session`，不接受管理员 Bearer token。制品下载接口仍使用部署所属 agent 的 Bearer token。
 
 首次打开 `/init` 设置管理员、密码、定义仓库和运行设置，成功后自动登录并立即启用 agent 通信。启动 YAML 只需 `http_listen` 和 `state_dir`；其他设置保存在 SQLite。运行设置以后通过 `/v1/settings` 修改，手动重启后生效；仓库地址和分支独立保存，定义仅手动同步。初始化不需要初始化码，只允许成功一次；重启不会重新开放初始化。后续登录使用 `/login`。
 
-Cookie 设置 `HttpOnly; Secure; SameSite=Strict; Path=/`，没有 Domain，有效期固定为 8 小时。所有管理写请求必须携带与当前生效的 `public_url` 完全一致的 `Origin`，以及当前会话返回的 `X-CSRF-Token`。初始化和登录尚无会话，只校验来源；未迁移旧公开地址的首次初始化要求规范 HTTPS Origin 与保留端口的 Host 相符，并原子保存该来源。修改公开地址后，重启前仍校验旧来源，重启后校验新来源；GET 查询无需 CSRF。旧 YAML 运行字段仅迁移一次，此后不覆盖网页配置。禁止跨源访问，浏览器经同源 HTTPS 反向代理使用页面和 API。
+Cookie 均设置 `HttpOnly; SameSite=Strict; Path=/`，HTTPS 额外设置 `Secure`；没有 Domain，有效期固定为 8 小时。Cookie 的名称、签发、读取及清除策略由当前生效的 `public_url` 决定，不使用转发头推断协议。所有管理写请求必须携带与当前生效的 `public_url` 完全一致的 `Origin`，以及当前会话返回的 `X-CSRF-Token`。初始化和登录尚无会话，只校验来源；未迁移旧公开地址的首次初始化要求规范 HTTP 或 HTTPS Origin 与保留端口的 Host 相符，并原子保存该来源。修改公开地址后，重启前仍校验旧来源，重启后校验新来源及相应的 Cookie；HTTP 与 HTTPS 切换后需重新登录。GET 查询无需 CSRF。旧 YAML 运行字段仅迁移一次，此后不覆盖网页配置。禁止跨源访问，浏览器通过同源 HTTP 或 HTTPS 使用页面和 API。
 
 以下 curl 示例使用 Cookie jar，登录示例还需要 `jq`：
 
 ```sh
-CONTROLLER_URL='https://pier.example.com'
+CONTROLLER_URL='http://pier.example.com:8080'
 umask 077
 COOKIE_JAR=$(mktemp)
 # AGENT_ID、DEPLOYMENT_ID 和 ENROLLMENT_ID 使用接口实际返回的值。
@@ -99,7 +99,7 @@ JSON 语法、字段类型、Content-Type、查询参数解码或请求体大小
 
 ### GET /v1/terminals/{id}/ws
 
-浏览器将相对地址转为同源 `wss://` URL，Cookie 自动携带，握手必须提供匹配公开地址的 `Origin`。此 GET 不需要 CSRF header，使用前一步经过 CSRF 校验的一次性资格；其他登录会话不能使用它。过期或重复连接返回 `409`，不同拥有者返回 `404`。握手后 agent 连接和 Bash 初始化分别有 10 秒超时。
+浏览器将相对地址转为同源 WebSocket URL，HTTP 使用 `ws://`、HTTPS 使用 `wss://`，Cookie 自动携带，握手必须提供匹配公开地址的 `Origin`。此 GET 不需要 CSRF header，使用前一步经过 CSRF 校验的一次性资格；其他登录会话不能使用它。过期或重复连接返回 `409`，不同拥有者返回 `404`。握手后 agent 连接和 Bash 初始化分别有 10 秒超时。
 
 | 方向 | 帧 | 内容 |
 | --- | --- | --- |
@@ -149,7 +149,7 @@ Bash 使用 app 的 UID/GID，以 `bash -il` 进入账户主目录，提供基�
   "repository": {"url": "https://git.example.com/services.git", "reference": "main"},
   "settings": {
     "tcp_listen": "0.0.0.0:7443",
-    "public_url": "https://pier.example.com",
+    "public_url": "http://pier.example.com:8080",
     "agent_endpoint": "pier.example.com:7443",
     "max_concurrent_builds": 2,
     "build_proxy": {}
@@ -157,9 +157,9 @@ Bash 使用 app 的 UID/GID，以 `bash -il` 进入账户主目录，提供基�
 }
 ```
 
-`reference` 默认 `main`；`repository` 在已导入旧 YAML 仓库配置时可省略，否则必填。`settings` 及其字段可省略，保留默认值或迁移值；字段格式见下文运行设置。未指定公开地址时采用当前 HTTPS Origin，提交值必须与该来源相同。未指定 agent 公布地址时采用该来源主机及 `tcp_listen` 端口。用户名为 1–64 字节，无首尾空白和控制字符；密码至少 12 个字符、最多 1024 字节，不裁剪空白。确认密码由页面校验，不是 API 字段。密码使用随机盐 Argon2id 哈希保存。
+`reference` 默认 `main`；`repository` 在已导入旧 YAML 仓库配置时可省略，否则必填。`settings` 及其字段可省略，保留默认值或迁移值；字段格式见下文运行设置。未指定公开地址时采用当前 HTTP 或 HTTPS Origin，提交值必须与该来源相同。未指定 agent 公布地址时采用该来源主机及 `tcp_listen` 端口。用户名为 1–64 字节，无首尾空白和控制字符；密码至少 12 个字符、最多 1024 字节，不裁剪空白。确认密码由页面校验，不是 API 字段。密码使用随机盐 Argon2id 哈希保存。
 
-需携带 `Origin`。未迁移旧公开地址时还要求 Host 与 HTTPS Origin 匹配（含非默认端口），反向代理使用 `proxy_set_header Host $http_host`。先绑定 agent 监听端口，再将管理员、会话、仓库及运行设置在同一事务中保存，成功后立即启用监听，无需重启。端口不可用返回 `409 agent listener unavailable; check its address, port and permissions`，不留下部分初始化数据，可修正参数重试。此请求不访问 Git，成功后需手动同步。成功设置 Cookie，返回与登录相同的会话结构；重复或并发初始化只有一个请求成功，其余返回 `409 already initialized`。未知字段或格式错误由请求解析器拒绝。
+需携带 `Origin`。未迁移旧公开地址时还要求 Host 与 HTTP 或 HTTPS Origin 匹配（含非默认端口），反向代理使用 `proxy_set_header Host $http_host`。先绑定 agent 监听端口，再将管理员、会话、仓库及运行设置在同一事务中保存，成功后立即启用监听，无需重启。端口不可用返回 `409 agent listener unavailable; check its address, port and permissions`，不留下部分初始化数据，可修正参数重试。此请求不访问 Git，成功后需手动同步。成功设置 Cookie，返回与登录相同的会话结构；重复或并发初始化只有一个请求成功，其余返回 `409 already initialized`。未知字段或格式错误由请求解析器拒绝。
 
 ### POST /v1/auth/login
 
@@ -225,14 +225,14 @@ curl --fail-with-body -X POST "$CONTROLLER_URL/v1/auth/logout" \
 {
   "active": {
     "tcp_listen": "0.0.0.0:7443",
-    "public_url": "https://pier.example.com",
+    "public_url": "http://pier.example.com:8080",
     "agent_endpoint": "pier.example.com:7443",
     "max_concurrent_builds": 2,
     "build_proxy": {"http_proxy": null, "https_proxy": null, "no_proxy": null}
   },
   "saved": {
     "tcp_listen": "0.0.0.0:7443",
-    "public_url": "https://pier.example.com",
+    "public_url": "http://pier.example.com:8080",
     "agent_endpoint": "pier.example.com:7443",
     "max_concurrent_builds": 4,
     "build_proxy": {"http_proxy": null, "https_proxy": null, "no_proxy": null}
@@ -264,7 +264,7 @@ curl --fail-with-body -X POST "$CONTROLLER_URL/v1/auth/logout" \
 | 字段 | 约束 |
 | --- | --- |
 | `tcp_listen` | IP 与端口，IPv6 使用 `[::]:7443`；端口为 1–65535 |
-| `public_url` | 规范 HTTPS 来源，不能包含路径、查询、fragment 或末尾斜杠 |
+| `public_url` | 规范 HTTP 或 HTTPS 来源，不能包含路径、查询、fragment 或末尾斜杠 |
 | `agent_endpoint` | 非空 `host:port`；IPv6 主机用方括号包裹 |
 | `max_concurrent_builds` | 整数 1–64 |
 | `build_proxy` | 代理对象；HTTP/HTTPS URL 最多 4096 字节，使用 `http://` 或 `https://`，不可带路径、查询、fragment 或控制字符；`no_proxy` 最多 4096 字节，无控制字符 |
@@ -776,7 +776,7 @@ curl --fail-with-body "$CONTROLLER_URL/v1/deployments/$DEPLOYMENT_ID" \
 
 交互初始化流程：
 
-1. `pier-agent init` 生成请求 ID 和服务器信息，并输出 `https://pier.example.com/agent/init#<base64url(JSON)>`。fragment 包含下文的请求对象。
+1. `pier-agent init` 生成请求 ID 和服务器信息，并输出 `http://pier.example.com:8080/agent/init#<base64url(JSON)>`。fragment 包含下文的请求对象。
 2. 管理员在浏览器登录后核对服务器信息；页面使用 Cookie 和 CSRF 调用 `POST /v1/enrollments` 获取一次性配对凭据。
 3. 用户将配对凭据粘贴回终端。agent 通过 Noise 加密 TCP 兑换长期身份，保存配置后确认完成；兑换和确认没有 HTTP 接口。
 4. 页面可用 `GET /v1/enrollments/{id}` 查询进度；agent 启动后出现在 agent 列表中。
@@ -793,7 +793,7 @@ curl --fail-with-body "$CONTROLLER_URL/v1/deployments/$DEPLOYMENT_ID" \
 | `agent_endpoint` | string | 被动模式必填，管理员在 Web 填写 controller 可达的 agent host:port；主动模式禁止 |
 | `agent_proxy` | string / null | 被动模式可配置 SOCKS5；省略保留，`null` 清除，字符串替换；主动模式禁止设置代理 |
 | `name` | string | 去除首尾空白后非空，不含控制字符，最多 256 字节 |
-| `public_url` | string | 必须等于 controller 配置的规范 HTTPS 来源地址，不含路径、查询、fragment 或末尾斜杠 |
+| `public_url` | string | 必须等于 controller 配置的规范 HTTP 或 HTTPS 来源地址，不含路径、查询、fragment 或末尾斜杠 |
 | `info.architecture` | string | `amd64` 或 `arm64` |
 | `info.hostname` | string | 最多 256 字节 |
 | `info.os_release` | string | 最多 8192 字节 |
@@ -804,7 +804,7 @@ curl --fail-with-body "$CONTROLLER_URL/v1/deployments/$DEPLOYMENT_ID" \
 {
   "request_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "name": "web-01",
-  "public_url": "https://pier.example.com",
+  "public_url": "http://pier.example.com:8080",
   "info": {
     "architecture": "amd64",
     "hostname": "web-01",
@@ -870,7 +870,7 @@ curl --fail-with-body "$CONTROLLER_URL/v1/enrollments/$ENROLLMENT_ID" \
 
 ### GET /v1/artifacts/{deployment}/{app}
 
-使用该部署目标 agent 的 token 下载自己的 tar.gz 包。管理员登录 Cookie 和其他 agent 的 token 均不能替代它。agent 日常下载使用加密 TCP，此 HTTP 接口保留供兼容客户端通过受保护的 HTTPS 反向代理调用。
+使用该部署目标 agent 的 token 下载自己的 tar.gz 包。管理员登录 Cookie 和其他 agent 的 token 均不能替代它。agent 日常下载使用加密 TCP，此 HTTP 接口保留供兼容客户端通过 HTTP 或 HTTPS 调用。
 
 | 路径参数 | 含义 |
 | --- | --- |

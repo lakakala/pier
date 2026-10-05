@@ -178,8 +178,8 @@ from package_wizard import Wizard
 
 wizard = Wizard()
 wizard.expect('Controller 网页地址')
-wizard.send('http://invalid\n')
-wizard.expect('请输入 HTTPS 地址')
+wizard.send('ftp://invalid\n')
+wizard.expect('请输入 HTTP 或 HTTPS 地址')
 wizard.send('https://localhost:8443\n')
 wizard.expect('连接方式')
 wizard.expect('输入编号')
