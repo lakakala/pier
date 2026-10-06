@@ -3,7 +3,7 @@ members = ["crates/pier-pkg", "crates/pier-protocol", "crates/pier-controller", 
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 
 [workspace.dependencies]
 anyhow = "1"
