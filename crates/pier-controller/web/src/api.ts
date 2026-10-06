@@ -120,6 +120,12 @@ export interface Binding {
   agent_id: string;
   blueprint: string;
   variable_names: string[];
+  variable_refs: Record<string, string>;
+}
+export interface GlobalVariable {
+  name: string;
+  value: string;
+  references: { agent_id: string; agent_name: string; blueprint: string; variable: string }[];
 }
 export interface Job {
   action: 'deploy' | 'stop';

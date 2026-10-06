@@ -91,10 +91,10 @@ async fn bindings_are_independent_and_only_stopped_online_blueprints_can_be_unbo
         StatusCode::OK
     );
     let bindings = state.bindings("agent").unwrap();
-    assert_eq!(bindings[&web].variables["SECRET"], "updated");
+    assert_eq!(bindings[&web].variables["SECRET"], "updated".into());
     assert_eq!(
         bindings[&pier_protocol::hash("other")].variables["SECRET"],
-        "secret-other"
+        "secret-other".into()
     );
     // No online session means even an unused binding cannot be removed.
     assert_eq!(

@@ -12,8 +12,10 @@ mod runtime;
 mod settings;
 mod terminal;
 mod upgrades;
+mod variables;
 mod web;
 pub use runtime::RuntimeSettings;
+pub use variables::BindingValue;
 
 use anyhow::{Context, Result, ensure};
 use catalog::Catalog;
@@ -115,7 +117,12 @@ pub struct AgentRecord {
 pub struct Binding {
     pub blueprint: String,
     #[serde(default, deserialize_with = "pier_protocol::unique_map")]
-    pub variables: Variables,
+    pub variables: BTreeMap<String, BindingValue>,
+}
+/// Values resolved when the deployment is created, before waiting for a build slot.
+struct ResolvedBinding {
+    blueprint: String,
+    variables: BTreeMap<String, Variables>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -258,7 +265,7 @@ impl Controller {
         &self,
         id: &str,
         catalog: Catalog,
-        binding: Binding,
+        binding: ResolvedBinding,
         images: BTreeMap<String, String>,
         architecture: pier_pkg::Architecture,
         runtime: Arc<runtime::Runtime>,
@@ -267,7 +274,7 @@ impl Controller {
             .blueprints
             .get(&binding.blueprint)
             .context("blueprint missing")?;
-        let variables = blueprint.resolve(&binding.variables)?;
+        let variables = &binding.variables;
         let mut job: Job = self.store.get("jobs", id)?.context("job missing")?;
         let mut plan = DeploymentPlan {
             id: id.into(),

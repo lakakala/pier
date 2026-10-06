@@ -578,7 +578,7 @@ async fn binding_patch_preserves_secrets_checks_defaults_and_detects_blueprint_c
         .unwrap()
         .remove(&pier_protocol::hash("web"))
         .unwrap();
-    assert_eq!(binding.variables["SECRET"], "private-value");
+    assert_eq!(binding.variables["SECRET"], "private-value".into());
     assert!(!binding.variables.contains_key("PORT"));
     for (body, status) in [
         (json!({"blueprint":"other","variables":{}}), 409),

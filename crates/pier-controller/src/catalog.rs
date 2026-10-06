@@ -41,7 +41,7 @@ fn environment() -> Environment<'static> {
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
     environment
 }
-fn variable_name(name: &str) -> bool {
+pub(crate) fn variable_name(name: &str) -> bool {
     let mut chars = name.bytes();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == b'_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == b'_')

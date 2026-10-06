@@ -91,16 +91,11 @@ fn save(job: &mut Transaction, phase: Phase, error: Option<String>) -> Result<()
     write_json(&Path::new(ROOT).join(JOB), job)
 }
 fn detect() -> Software {
-    detect_with(
-        fs::read_to_string("/etc/os-release"),
-        package::installed,
-        package::managed,
-    )
+    detect_with(fs::read_to_string("/etc/os-release"), package::installed)
 }
 fn detect_with(
     os_release: std::io::Result<String>,
-    installed: impl FnOnce(&str, Format) -> Result<pier_protocol::upgrade::Version>,
-    managed: impl FnOnce() -> Result<()>,
+    installed: impl FnOnce(Format) -> Result<pier_protocol::upgrade::Version>,
 ) -> Software {
     let mut software = Software {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -116,8 +111,7 @@ fn detect_with(
             .context("当前发行版不支持自动升级；仅支持 Ubuntu 24.04、AlmaLinux 8 和 9")?;
         software.system = Some(system.into());
         software.format = Some(format);
-        software.package = Some(installed(system, format)?);
-        managed()?;
+        software.package = Some(installed(format)?);
         Ok(())
     })();
     software.supported = detected.is_ok();
@@ -483,8 +477,13 @@ pub fn apply() -> Result<()> {
         "upgrade not reserved"
     );
     let result = install(&mut job);
-    if result.is_err() {
-        save(&mut job, Phase::Failed, Some("installation or startup failed; inspect pier-agent-upgrade journal and recover manually".into()))?;
+    if let Err(error) = &result {
+        let reason = if error.is::<InstalledVersionChanged>() {
+            error.to_string()
+        } else {
+            "installation or startup failed; inspect pier-agent-upgrade journal and recover manually".into()
+        };
+        save(&mut job, Phase::Failed, Some(reason))?;
     }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -492,29 +491,46 @@ pub fn apply() -> Result<()> {
     let _ = rt.block_on(report_saved(&job.config, &job.status));
     result
 }
+#[derive(Debug)]
+struct InstalledVersionChanged;
+impl std::fmt::Display for InstalledVersionChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("已安装包版本不低于目标版本，本次升级已取消；未安装或重启")
+    }
+}
+impl std::error::Error for InstalledVersionChanged {}
+
+fn install_newer(
+    current: &pier_protocol::upgrade::Version,
+    target: &pier_protocol::upgrade::Version,
+    installer: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    ensure!(target.newer_than(current)?, InstalledVersionChanged);
+    installer()
+}
+
 fn install(job: &mut Transaction) -> Result<()> {
     ensure!(job.boot_id == boot_id()?, "upgrade interrupted by reboot");
     let release = &job.status.release;
     let path = PathBuf::from(ROOT).join(release.filename());
     package::inspect(&path, release)?;
-    let current = package::installed(&release.system, release.format)?;
-    ensure!(!current.newer_than(&release.package)?, "refusing downgrade");
-    match release.format {
+    let current = package::installed(release.format)?;
+    install_newer(&current, &release.package, || match release.format {
         Format::Deb => package::bounded(
             Command::new("dpkg")
                 .args(["--force-confold", "--install"])
                 .arg(&path),
             Duration::from_secs(600),
-        )?,
+        ),
         Format::Rpm => package::bounded(
             Command::new("rpm")
                 .args(["--upgrade", "--replacepkgs"])
                 .arg(&path),
             Duration::from_secs(600),
-        )?,
-    }
+        ),
+    })?;
     ensure!(
-        package::installed(&release.system, release.format)? == release.package,
+        package::installed(release.format)? == release.package,
         "installed package version mismatch"
     );
     save(job, Phase::Restarting, None)?;
@@ -551,7 +567,7 @@ mod detection_tests {
     use super::*;
     use pier_protocol::upgrade::Version;
 
-    fn installed(_: &str, _: Format) -> Result<Version> {
+    fn installed(_: Format) -> Result<Version> {
         Ok(Version {
             version: "1.2.3".into(),
             revision: 1,
@@ -559,7 +575,7 @@ mod detection_tests {
     }
 
     #[test]
-    fn detection_reports_the_failed_check_and_retains_known_metadata() {
+    fn detection_uses_package_version_without_checking_process_ownership() {
         for (os, reason) in [
             (
                 Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
@@ -567,45 +583,66 @@ mod detection_tests {
             ),
             (Ok("ID=debian\nVERSION_ID=12".into()), "当前发行版不支持"),
         ] {
-            let software = detect_with(
-                os,
-                |_, _| panic!("unsupported system must not query packages"),
-                || panic!("unsupported system must not query systemd"),
-            );
+            let software =
+                detect_with(os, |_| panic!("unsupported system must not query packages"));
             assert!(!software.supported);
             assert!(software.system.is_none());
             assert!(software.reason.as_ref().unwrap().contains(reason));
             software.validate().unwrap();
         }
         let os = || Ok("ID=ubuntu\nVERSION_ID=24.04".into());
-        let software = detect_with(
-            os(),
-            |_, _| anyhow::bail!("pier-agent DEB 未处于完整安装状态；请修复安装包"),
-            || panic!("invalid package must not query systemd"),
-        );
+        let software = detect_with(os(), |_| {
+            anyhow::bail!("无法读取 pier-agent 原生安装包记录")
+        });
         assert!(!software.supported);
         assert_eq!(software.system.as_deref(), Some("ubuntu24.04"));
         assert!(software.package.is_none());
-        assert!(
-            software
-                .reason
-                .as_ref()
-                .unwrap()
-                .contains("未处于完整安装状态")
-        );
+        assert!(software.reason.as_ref().unwrap().contains("无法读取"));
         software.validate().unwrap();
 
-        let software = detect_with(os(), installed, || {
-            anyhow::bail!("pier-agent.service 没有主进程；请通过 systemctl 启动 agent 服务")
-        });
-        assert!(!software.supported);
-        assert!(software.package.is_some());
-        assert!(software.reason.as_ref().unwrap().contains("没有主进程"));
-        software.validate().unwrap();
-
-        let software = detect_with(os(), installed, || Ok(()));
+        // This test process is neither /usr/bin/pier-agent nor systemd's MainPID.
+        let software = detect_with(os(), installed);
         assert!(software.supported);
+        assert!(software.package.is_some());
         assert!(software.reason.is_none());
         software.validate().unwrap();
+    }
+
+    #[test]
+    fn recheck_cancels_equal_or_newer_installed_versions_before_running_installer() {
+        let target = Version {
+            version: "1.2.3".into(),
+            revision: 2,
+        };
+        for current in [
+            target.clone(),
+            Version {
+                version: "1.2.3".into(),
+                revision: 3,
+            },
+            Version {
+                version: "2.0.0".into(),
+                revision: 1,
+            },
+        ] {
+            let error = install_newer(&current, &target, || panic!("must not install or restart"))
+                .unwrap_err();
+            assert!(error.is::<InstalledVersionChanged>());
+            assert!(error.to_string().contains("本次升级已取消"));
+        }
+        let current = Version {
+            version: "1.2.3".into(),
+            revision: 1,
+        };
+        let mut called = false;
+        install_newer(&current, &target, || {
+            called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(called);
+        let error =
+            install_newer(&current, &target, || anyhow::bail!("installer failed")).unwrap_err();
+        assert!(!error.is::<InstalledVersionChanged>());
     }
 }

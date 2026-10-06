@@ -79,17 +79,14 @@ fn query(command: &mut Command) -> std::result::Result<String, QueryError> {
         .map_err(|_| QueryError::InvalidOutput)?;
     Ok(text.trim().to_string())
 }
-pub(super) fn version(value: &str, system: &str, allow_legacy: bool) -> Result<Version> {
+fn target_version(value: &str, system: &str) -> Result<Version> {
     let (version, revision) = value.rsplit_once('-').context("missing package revision")?;
     let package = Version {
         version: version.into(),
         revision: revision.split('.').next().unwrap_or_default().parse()?,
     };
     ensure!(
-        value == package.native(system)?
-            || (allow_legacy
-                && system == "ubuntu24.04"
-                && value == format!("{}-{}", package.version, package.revision)),
+        value == package.native(system)?,
         "native package version does not match target system"
     );
     Ok(package)
@@ -104,22 +101,18 @@ fn arch(value: &str, format: Format) -> Result<()> {
     ensure!(value == expected, "package architecture mismatch");
     Ok(())
 }
-pub(super) fn installed(system: &str, format: Format) -> Result<Version> {
+pub(super) fn installed(format: Format) -> Result<Version> {
     let (tool, queried) = match format {
         Format::Deb => (
             "dpkg-query",
-            query(Command::new("dpkg-query").args([
-                "-W",
-                "-f=${Status}\n${Version}\n${Architecture}",
-                "pier-agent",
-            ])),
+            query(Command::new("dpkg-query").args(["-W", "-f=${Version}\n", "pier-agent"])),
         ),
         Format::Rpm => (
             "rpm",
             query(Command::new("rpm").args([
                 "-q",
                 "--qf",
-                "%{EPOCHNUM}\n%{VERSION}-%{RELEASE}\n%{ARCH}",
+                "%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n",
                 "pier-agent",
             ])),
         ),
@@ -129,27 +122,28 @@ pub(super) fn installed(system: &str, format: Format) -> Result<Version> {
             "无法读取 pier-agent 原生安装包记录：{tool} {error}；请检查安装包及包管理器"
         )
     })?;
-    installed_metadata(&text, system, format)
+    installed_version(&text).context("无法解析 pier-agent 已安装包版本；需要 x.y.z 和数字修订号")
 }
-fn installed_metadata(text: &str, system: &str, format: Format) -> Result<Version> {
-    let lines: Vec<_> = text.lines().collect();
-    ensure!(lines.len() == 3, "pier-agent 安装包元数据格式错误");
+fn installed_version(text: &str) -> Result<Version> {
     ensure!(
-        lines[0]
-            == if format == Format::Deb {
-                "install ok installed"
-            } else {
-                "0"
-            },
-        if format == Format::Deb {
-            "pier-agent DEB 未处于完整安装状态；请修复安装包"
-        } else {
-            "pier-agent RPM 的 Epoch 不为 0；不支持自动升级该安装包"
-        }
+        !text.chars().any(char::is_whitespace),
+        "invalid package version"
     );
-    arch(lines[2], format).context("pier-agent 安装包架构与当前 agent 架构不一致")?;
-    version(lines[1], system, true)
-        .context("pier-agent 安装包版本格式或发行版后缀不匹配；请安装对应系统的官方安装包")
+    // Epoch zero is equivalent to no epoch. Other epochs cannot be represented
+    // by the protocol's numeric version and revision, so parsing fails closed.
+    let text = text.strip_prefix("0:").unwrap_or(text);
+    let (version, release) = text.split_once('-').context("missing package revision")?;
+    let revision = release.split('.').next().unwrap_or_default();
+    ensure!(
+        !revision.is_empty() && revision.bytes().all(|c| c.is_ascii_digit()),
+        "invalid package revision"
+    );
+    let package = Version {
+        version: version.into(),
+        revision: revision.parse()?,
+    };
+    package.key()?;
+    Ok(package)
 }
 pub(super) fn inspect(path: &Path, release: &Release) -> Result<()> {
     release.verify(path)?;
@@ -175,7 +169,7 @@ pub(super) fn inspect(path: &Path, release: &Release) -> Result<()> {
         "invalid update package metadata"
     );
     ensure!(
-        lines[0] == "pier-agent" && version(lines[1], &release.system, false)? == release.package,
+        lines[0] == "pier-agent" && target_version(lines[1], &release.system)? == release.package,
         "update package name or version mismatch"
     );
     arch(lines[2], release.format)?;
@@ -187,39 +181,6 @@ pub(super) fn inspect(path: &Path, release: &Release) -> Result<()> {
 }
 pub(super) fn systemctl(args: &[&str]) -> Result<String> {
     Ok(query(Command::new("systemctl").args(args))?)
-}
-pub(super) fn managed() -> Result<()> {
-    let exe = std::env::current_exe().context("无法读取当前 agent 的可执行文件路径")?;
-    managed_process(&exe, std::process::id(), || {
-        systemctl(&[
-            "show",
-            "--property=MainPID",
-            "--value",
-            "pier-agent.service",
-        ])
-        .map_err(|error| {
-            anyhow::anyhow!("无法查询 pier-agent.service 的 MainPID：systemctl {error}")
-        })
-    })
-}
-fn managed_process(exe: &Path, pid: u32, main_pid: impl FnOnce() -> Result<String>) -> Result<()> {
-    ensure!(
-        exe == Path::new("/usr/bin/pier-agent")
-            || exe == Path::new("/usr/bin/pier-agent (deleted)"),
-        "当前运行程序不在 /usr/bin/pier-agent；请使用原生安装包提供的程序"
-    );
-    let main_pid = main_pid()?
-        .parse::<u32>()
-        .context("pier-agent.service 返回了无效的 MainPID")?;
-    ensure!(
-        main_pid != 0,
-        "pier-agent.service 没有主进程；请通过 systemctl 启动 agent 服务"
-    );
-    ensure!(
-        main_pid == pid,
-        "当前 agent PID {pid} 不是 pier-agent.service 的 MainPID {main_pid}；请通过该服务运行 agent"
-    );
-    Ok(())
 }
 pub(super) fn helper_active() -> bool {
     systemctl(&[
@@ -266,61 +227,30 @@ pub(super) fn bounded(command: &mut Command, limit: Duration) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn installed_metadata_explains_each_rejected_package() {
-        let deb_arch = if crate::architecture().unwrap() == pier_pkg::Architecture::Amd64 {
-            "amd64"
-        } else {
-            "arm64"
-        };
-        let valid = format!("install ok installed\n1.2.3-1.ubuntu24.04\n{deb_arch}");
-        assert!(installed_metadata(&valid, "ubuntu24.04", Format::Deb).is_ok());
-        for (metadata, reason) in [
-            ("unexpected".into(), "元数据格式错误"),
-            (
-                valid.replace("install ok installed", "deinstall ok config-files"),
-                "未处于完整安装状态",
-            ),
-            (valid.replace(deb_arch, "other-architecture"), "架构不一致"),
-            (
-                valid.replace("ubuntu24.04", "ubuntu22.04"),
-                "版本格式或发行版后缀不匹配",
-            ),
+    fn installed_versions_ignore_distribution_suffixes() {
+        for value in [
+            "1.2.3-12",
+            "1.2.3-12.el8",
+            "1.2.3-12.el9",
+            "1.2.3-12.ubuntu22.04",
+            "0:1.2.3-12.custom-build",
         ] {
-            let error = installed_metadata(&metadata, "ubuntu24.04", Format::Deb).unwrap_err();
-            assert!(error.to_string().contains(reason), "{error}");
-            assert!(error.to_string().len() <= 256);
+            let parsed = installed_version(value).unwrap();
+            assert_eq!(parsed.version, "1.2.3");
+            assert_eq!(parsed.revision, 12);
         }
-        let error =
-            installed_metadata("1\n1.2.3-1.el9\nx86_64", "almalinux9", Format::Rpm).unwrap_err();
-        assert!(error.to_string().contains("Epoch 不为 0"));
-    }
-
-    #[test]
-    fn process_checks_explain_path_service_and_pid_failures() {
-        let native = Path::new("/usr/bin/pier-agent");
-        assert!(managed_process(native, 123, || Ok("123".into())).is_ok());
-        assert!(
-            managed_process(Path::new("/usr/bin/pier-agent (deleted)"), 123, || Ok(
-                "123".into()
-            ))
-            .is_ok()
-        );
-        let error = managed_process(Path::new("/tmp/pier-agent"), 123, || {
-            panic!("wrong path must not query systemd")
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("不在 /usr/bin/pier-agent"));
-        for (pid, reason) in [
-            ("0", "没有主进程"),
-            ("456", "MainPID 456"),
-            ("invalid", "无效的 MainPID"),
+        for value in [
+            "",
+            "1.2.3",
+            "1:1.2.3-12.el9",
+            "1.2.3-0",
+            "1.2.3-foo",
+            "1.2.3-+1",
+            "1.2.3-18446744073709551616.el9",
+            "1.2.3-12.el9\n1.2.4-1.el9",
         ] {
-            let error = managed_process(native, 123, || Ok(pid.into())).unwrap_err();
-            assert!(error.to_string().contains(reason), "{error}");
+            assert!(installed_version(value).is_err(), "{value}");
         }
-        let error =
-            managed_process(native, 123, || anyhow::bail!("systemctl unavailable")).unwrap_err();
-        assert_eq!(error.to_string(), "systemctl unavailable");
     }
 
     #[test]
@@ -347,13 +277,9 @@ mod tests {
             ("1.2.3-12.el9", "almalinux9"),
             ("1.2.3-12.ubuntu24.04", "ubuntu24.04"),
         ] {
-            assert_eq!(version(s, system, false).unwrap().revision, 12);
+            assert_eq!(target_version(s, system).unwrap().revision, 12);
         }
-        assert_eq!(
-            version("1.2.3-2", "ubuntu24.04", true).unwrap().version,
-            "1.2.3"
-        );
-        assert!(version("1.2.3-2", "ubuntu24.04", false).is_err());
+        assert!(target_version("1.2.3-2", "ubuntu24.04").is_err());
         for (s, system) in [
             ("1:1.2.3-1", "ubuntu24.04"),
             ("1.2.3-1.el9", "almalinux8"),
@@ -365,7 +291,7 @@ mod tests {
             ("1.2.3-01.el9", "almalinux9"),
             ("1.2.3-18446744073709551616.el9", "almalinux9"),
         ] {
-            assert!(version(s, system, true).is_err());
+            assert!(target_version(s, system).is_err());
         }
     }
 }

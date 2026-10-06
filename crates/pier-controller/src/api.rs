@@ -36,7 +36,7 @@ impl From<anyhow::Error> for ApiError {
 pub(crate) fn bad(message: &str) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, message.into())
 }
-fn missing() -> ApiError {
+pub(crate) fn missing() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "resource not found".into())
 }
 pub(crate) fn conflict(message: &str) -> ApiError {
@@ -79,6 +79,14 @@ pub fn router(state: Arc<Controller>) -> Router {
         .route("/v1/repository/sync", post(sync))
         .route("/v1/apps", get(apps))
         .route("/v1/blueprints", get(blueprints))
+        .route(
+            "/v1/variables",
+            get(crate::variables::list).post(crate::variables::create),
+        )
+        .route(
+            "/v1/variables/{name}",
+            put(crate::variables::update).delete(crate::variables::delete),
+        )
         .route("/v1/agents", post(register).get(agents))
         .route("/v1/agents/{id}", get(agent))
         .route("/v1/agents/{id}/connection", put(update_connection))
@@ -114,7 +122,7 @@ pub fn router(state: Arc<Controller>) -> Router {
 struct BindingPatch {
     blueprint: String,
     #[serde(deserialize_with = "pier_protocol::unique_map")]
-    variables: BTreeMap<String, Option<String>>,
+    variables: BTreeMap<String, Option<crate::BindingValue>>,
 }
 async fn patch_binding(
     State(state): State<Arc<Controller>>,
@@ -146,8 +154,8 @@ async fn patch_binding(
             binding.variables.remove(&key);
         }
     }
-    blueprint
-        .resolve(&binding.variables)
+    state
+        .resolve_binding(binding, blueprint)
         .map_err(|e| bad(&e.to_string()))?;
     let value = public_binding(&id, binding);
     state.store.put("blueprint_bindings", &id, &bindings)?;
@@ -378,7 +386,12 @@ async fn update_connection(
     Ok(Json(public_agent(&state, record)))
 }
 fn public_binding(agent: &str, binding: &Binding) -> Value {
-    json!({"agent_id":agent,"id":pier_protocol::hash(&binding.blueprint),"blueprint":binding.blueprint,"variable_names":binding.variables.keys().collect::<Vec<_>>()})
+    let refs: BTreeMap<_, _> = binding
+        .variables
+        .iter()
+        .filter_map(|(name, value)| value.reference().map(|reference| (name, reference)))
+        .collect();
+    json!({"agent_id":agent,"id":pier_protocol::hash(&binding.blueprint),"blueprint":binding.blueprint,"variable_names":binding.variables.keys().collect::<Vec<_>>(),"variable_refs":refs})
 }
 fn binding_idle(state: &Controller, agent: &str, blueprint: &str) -> Result<(), ApiError> {
     if state
@@ -413,8 +426,8 @@ fn save_binding(state: &Controller, id: &str, binding: Binding, replace: bool) -
             .blueprints
             .get(&binding.blueprint)
             .ok_or_else(missing)?;
-        blueprint
-            .resolve(&binding.variables)
+        state
+            .resolve_binding(&binding, blueprint)
             .map_err(|e| bad(&e.to_string()))?;
         blueprint.name.clone()
     };
@@ -619,8 +632,8 @@ async fn deploy(
             .blueprints
             .get(&binding.blueprint)
             .ok_or_else(|| conflict("bound blueprint absent from current catalog"))?;
-        blueprint
-            .resolve(&binding.variables)
+        let resolved = state
+            .resolve_binding(&binding, blueprint)
             .map_err(|e| bad(&e.to_string()))?;
         if request
             .images
@@ -665,7 +678,7 @@ async fn deploy(
                 builder.build(
                     &build_id,
                     catalog,
-                    binding,
+                    resolved,
                     request.images,
                     info.architecture,
                     runtime,

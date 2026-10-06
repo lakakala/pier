@@ -56,6 +56,7 @@ import {
   type SetupDefaults,
 } from './runtime-settings';
 import './style.css';
+import { GlobalVariables } from './variables';
 
 function Login({
   initialized,
@@ -322,6 +323,7 @@ function Console() {
     ['/repository', '定义仓库', <GithubOutlined />],
     ['/apps', '应用', <AppstoreOutlined />],
     ['/blueprints', 'Blueprint', <ApartmentOutlined />],
+    ['/variables', '全局变量', <AppstoreOutlined />],
     ['/agents', '服务器', <CloudServerOutlined />],
     ['/deployments', '部署记录', <DeploymentUnitOutlined />],
     ['/settings/controller', '控制器设置', <SettingOutlined />],
@@ -376,6 +378,7 @@ function Console() {
             <Route path="/repository" element={<Repository />} />
             <Route path="/apps" element={<Definitions kind="apps" />} />
             <Route path="/blueprints" element={<Definitions kind="blueprints" />} />
+            <Route path="/variables" element={<GlobalVariables />} />
             <Route path="/agents" element={<Agents />} />
             <Route path="/agents/:id" element={<AgentDetail />} />
             <Route path="/deployments" element={<Deployments />} />

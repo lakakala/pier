@@ -40,6 +40,7 @@ import {
   type Binding,
   type Blueprint,
   type Catalog,
+  type GlobalVariable,
   type Job,
 } from './api';
 import { ErrorBox, Heading, Loading, StateTag, useLoad, Variables } from './components';
@@ -455,6 +456,7 @@ export function Agents() {
 function BindingForm({ agent }: { agent: Agent }) {
   const bindings = useLoad<{ bindings: Binding[] }>(`/v1/agents/${agent.id}/bindings`);
   const catalog = useLoad<Catalog>('/v1/blueprints');
+  const globals = useLoad<{ variables: GlobalVariable[] }>('/v1/variables');
   const [selected, setSelected] = useState('');
   const [replace, setReplace] = useState(false);
   const binding = {
@@ -477,20 +479,27 @@ function BindingForm({ agent }: { agent: Agent }) {
   const variables = Object.entries(blueprint?.variables ?? {});
   useEffect(() => {
     form.resetFields();
+    form.setFieldsValue({
+      items: Object.keys(blueprint?.variables ?? {}).map((name) => ({
+        ref: editing ? binding.data?.variable_refs?.[name] : undefined,
+      })),
+    });
     setModes(
       Object.entries(blueprint?.variables ?? {}).map(([name, def]) =>
-        editing && binding.data?.variable_names.includes(name)
-          ? 'keep'
-          : def.default !== null
-            ? 'default'
-            : 'set',
+        editing && binding.data?.variable_refs?.[name]
+          ? 'global'
+          : editing && binding.data?.variable_names.includes(name)
+            ? 'keep'
+            : def.default !== null
+              ? 'default'
+              : 'set',
       ),
     );
   }, [blueprint, editing, binding.data, form]);
   const failedBinding = binding.error?.status !== 404 ? binding.error : undefined;
   return (
     <Card title="Blueprint 绑定" className="block-gap">
-      <ErrorBox error={error || catalog.error || failedBinding} />
+      <ErrorBox error={error || catalog.error || failedBinding || globals.error} />
       <Table<Binding>
         rowKey="id"
         pagination={false}
@@ -587,14 +596,16 @@ function BindingForm({ agent }: { agent: Agent }) {
           setPending(true);
           setError(undefined);
           const updates = Object.fromEntries(
-            variables.flatMap(([name], index) =>
+            variables.flatMap<[string, string | { ref: string } | null]>(([name], index) =>
               modes[index] === 'keep'
                 ? []
                 : modes[index] === 'default'
                   ? editing
                     ? [[name, null]]
                     : []
-                  : [[name, values.items?.[index]?.value ?? '']],
+                  : modes[index] === 'global'
+                    ? [[name, { ref: values.items?.[index]?.ref }]]
+                    : [[name, values.items?.[index]?.value ?? '']],
             ),
           );
           try {
@@ -660,12 +671,39 @@ function BindingForm({ agent }: { agent: Agent }) {
                       ? [{ value: 'keep', label: '保留已保存值' }]
                       : []),
                     { value: 'set', label: '设置值' },
+                    { value: 'global', label: '引用全局变量' },
                     ...(def.default !== null
                       ? [{ value: 'default', label: `使用默认值：${JSON.stringify(def.default)}` }]
                       : []),
                   ]}
                 />
               </Form.Item>
+              {modes[index] === 'global' && (
+                <Form.Item
+                  name={['items', index, 'ref']}
+                  label={`${name} 引用的全局变量`}
+                  rules={[{ required: true, message: '请选择全局变量' }]}
+                  extra={
+                    <span>
+                      创建部署时使用最新值。<Link to="/variables">管理全局变量</Link>
+                    </span>
+                  }
+                >
+                  <Select
+                    showSearch
+                    optionFilterProp="label"
+                    loading={!globals.data && !globals.error}
+                    onOpenChange={(open) => {
+                      if (open) globals.refresh();
+                    }}
+                    options={(globals.data?.variables ?? []).map((value) => ({
+                      value: value.name,
+                      label: value.name,
+                    }))}
+                    notFoundContent="暂无全局变量，请先到全局变量页面创建"
+                  />
+                </Form.Item>
+              )}
               {modes[index] === 'set' && (
                 <Form.Item
                   name={['items', index, 'value']}

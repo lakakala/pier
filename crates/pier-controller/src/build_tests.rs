@@ -40,6 +40,7 @@ service: {command: [bin/demo]}
                 })
                 .collect(),
         };
+        let variables = blueprint.resolve(&BTreeMap::new()).unwrap();
         let catalog = Catalog {
             root: root.path().into(),
             commit: "commit".into(),
@@ -63,9 +64,9 @@ service: {command: [bin/demo]}
             .build(
                 "job",
                 catalog,
-                Binding {
+                ResolvedBinding {
                     blueprint: "blueprint".into(),
-                    variables: BTreeMap::new(),
+                    variables,
                 },
                 BTreeMap::new(),
                 pier_pkg::Architecture::Amd64,

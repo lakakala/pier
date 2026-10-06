@@ -26,6 +26,8 @@ controller 启动 YAML 只保留 `http_listen` 和 `state_dir`。初次访问 `/
 
 “仓库同步与构建代理”复用 `build_proxy`，定义仓库同步按仓库协议使用 HTTP 或 HTTPS 代理，遵循 NO_PROXY；未配置对应代理时直连，不继承系统环境或 Git 的 HTTP 代理。保存或清除后重启 controller 生效。app 仍由其 `proxy.enabled` 控制，SSH 与本地仓库连接方式保持不变。
 
+“全局变量”页面可维护所有服务器共享的字符串值，并显示引用位置。在 Blueprint 绑定表单选择“引用全局变量”后保存变量名，创建部署时获取最新值；已排队的部署使用创建时的快照。所有全局变量值可查看，被引用时禁止删除。变量和绑定均不写入浏览器持久存储。
+
 ## 测试
 
 仓库代理的 Rust 集成测试需要 Python 3、OpenSSL 和 Git，通过本地 smart HTTP 服务、带认证的 HTTP(S) 代理及受信任的临时证书验证真实 Git 拉取，不访问外部仓库：`cargo test -p pier-controller repository_proxy_transport_and_restart`（在仓库根目录执行）。

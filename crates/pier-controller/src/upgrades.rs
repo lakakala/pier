@@ -412,7 +412,7 @@ mod tests {
         let mut software: Software = state.store.get("agent_software", "agent").unwrap().unwrap();
         software.supported = false;
         software.reason =
-            Some("pier-agent.service 没有主进程；请通过 systemctl 启动 agent 服务".into());
+            Some("无法读取 pier-agent 原生安装包记录：dpkg-query 查询失败，退出码 1".into());
         state.record_software("agent", Some(&software)).unwrap();
         assert!(state.upgrade_offer("agent").unwrap().release.is_none());
         let expected = state.upgrade_view("agent").unwrap();
@@ -440,6 +440,23 @@ mod tests {
                 .unwrap()
                 .contains("未提供")
         );
+    }
+
+    #[test]
+    fn offers_compare_installed_packages_independently_of_running_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fixture(dir.path());
+        let mut software: Software = state.store.get("agent_software", "agent").unwrap().unwrap();
+        software.version = "9.0.0".into();
+        state.record_software("agent", Some(&software)).unwrap();
+        let target = state.upgrade_offer("agent").unwrap().release.unwrap();
+        software.package = Some(target.package);
+        software.version = "0.1.0".into();
+        state.record_software("agent", Some(&software)).unwrap();
+        assert!(state.upgrade_offer("agent").unwrap().release.is_none());
+        software.package.as_mut().unwrap().revision += 1;
+        state.record_software("agent", Some(&software)).unwrap();
+        assert!(state.upgrade_offer("agent").unwrap().release.is_none());
     }
 
     #[test]

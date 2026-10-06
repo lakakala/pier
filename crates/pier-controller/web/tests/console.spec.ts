@@ -162,7 +162,7 @@ test.describe.serial('controller console', () => {
   }) => {
     await login(page);
     const reason =
-      '当前 agent PID 123 不是 pier-agent.service 的 MainPID 456；请通过该服务运行 agent';
+      '无法读取 pier-agent 原生安装包记录：dpkg-query 查询失败，退出码 1；请检查安装包及包管理器';
     const agent = {
       id: 'upgrade-blocked',
       name: 'blocked-agent',
@@ -683,6 +683,104 @@ test.describe.serial('controller console', () => {
     expect(submitted?.blueprint).toBe('blueprints/web');
     expect(submitted?.commit).toMatch(/^[0-9a-f]{40}$/);
     await page.screenshot({ path: testInfo.outputPath('deployment.png'), fullPage: true });
+  });
+  test('global variables can be managed, referenced and released through binding edits', async ({
+    page,
+  }, testInfo) => {
+    await login(page);
+    await page.getByRole('link', { name: '全局变量', exact: true }).click();
+    const original = 'shared value\n{{ remains_literal }}';
+    await page.getByRole('button', { name: '新增变量', exact: true }).click();
+    await page.getByLabel('变量名称', { exact: true }).fill('SHARED_SECRET');
+    await page.getByLabel('变量值', { exact: true }).fill(original);
+    await page.getByRole('button', { name: '保存变量', exact: true }).click();
+    await expect(page.getByRole('dialog')).not.toBeVisible();
+    let row = page.getByRole('row').filter({ hasText: 'SHARED_SECRET' });
+    await expect(row).toContainText('{{ remains_literal }}');
+    await page.reload();
+    await expect(row).toContainText('shared value');
+    await row.getByRole('button', { name: '编辑', exact: true }).click();
+    await expect(page.getByLabel('变量名称', { exact: true })).toBeDisabled();
+    await expect(page.getByLabel('变量值', { exact: true })).toHaveValue(original);
+    await page.getByLabel('变量值', { exact: true }).fill('latest value');
+    await page.getByRole('button', { name: '保存变量', exact: true }).click();
+    await expect(row).toContainText('latest value');
+    await page.getByRole('button', { name: '新增变量', exact: true }).click();
+    await page.getByLabel('变量名称', { exact: true }).fill('SHARED_SECRET');
+    await page.getByRole('button', { name: '保存变量', exact: true }).click();
+    await expect(page.getByRole('dialog')).toContainText('global variable already exists');
+    await page.getByLabel('变量名称', { exact: true }).fill('EMPTY_VALUE');
+    await page.getByRole('button', { name: '保存变量', exact: true }).click();
+    await expect(page.getByRole('dialog')).not.toBeVisible();
+    const empty = page.getByRole('row').filter({ hasText: 'EMPTY_VALUE' });
+    await expect(empty).toContainText('空字符串');
+    await empty.getByRole('button', { name: '删除', exact: true }).click();
+    await page.getByRole('button', { name: '确定', exact: true }).click();
+    await expect(empty).toHaveCount(0);
+
+    await page.getByRole('link', { name: '服务器', exact: true }).click();
+    await page.getByRole('button', { name: '手动注册', exact: true }).click();
+    await page.getByLabel('服务器名称').fill('variable-agent');
+    await page.getByRole('button', { name: '注册', exact: true }).click();
+    await expect(page.getByRole('dialog')).toContainText('token');
+    await page.getByRole('button', { name: '关闭', exact: true }).click();
+    await page.getByRole('link', { name: 'variable-agent', exact: true }).click();
+    const agentId = page.url().split('/').pop()!;
+    await page.getByRole('combobox', { name: '选择 Blueprint' }).click();
+    await page.getByText('web-server · blueprints/web', { exact: true }).click();
+    await page.getByRole('combobox', { name: 'SECRET 的填写方式' }).click();
+    await page.getByTitle('引用全局变量', { exact: true }).click();
+    await page.getByLabel('SECRET 引用的全局变量', { exact: true }).click();
+    await page.getByTitle('SHARED_SECRET', { exact: true }).click();
+    const created = page.waitForResponse(
+      (r) => r.request().method() === 'POST' && r.url().endsWith(`/v1/agents/${agentId}/bindings`),
+    );
+    await page.getByRole('button', { name: '保存绑定', exact: true }).click();
+    expect((await created).ok()).toBe(true);
+    await page.reload();
+    await expect(page.locator('.variable-row').filter({ hasText: 'SECRET' })).toContainText(
+      'SHARED_SECRET',
+    );
+    await page.getByRole('combobox', { name: 'PORT 的填写方式' }).click();
+    await page.getByTitle('设置值', { exact: true }).click();
+    await page.getByLabel('PORT 的值', { exact: true }).fill('9091');
+    const edited = page.waitForResponse(
+      (r) =>
+        r.request().method() === 'PATCH' && r.url().includes(`/v1/agents/${agentId}/bindings/`),
+    );
+    await page.getByRole('button', { name: '保存绑定', exact: true }).click();
+    expect((await edited).ok()).toBe(true);
+    const binding = (await (await page.request.get(`/v1/agents/${agentId}/bindings`)).json())
+      .bindings[0];
+    expect(binding.variable_refs).toEqual({ SECRET: 'SHARED_SECRET' });
+    expect(binding.variable_names).toEqual(['PORT', 'SECRET']);
+    await page.getByRole('link', { name: '全局变量', exact: true }).click();
+    row = page.getByRole('row').filter({ hasText: 'SHARED_SECRET' });
+    await expect(row).toContainText('variable-agent');
+    await expect(row).toContainText('blueprints/web · SECRET');
+    await expect(row.getByRole('button', { name: '删除', exact: true })).toBeDisabled();
+    await row.getByRole('button', { name: '编辑', exact: true }).click();
+    await page.getByLabel('变量值', { exact: true }).fill('next deployment');
+    await page.getByRole('button', { name: '保存变量', exact: true }).click();
+    await expect(row).toContainText('next deployment');
+    await page.screenshot({ path: testInfo.outputPath('global-variables.png'), fullPage: true });
+    await row.getByRole('link', { name: 'variable-agent', exact: true }).click();
+    await page.getByRole('combobox', { name: 'SECRET 的填写方式' }).click();
+    await page.getByTitle('设置值', { exact: true }).click();
+    await page.getByLabel('SECRET 的值', { exact: true }).fill('local value');
+    const detached = page.waitForResponse(
+      (r) =>
+        r.request().method() === 'PATCH' && r.url().includes(`/v1/agents/${agentId}/bindings/`),
+    );
+    await page.getByRole('button', { name: '保存绑定', exact: true }).click();
+    expect((await (await detached).json()).variable_refs).toEqual({});
+    await page.getByRole('link', { name: '全局变量', exact: true }).click();
+    await expect(row.getByRole('button', { name: '删除', exact: true })).toBeEnabled();
+    await row.getByRole('button', { name: '删除', exact: true }).click();
+    await page.getByRole('button', { name: '确定', exact: true }).click();
+    await expect(row).toHaveCount(0);
+    expect(await page.evaluate(() => Object.keys(localStorage))).toEqual([]);
+    expect(await page.evaluate(() => Object.keys(sessionStorage))).toEqual([]);
   });
   test('agent fragment survives login, pairing copy, invalid link and password revocation', async ({
     page,

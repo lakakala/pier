@@ -20,7 +20,7 @@ COOKIE_JAR=$(mktemp)
 # AGENT_TOKEN 仅用于制品下载。
 ```
 
-有 JSON 请求体时须发送 `Content-Type: application/json`。请求对象拒绝未知字段；绑定和镜像映射拒绝重复键。绑定变量通常为字符串，PATCH 绑定允许用 `null` 移除已保存值。
+有 JSON 请求体时须发送 `Content-Type: application/json`。请求对象拒绝未知字段；绑定和镜像映射拒绝重复键。绑定变量支持字符串直接值或 `{"ref":"NAME"}` 全局引用，PATCH 绑定允许用 `null` 移除已保存值。
 
 业务接口成功返回 **HTTP 200**，包括创建部署和终端；退出和修改密码返回 **204**，终端 WebSocket 握手返回 **101**。除制品下载、WebSocket 和 204 外，成功响应为 JSON。响应设置 `Cache-Control: no-store` 与 `X-Content-Type-Options: nosniff`。
 
@@ -39,7 +39,7 @@ COOKIE_JAR=$(mktemp)
 | `400` | 业务参数无效、同步失败或初始化授权无效，返回 JSON 错误 |
 | `401` | 管理接口未登录、凭据错误或会话失效，返回 `{"error":"authentication required"}`；制品接口 token 错误返回 `{"error":"unauthorized"}` |
 | `403` | Origin 缺失/错误或 CSRF 错误，返回 `invalid origin` / `invalid csrf token` |
-| `404` | agent、绑定、部署、授权记录或制品不存在，返回 JSON 错误 |
+| `404` | agent、全局变量、绑定、部署、授权记录或制品不存在，返回 JSON 错误 |
 | `409` | 当前状态不允许操作，例如目录不可用、agent 离线或已有活动部署，返回 JSON 错误 |
 | `429` | 认证限流返回 `too many authentication attempts; retry later`；终端数量超限返回 `terminal limit reached` |
 | `500` | 内部操作失败，通常返回 `{"error":"internal operation failed"}`；同步工作线程失败返回 `{"error":"sync worker failed"}` |
@@ -64,6 +64,8 @@ JSON 语法、字段类型、Content-Type、查询参数解码或请求体大小
 | POST | `/v1/repository/sync` | 管理员 Cookie | 立即同步并校验定义仓库 |
 | GET | `/v1/apps` | 管理员 Cookie | app 声明及变量 |
 | GET | `/v1/blueprints` | 管理员 Cookie | blueprint 与 app 声明 |
+| GET / POST | `/v1/variables` | 管理员 Cookie | 查询 / 新增全局变量 |
+| PUT / DELETE | `/v1/variables/{name}` | 管理员 Cookie | 更新值 / 删除全局变量 |
 | POST | `/v1/agents` | 管理员 Cookie | 手动注册 agent |
 | GET | `/v1/agents` | 管理员 Cookie | agent 列表 |
 | PUT | `/v1/agents/{id}/connection` | 管理员 Cookie | 修改被动 agent 的可达地址、SOCKS5 代理并重连 |
@@ -535,7 +537,9 @@ curl --fail-with-body "$CONTROLLER_URL/v1/agents/$AGENT_ID" \
 | `upgrade.status` | 最近一次升级记录，或 `null` |
 | `upgrade.reason` | 未提供升级的原因，正常时为 `null` |
 
-`software.reason` 由 agent 在启动时上报具体检查失败原因，包括系统识别、原生包查询/安装状态/版本/架构、可执行文件路径、systemd MainPID，以及升级目录或记录问题。`software.supported=false` 时，`upgrade.reason` 保留该原因；旧 agent 未提供原因时返回手动更新提示。诊断不包含命令原始输出，修复后需重启 agent 重新检测。服务器列表和详情页展示当前原因，历史升级状态不会将其隐藏。
+`software.reason` 由 agent 在启动时上报系统识别、已安装版本查询/解析、升级目录或记录问题。`software.supported=false` 时，`upgrade.reason` 保留该原因；旧 agent 未提供原因时返回手动更新提示。诊断不包含命令原始输出，修复后需重启 agent 重新检测。服务器列表和详情页展示当前原因，历史升级状态不会将其隐藏。
+
+升级判断只比较 `software.package` 与目标包版本（包含数字修订号），目标更高才提供升级；`software.version` 不参与比较，相同包版本即使运行版本较旧也不触发重装或重启。不再校验运行路径、MainPID 或现有包状态、架构及发行版后缀；目标包仍按系统、格式和架构匹配并校验。版本查询失败或无法解析时不自动安装。安装前若发现本机版本已不低于目标，使用现有 `failed` 状态报告取消原因并释放占用，不增加新的协议字段或状态。
 
 发行版后缀仅用于原生包元数据和文件名，`software.package` 仍使用基础版本与数字修订号。旧版 Ubuntu agent 需要手动安装一次带 `.ubuntu24.04` 的新包并重启，之后恢复自动升级。
 
@@ -552,6 +556,30 @@ curl --fail-with-body "$CONTROLLER_URL/v1/agents/$AGENT_ID" \
 
 升级通过已有端口上的独立 Noise 认证连接完成。只升级更高版本或修订号，不自动降级。controller 与 agent 双方检查部署空闲；`installing` / `restarting` 期间创建部署返回 `409`。安装/启动失败不自动回滚，事务与记录持久化；controller 重启保留升级预留，超过 45 分钟未完成则标记失败并解除预留。新进程就绪的本地确认不依赖 controller 在线。重启 agent 会短暂中断其管理的 app，保留身份、配置和部署数据。
 
+## 全局变量
+
+全局变量保存在 controller 数据库中，供所有 agent 的 blueprint 绑定显式引用。登录管理员可查看全部变量值；写接口沿用同源 Origin 和 CSRF 校验。保存立即可用，无需重启，不自动触发部署。
+
+### GET /v1/variables
+
+返回按名称排序的变量及当前绑定引用位置：
+
+```json
+{"variables":[{"name":"PROD_DB_HOST","value":"db.internal","references":[{"agent_id":"agent-id","agent_name":"server","blueprint":"examples/blueprints/web","variable":"DB_HOST"}]}]}
+```
+
+### POST /v1/variables
+
+请求为 `{"name":"PROD_DB_HOST","value":"db.internal"}`。名称必须符合 `[A-Za-z_][A-Za-z0-9_]*`，`PIER_ARCH` 为保留名称；名称区分大小写且创建后不可修改。值必须为字符串，允许空字符串和多行文本，其中的模板表达式按普通文本保存。成功返回单个变量对象；非法名称返回 `400`，重名返回 `409`。
+
+### PUT /v1/variables/{name}
+
+请求为 `{"value":"new-db.internal"}`，只替换值，返回更新后的变量及引用位置。变量不存在返回 `404`。更新不影响已经创建的部署任务，包括尚在排队的任务；下次创建部署时才读取新值。
+
+### DELETE /v1/variables/{name}
+
+未被引用时删除并返回 `{"removed":true}`，不存在返回 `404`。仍被任一绑定引用时返回 `409`，可通过列表查询服务器、blueprint 路径和参数名，修改绑定解除引用后再删除。停止服务不解除变量引用。
+
 ## Blueprint 绑定
 
 一个 agent 可绑定多个不同蓝图，每份蓝图在该 agent 上只绑定一次。旧的单绑定 `/binding` 接口已替换为以下集合接口；旧配置需按新接口重新绑定。绑定身份 `blueprint_id` 为仓库相对路径的 SHA-256，而 Linux 用户和组使用蓝图的 `name`。绑定不自动部署，变量按绑定独立保存，不返回变量值。
@@ -566,7 +594,9 @@ curl --fail-with-body "$CONTROLLER_URL/v1/agents/$AGENT_ID" \
 
 `blueprint` 必填，必须存在于当前目录；`variables` 默认为 `{}`，未知变量和缺少必填变量返回 `400`。蓝图名称必须符合系统账户规则，且不得与同机其他蓝图重名；校验失败保留已有绑定。重复绑定同一路径返回 `409`。
 
-响应为 `{"agent_id":"...","id":"<blueprint_id>","blueprint":"examples/blueprints/web","variable_names":["API_PORT","DB_HOST","WORKER_PORT"]}`。`variable_names` 仅包含显式保存的变量名。
+变量值也可以是 `{"ref":"全局变量名"}`，例如 `{"blueprint":"examples/blueprints/web","variables":{"DB_HOST":{"ref":"PROD_DB_HOST"}}}`。字符串始终按直接值处理，不解析成全局引用；未指定的参数使用 blueprint 默认值，不按同名自动查找全局变量。引用不存在或名称无效时返回 `400`，指出相应参数。
+
+响应为 `{"agent_id":"...","id":"<blueprint_id>","blueprint":"examples/blueprints/web","variable_names":["DB_HOST"],"variable_refs":{"DB_HOST":"PROD_DB_HOST"}}`。`variable_names` 包含显式保存的直接值和引用参数名，`variable_refs` 仅包含引用关系，未引用时为 `{}`。绑定接口不返回直接值或解析后的全局变量值。
 
 ### GET /v1/agents/{id}/bindings
 
@@ -586,7 +616,7 @@ curl --fail-with-body "$CONTROLLER_URL/v1/agents/$AGENT_ID" \
 {"blueprint":"examples/blueprints/web","variables":{"API_PORT":"9090","WORKER_PORT":null}}
 ```
 
-`variables` 必填：省略的键保留原值，字符串覆盖原值（包括空字符串），`null` 移除显式值并恢复默认值。蓝图路径不匹配返回 `409`；未知变量、删除无默认值的必填变量或渲染失败返回 `400`，整个修改不生效。PUT/PATCH 均返回绑定概要。目标蓝图有活动任务时禁止编辑。
+`variables` 必填：省略的键保留原值，字符串覆盖为直接值（包括空字符串），`{"ref":"NAME"}` 覆盖为全局引用，`null` 移除直接值或引用并恢复默认值。蓝图路径不匹配返回 `409`；未知变量、无效引用、删除无默认值的必填变量或渲染失败返回 `400`，整个修改不生效。PUT/PATCH 均返回绑定概要。目标蓝图有活动任务时禁止编辑。
 
 ### DELETE /v1/agents/{id}/bindings/{blueprint_id}
 
@@ -633,7 +663,7 @@ curl --fail-with-body -X POST "$CONTROLLER_URL/v1/deployments" \
 
 `images` 按 blueprint 的 **app 实例 ID** 指定，不使用 app 目录路径或实例摘要。每个 `source: git` app 必须有镜像，`source: binary` app 禁止提供镜像，未知实例也会被拒绝。架构从在线 agent 的信息读取，无请求架构字段；调用方负责选择兼容目标系统的镜像，controller 不根据发行版替换镜像。
 
-每次部署捕获固定的定义 commit、绑定变量、镜像参数和当前生效的构建设置。每个 agent 同时只允许一个未完成任务；默认最多同时处理两个 agent 的构建任务，可通过 `/v1/settings` 的 `max_concurrent_builds` 调整并重启生效。`200` 表示任务已创建，实际结果须查询部署详情；全部包构建成功后才下发 agent，后台校验或构建失败不会修改服务器上的服务。
+每次部署捕获固定的定义 commit、解析后的绑定变量、镜像参数和当前生效的构建设置。全局引用在创建任务时读取最新值并完成 blueprint 映射，排队和构建期间不再读取变量库；缺失引用在创建任务前返回 `400`。每个 agent 同时只允许一个未完成任务；默认最多同时处理两个 agent 的构建任务，可通过 `/v1/settings` 的 `max_concurrent_builds` 调整并重启生效。`200` 表示任务已创建，实际结果须查询部署详情；全部包构建成功后才下发 agent，后台校验或构建失败不会修改服务器上的服务。
 
 | 状态码 | 条件 |
 | --- | --- |

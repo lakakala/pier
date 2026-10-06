@@ -21,6 +21,7 @@ pub(crate) async fn serve(
             | "/repository"
             | "/apps"
             | "/blueprints"
+            | "/variables"
             | "/agents"
             | "/deployments"
             | "/settings"

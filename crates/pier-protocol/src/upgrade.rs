@@ -205,18 +205,7 @@ impl Software {
             return Ok(false);
         }
         let current = self.package.as_ref().context("missing installed package")?;
-        let running = Version {
-            version: self.version.clone(),
-            revision: 1,
-        }
-        .key()?
-        .0;
-        if running > release.package.key()?.0 {
-            return Ok(false);
-        }
-        // Also activate a package that was installed manually without restarting.
-        Ok(release.package.newer_than(current)?
-            || (current == &release.package && running < release.package.key()?.0))
+        release.package.newer_than(current)
     }
 }
 
@@ -406,12 +395,12 @@ mod tests {
         };
         assert!(software.accepts(&release).unwrap());
         software.version = "2.0.0".into();
-        assert!(!software.accepts(&release).unwrap());
+        assert!(software.accepts(&release).unwrap());
         software.version = "1.2.3".into();
         software.package = Some(release.package.clone());
         assert!(!software.accepts(&release).unwrap());
         software.version = "1.2.2".into();
-        assert!(software.accepts(&release).unwrap());
+        assert!(!software.accepts(&release).unwrap());
         software.package = Some(version("2.0.0", 1));
         assert!(!software.accepts(&release).unwrap());
         release.system = "almalinux8".into();
