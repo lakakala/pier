@@ -3,6 +3,7 @@
 compile_error!("pier-agent currently requires Linux");
 
 mod account;
+mod forward;
 pub mod init;
 mod network;
 mod supervisor;
@@ -116,6 +117,7 @@ struct Completed {
 }
 
 pub struct Runtime {
+    forwarding: forward::Manager,
     transport: Arc<transport::Transport>,
     terminals: Arc<terminal::Manager>,
     _lock: fs::File,
@@ -207,6 +209,7 @@ impl Runtime {
         );
         store.put("identity", "agent_id", &config.agent_id)?;
         let state = Arc::new(Self {
+            forwarding: forward::Manager::default(),
             transport: transport::Transport::new(config.clone(), events.clone()),
             terminals: Arc::new(terminal::Manager::default()),
             _lock: lock,
@@ -284,6 +287,7 @@ impl Runtime {
         Ok(())
     }
     fn stop_blueprint(&self, id: &str) -> Result<()> {
+        self.forwarding.close(id);
         let supervisor = self.active.lock().unwrap().remove(id);
         if let Some(mut supervisor) = supervisor {
             supervisor.stop();
@@ -294,6 +298,7 @@ impl Runtime {
         Ok(())
     }
     fn stop_all(&self) {
+        self.forwarding.close_all();
         let active = std::mem::take(&mut *self.active.lock().unwrap());
         for supervisor in active.values() {
             supervisor.request_stop();
@@ -384,6 +389,7 @@ impl Runtime {
             capabilities: vec![
                 pier_protocol::terminal::CAPABILITY.into(),
                 pier_protocol::MULTI_BLUEPRINT_CAPABILITY.into(),
+                pier_protocol::forward::CAPABILITY.into(),
             ],
             deployment_id: if blueprints.len() == 1 {
                 blueprints[0].deployment_id.clone()
@@ -425,6 +431,7 @@ impl Runtime {
         let _busy = self.busy_blueprint.lock().unwrap();
         self.maintenance.store(true, Ordering::SeqCst);
         self.terminals.close_all("agent_upgrading");
+        self.forwarding.close_all();
         Ok(true)
     }
 

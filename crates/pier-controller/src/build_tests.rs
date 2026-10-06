@@ -48,6 +48,7 @@ service: {command: [bin/demo]}
             blueprints: BTreeMap::from([("blueprint".into(), blueprint)]),
         };
         let job = Job {
+            network: Default::default(),
             action: pier_protocol::DeploymentAction::Deploy,
             id: "job".into(),
             agent_id: "agent".into(),

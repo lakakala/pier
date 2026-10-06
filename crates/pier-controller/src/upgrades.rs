@@ -372,6 +372,7 @@ mod tests {
                 "agents",
                 "agent",
                 &AgentRecord {
+                    tags: Vec::new(),
                     proxy: None,
                     connection: Default::default(),
                     id: "agent".into(),
@@ -523,6 +524,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = fixture(dir.path());
         let mut job = Job {
+            network: Default::default(),
             action: pier_protocol::DeploymentAction::Deploy,
             id: "job".into(),
             agent_id: "agent".into(),

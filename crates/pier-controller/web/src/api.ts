@@ -6,7 +6,13 @@ export interface Session {
 export interface Variable {
   default: string | null;
 }
+export interface PortDefinition {
+  protocol: 'tcp' | 'udp';
+  port: number | string;
+}
+export type ExposureMap = Record<string, Record<string, { tag: string; port: number }>>;
 export interface AppDefinition {
+  ports?: Record<string, PortDefinition>;
   name: string;
   version: string;
   source: 'git' | 'binary';
@@ -24,6 +30,7 @@ export interface Catalog {
   blueprints: Record<string, Blueprint>;
 }
 export interface Agent {
+  tags?: string[];
   connection?: {
     mode: 'agent_to_controller' | 'controller_to_agent';
     proxy_configured: boolean;
@@ -116,6 +123,7 @@ export const upgradeLabel = (agent: Agent) => {
   return '已启用自动升级';
 };
 export interface Binding {
+  exposures?: ExposureMap;
   id: string;
   agent_id: string;
   blueprint: string;

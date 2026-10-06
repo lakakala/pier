@@ -513,6 +513,24 @@ async fn binding_patch_preserves_secrets_checks_defaults_and_detects_blueprint_c
     use std::collections::BTreeMap;
     let root = tempfile::tempdir().unwrap();
     let state = Controller::open(config(root.path())).unwrap();
+    state
+        .store
+        .put(
+            "agents",
+            "agent",
+            &crate::AgentRecord {
+                tags: vec![],
+                proxy: None,
+                connection: Default::default(),
+                id: "agent".into(),
+                name: "test".into(),
+                token_hash: pier_protocol::hash("token"),
+                info: None,
+                last_seen: None,
+                report: Default::default(),
+            },
+        )
+        .unwrap();
     let bp = crate::catalog::Blueprint {
         schema: 1,
         name: "web".into(),
@@ -544,6 +562,7 @@ async fn binding_patch_preserves_secrets_checks_defaults_and_detects_blueprint_c
             &BTreeMap::from([(
                 pier_protocol::hash("web"),
                 crate::Binding {
+                    exposures: Default::default(),
                     blueprint: "web".into(),
                     variables: BTreeMap::from([
                         ("SECRET".into(), "private-value".into()),

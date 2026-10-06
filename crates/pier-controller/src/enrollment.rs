@@ -178,6 +178,7 @@ impl Controller {
             },
         };
         let agent = AgentRecord {
+            tags: Vec::new(),
             proxy: record.proxy.clone(),
             connection: record.connection.clone(),
             id: agent_id.clone(),

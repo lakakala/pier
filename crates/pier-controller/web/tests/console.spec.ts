@@ -782,6 +782,62 @@ test.describe.serial('controller console', () => {
     expect(await page.evaluate(() => Object.keys(localStorage))).toEqual([]);
     expect(await page.evaluate(() => Object.keys(sessionStorage))).toEqual([]);
   });
+  test('agent labels and port exposure bindings persist and report listener failures', async ({
+    page,
+  }) => {
+    await login(page);
+    await page.goto('/agents');
+    await page.getByRole('link', { name: 'browser-agent', exact: true }).click();
+    const id = page.url().split('/').pop()!;
+    await page.getByRole('button', { name: '编辑标签', exact: true }).click();
+    await page.getByRole('combobox', { name: 'Agent 标签' }).fill('edge');
+    await page.getByRole('combobox', { name: 'Agent 标签' }).press('Enter');
+    await page.getByRole('combobox', { name: 'Agent 标签' }).press('Escape');
+    await page.getByRole('button', { name: '确定', exact: true }).click();
+    await expect(page.getByText('标签已保存，已部署应用的入口将自动调整')).toBeVisible();
+    expect((await (await page.request.get(`/v1/agents/${id}`)).json()).tags).toEqual(['edge']);
+    await page.getByRole('checkbox', { name: 'api / http', exact: false }).check();
+    await page.getByLabel('api/http 入口标签', { exact: true }).fill('edge');
+    await page.getByLabel('api/http 对外端口', { exact: true }).fill('18080');
+    const saving = page.waitForResponse(
+      (r) => r.request().method() === 'PATCH' && r.url().includes('/bindings/'),
+    );
+    await page.getByRole('button', { name: '保存绑定' }).click();
+    expect((await saving).status()).toBe(200);
+    await page.reload();
+    await expect(page.getByRole('checkbox', { name: 'api / http', exact: false })).toBeChecked();
+    await expect(page.getByLabel('api/http 对外端口', { exact: true })).toHaveValue('18080');
+    const bindings = await (await page.request.get(`/v1/agents/${id}/bindings`)).json();
+    expect(bindings.bindings[0].exposures).toEqual({ api: { http: { tag: 'edge', port: 18080 } } });
+    await page.route(`**/v1/agents/${id}/exposures`, (route) =>
+      route.fulfill({
+        json: {
+          exposures: [
+            {
+              id: 'route',
+              agent_id: id,
+              blueprint: 'blueprints/web',
+              deployment: 'deployed',
+              app: 'api',
+              name: 'http',
+              tag: 'edge',
+              protocol: 'tcp',
+              port: 18080,
+              target_port: 9090,
+              ingress_id: id,
+              ingress_name: 'browser-agent',
+              state: 'error',
+              reason: '监听 18080 TCP 失败：Address already in use',
+            },
+          ],
+        },
+      }),
+    );
+    await page.reload();
+    await expect(
+      page.getByText('监听 18080 TCP 失败：Address already in use', { exact: true }),
+    ).toBeVisible();
+  });
   test('agent fragment survives login, pairing copy, invalid link and password revocation', async ({
     page,
     context,

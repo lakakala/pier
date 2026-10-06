@@ -63,16 +63,20 @@ pub async fn connect(
             let Message::Welcome { version: pier_protocol::VERSION, upgrade } = welcome else { anyhow::bail!("invalid welcome or protocol version"); };
             upgrades.offer(upgrade);
             pier_protocol::send(&mut stream, &Message::Report { report: runtime.report()? }).await?;
+            let (sender, mut messages, mux, incoming) = pier_protocol::forward::session(stream, terminals.clone(), true);
+            let (port_tx, port_rx) = mpsc::channel(8);
+            crate::forward::serve(runtime.clone(), mux, incoming, port_rx, sender.clone(), terminals.clone());
             tracing::info!("connected to controller");
             delay = 1;
             let mut interval = tokio::time::interval(Duration::from_secs(config.heartbeat_seconds));
             let mut received = Instant::now();
             loop {
                 tokio::select! {
-                    message = pier_protocol::receive(&mut stream) => {
+                    message = messages.recv() => {
                         received = Instant::now();
-                        match message? {
-                            Message::Ping => timeout(Duration::from_secs(10), pier_protocol::send(&mut stream, &Message::Pong)).await??,
+                        match message.context("control disconnected")? {
+                            Message::Ping => sender.try_send(Message::Pong)?,
+                            Message::PortConfig { listeners } => port_tx.try_send(listeners)?,
                             Message::Pong => (),
                             Message::Deploy { plan } => {
                                 // Bounded queue avoids blocking heartbeat processing on builds.
@@ -93,15 +97,16 @@ pub async fn connect(
                     event = events.recv() => {
                         let event = event.context("event channel closed")?;
                         if matches!(&event, Message::OpenChannel { session, .. } if !runtime.transport.current(session)) { continue; }
-                        timeout(Duration::from_secs(30), pier_protocol::send(&mut stream, &event)).await??;
-                        if matches!(event, Message::Result { .. }) {
-                            timeout(Duration::from_secs(10), pier_protocol::send(&mut stream, &Message::Report { report: runtime.report()? })).await??;
+                        let is_result = matches!(event, Message::Result { .. });
+                        sender.try_send(event)?;
+                        if is_result {
+                            sender.try_send(Message::Report { report: runtime.report()? })?;
                         }
                     }
                     _ = interval.tick() => {
                         upgrades.poll();
                         ensure!(received.elapsed() < Duration::from_secs(45), "controller heartbeat timeout");
-                        timeout(Duration::from_secs(10), pier_protocol::send(&mut stream, &Message::Report { report: runtime.report()? })).await??;
+                        sender.try_send(Message::Report { report: runtime.report()? })?;
                     }
                 }
             }

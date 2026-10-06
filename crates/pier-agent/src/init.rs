@@ -662,6 +662,7 @@ mod tests {
     #[test]
     fn passive_configuration_is_private_and_legacy_configuration_keeps_its_mode() {
         let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let config = dir.path().join("agent.yml");
         let token = dir.path().join("agent.token");
         let credentials = Credentials {

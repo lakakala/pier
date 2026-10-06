@@ -25,6 +25,8 @@ pub struct ElfRecord {
 
 #[derive(Serialize)]
 pub(crate) struct Manifest<'a> {
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub ports: crate::Ports,
     pub schema: u32,
     pub name: &'a str,
     pub version: &'a str,

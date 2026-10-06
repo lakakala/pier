@@ -307,6 +307,7 @@ mod tests {
     #[test]
     fn explicit_mapping_defaults_and_shared_variables() {
         let metadata = AppMetadata {
+            ports: Default::default(),
             name: "demo".into(),
             version: "1".into(),
             source: SourceKind::Binary,

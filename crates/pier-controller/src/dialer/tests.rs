@@ -236,6 +236,7 @@ async fn passive_enrollment_and_address_edits() {
         assert!(!text.contains(value) && !text.contains("private-password"));
     }
     let job = crate::Job {
+        network: Default::default(),
         action: pier_protocol::DeploymentAction::Deploy,
         id: "busy".into(),
         agent_id: credentials.agent_id.clone(),
@@ -352,6 +353,7 @@ async fn controller_initiates_noise_control_and_cleans_up_on_disconnect() {
     initialize(&crate::api::router(state.clone())).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let record = AgentRecord {
+        tags: Vec::new(),
         proxy: None,
         id: "agent".into(),
         name: "passive".into(),

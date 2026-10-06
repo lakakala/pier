@@ -43,6 +43,8 @@ where
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Recipe {
+    #[serde(default, deserialize_with = "unique_map")]
+    pub ports: crate::PortDefinitions,
     pub schema: u32,
     pub name: String,
     pub version: String,

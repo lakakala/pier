@@ -10,6 +10,7 @@ async fn bindings_are_independent_and_only_stopped_online_blueprints_can_be_unbo
     let (cookie, session) = initialize(&router).await;
     let csrf = session["csrf_token"].as_str().unwrap();
     let mut agent = AgentRecord {
+        tags: Vec::new(),
         proxy: None,
         connection: Default::default(),
         id: "agent".into(),
@@ -115,6 +116,7 @@ async fn bindings_are_independent_and_only_stopped_online_blueprints_can_be_unbo
     state.sessions.lock().unwrap().insert(
         "agent".into(),
         crate::Session {
+            forward: None,
             id: "session".into(),
             sender,
             terminal: true,
@@ -155,6 +157,7 @@ async fn bindings_are_independent_and_only_stopped_online_blueprints_can_be_unbo
             "jobs",
             "busy",
             &Job {
+                network: Default::default(),
                 action: DeploymentAction::Stop,
                 id: "busy".into(),
                 agent_id: "agent".into(),
@@ -214,6 +217,7 @@ async fn new_plans_are_never_dispatched_to_old_agents() {
     state.sessions.lock().unwrap().insert(
         "agent".into(),
         crate::Session {
+            forward: None,
             id: "session".into(),
             sender,
             terminal: true,
@@ -227,6 +231,7 @@ async fn new_plans_are_never_dispatched_to_old_agents() {
             "jobs",
             "job",
             &Job {
+                network: Default::default(),
                 action: DeploymentAction::Deploy,
                 id: "job".into(),
                 agent_id: "agent".into(),

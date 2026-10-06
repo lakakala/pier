@@ -10,7 +10,6 @@ use std::{sync::Arc, time::Duration};
 use tokio::io::AsyncReadExt;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::mpsc,
     time::{Instant, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -67,6 +66,7 @@ fn report(state: &Controller, agent_id: &str, report: AgentReport) -> Result<()>
         .store
         .get("agents", agent_id)?
         .context("unknown agent")?;
+    crate::exposures::report(state, agent_id, &report)?;
     record.report = report;
     record.last_seen = Some(pier_protocol::now());
     state.store.put("agents", agent_id, &record)
@@ -232,14 +232,21 @@ pub(crate) async fn control(
         .capabilities
         .iter()
         .any(|v| v == pier_protocol::MULTI_BLUEPRINT_CAPABILITY);
+    let forwarding = initial
+        .capabilities
+        .iter()
+        .any(|v| v == pier_protocol::forward::CAPABILITY);
     report(&state, &agent_id, initial)?;
-    let (sender, mut receiver) = mpsc::channel(8);
+    let (sender, mut messages, mux, incoming) =
+        pier_protocol::forward::session(stream, cancelled.clone(), forwarding);
+    let wire_sender = sender.clone();
     {
         let mut sessions = state.sessions.lock().unwrap();
         ensure!(!sessions.contains_key(&agent_id), "agent already connected");
         sessions.insert(
             agent_id.clone(),
             Session {
+                forward: forwarding.then_some(mux),
                 id: session_id.clone(),
                 sender,
                 terminal,
@@ -252,6 +259,7 @@ pub(crate) async fn control(
     impl Drop for Guard {
         fn drop(&mut self) {
             self.0.terminals.disconnect_agent(&self.1, &self.2);
+            crate::exposures::disconnect(&self.0, &self.1);
             let mut sessions = self.0.sessions.lock().unwrap();
             if sessions.get(&self.1).is_some_and(|s| s.id == self.2) {
                 sessions.remove(&self.1);
@@ -259,6 +267,8 @@ pub(crate) async fn control(
         }
     }
     let _guard = Guard(state.clone(), agent_id.clone(), session_id.clone());
+    crate::exposures::start(&state);
+    crate::exposures::serve(state.clone(), agent_id.clone(), incoming, cancelled.clone());
     if reverse {
         state.complete_passive_enrollment(&agent_id)?;
     }
@@ -272,10 +282,11 @@ pub(crate) async fn control(
         let mut last_received = Instant::now();
         loop {
             tokio::select! {
-                message = pier_protocol::receive(&mut stream) => {
+                message = messages.recv() => {
                     last_received = Instant::now();
-                    match message? {
-                        Message::Ping => pier_protocol::send(&mut stream, &Message::Pong).await?,
+                    match message.context("control disconnected")? {
+                        Message::Ping => wire_sender.try_send(Message::Pong)?,
+                        Message::PortStatus { statuses } if forwarding => crate::exposures::status(&state, &agent_id, statuses)?,
                         Message::Pong => (),
                         Message::OpenChannel { session, id, purpose } => {
                             ensure!(reverse && session == session_id && pier_protocol::safe_id(&id), "invalid channel request");
@@ -304,13 +315,9 @@ pub(crate) async fn control(
                         _ => anyhow::bail!("unexpected agent message"),
                     }
                 }
-                message = receiver.recv() => {
-                    let message = message.context("session closed")?;
-                    timeout(Duration::from_secs(30), pier_protocol::send(&mut stream, &message)).await??;
-                }
                 _ = interval.tick() => {
                     ensure!(last_received.elapsed() < Duration::from_secs(45), "heartbeat timeout");
-                    timeout(Duration::from_secs(10), pier_protocol::send(&mut stream, &Message::Ping)).await??;
+                    wire_sender.try_send(Message::Ping)?;
                 }
             }
         }

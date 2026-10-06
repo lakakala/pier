@@ -920,3 +920,16 @@ curl --fail "$CONTROLLER_URL/v1/artifacts/$DEPLOYMENT_ID/api" \
 agent 的 `report.blueprints` 数组包含 `id`（蓝图路径摘要）、`blueprint`（路径）、`name`（账户名）、`deployment_id`（该蓝图最后成功任务）、`state`、`account_reserved`（是否保留专属账户）、`apps` 和 `result`（该蓝图最近任务结果）。`state` 为 `starting`、`running`、`backoff`、`failed` 或 `stopped`。停止或解除绑定不删除 agent 保存的账户和蓝图记录。
 
 `apps` 中的应用状态字段保持不变，同一蓝图应用共享账户和数据，故障时一起重启。为兼容查询，顶层 `report.apps` 仍为所有蓝图应用的展开列表，`report.result` 为整台 agent 最近任务结果；顶层 `deployment_id` 仅在恰有一个蓝图时有值，多蓝图客户端应使用分组字段。终端接口仍按应用实例 ID 打开，但终端账户和主目录属于整个蓝图。部署一个蓝图不关闭其他蓝图的终端。
+
+## Agent 标签与端口暴露
+
+以下接口沿用管理员 Cookie、Origin 和 CSRF 校验。Agent 列表及详情新增 `tags: string[]`。
+
+- `PUT /v1/agents/{id}/tags`：`{"tags":["edge"]}` 整体替换标签，去除首尾空白及重复值。每个 agent 最多 64 个标签，每个标签不超过 80 字节且非空、无控制字符。标签修改立即调整已部署入口；若引入端口冲突返回 409，原标签保留。
+- App 元数据新增 `ports` 命名映射，包含 `protocol` 与数字或模板字符串 `port`。
+- 绑定 POST/PUT/PATCH 和查询增加 `exposures`，例如 `{"api":{"http":{"tag":"edge","port":18080}}}`，第一层是蓝图内 App ID，第二层是 App 声明的端口名。PATCH 省略该字段保留配置，提供时整体替换，`{}` 清空；POST/PUT 省略时为空。绑定保存不会改变已部署入口。
+- `GET /v1/agents/{id}/exposures`：返回 `{"exposures":[...]}`，涵盖该 agent 作为应用服务器或入口的当前部署。每项含 `id`、`agent_id`（应用服务器）、`blueprint`、`deployment`、`app`、`name`、`tag`、`protocol`、`port`（对外端口）、`target_port`、可空的 `ingress_id/ingress_name`、`state`（`pending/ready/error`）、可空的 `reason`。没有匹配标签时保留一项等待状态，入口身份为空。监听状态不代表应用协议的健康检查。
+
+端口配置在创建部署时与变量一起固定；成功部署后生效，回滚恢复旧快照。停止不依赖当前目录。相同入口的同协议、同端口冲突及本机已声明的后端端口冲突返回 409；系统中未声明的进程占用端口则在运行状态中报告并重试。
+
+协议 v2 新增能力 `port_forward_v1`，能力协商后通过现有控制连接发送 `port_config`、`port_status` 和 `forward` 消息。`forward` 以会话内逻辑流 ID 区分连接，帧种类为 `open/ready/data/credit/fin/reset`；TCP 分块上限 32 KiB、逐流窗口 64 KiB。UDP 在逻辑流中使用两字节长度和完整报文，最多 65507 字节。数据为 Base64；控制消息优先，转发队列有界。流 ID 和路由授权不跨控制会话重用，后端 agent 校验部署、实例、命名端口及当前进程。

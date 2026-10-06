@@ -20,6 +20,8 @@ version: "1.0.0"
 variables:
   SECRET: {}
   PORT: {default: "8080"}
+ports:
+  http: {protocol: tcp, port: "{{ PORT }}"}
 source: {type: git, repo: "https://example.invalid/demo.git", ref: main}
 build: {language: rust, commands: ["true"]}
 files: [{from: demo, to: bin/demo, executable: true}]

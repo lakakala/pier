@@ -6,6 +6,7 @@ mod config;
 mod files;
 mod inspect;
 mod pipeline;
+mod ports;
 mod process;
 mod proxy;
 mod templates;
@@ -15,4 +16,7 @@ pub use archive::{ElfRecord, FileRecord};
 pub use config::Service;
 pub use inspect::{AppMetadata, PackageManifest, SourceKind, VariableDefinition, inspect, unpack};
 pub use pipeline::{pack, validate};
+pub use ports::{
+    Port, PortDefinition, PortDefinitions, PortProtocol, PortValue, Ports, resolve_ports,
+};
 pub use types::*;

@@ -17,6 +17,7 @@ async fn setup() -> (tempfile::TempDir, Arc<Controller>, Router, String, String)
             "agents",
             "agent",
             &AgentRecord {
+                tags: Vec::new(),
                 proxy: None,
                 connection: Default::default(),
                 id: "agent".into(),
@@ -39,6 +40,7 @@ async fn setup() -> (tempfile::TempDir, Arc<Controller>, Router, String, String)
     state.sessions.lock().unwrap().insert(
         "agent".into(),
         Session {
+            forward: None,
             cancelled: tokio_util::sync::CancellationToken::new(),
             id: "control".into(),
             sender,
@@ -267,6 +269,7 @@ async fn deployment_blocks_only_its_own_blueprints_terminals() {
     }];
     state.store.put("agents", "agent", &agent).unwrap();
     let mut job = Job {
+        network: Default::default(),
         action: pier_protocol::DeploymentAction::Deploy,
         id: "job".into(),
         agent_id: "agent".into(),

@@ -182,6 +182,7 @@ fn package(prepared: Prepared, options: &PackOptions) -> Result<PackageArtifact>
     }
     archive::check_service(&staging, &prepared.recipe.service)?;
     let manifest = archive::Manifest {
+        ports: crate::resolve_ports(&prepared.recipe.ports, &BTreeMap::new())?,
         schema: 2,
         name: &prepared.recipe.name,
         version: &prepared.recipe.version,

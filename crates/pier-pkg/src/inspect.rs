@@ -26,6 +26,8 @@ pub enum SourceKind {
 /// Names and versions may still contain template expressions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppMetadata {
+    #[serde(default)]
+    pub ports: crate::PortDefinitions,
     pub name: String,
     pub version: String,
     pub variables: BTreeMap<String, VariableDefinition>,
@@ -35,6 +37,7 @@ pub struct AppMetadata {
 /// Read declarations without rendering templates, contacting a source, or writing files.
 pub fn inspect(service_dir: impl AsRef<Path>) -> Result<AppMetadata> {
     let recipe = config::read(service_dir.as_ref())?;
+    crate::ports::check_declarations(&recipe.ports)?;
     for name in recipe.variables.keys() {
         if !config::valid_env(name) || name == "PIER_ARCH" {
             return Err(Error::new(
@@ -64,6 +67,7 @@ pub fn inspect(service_dir: impl AsRef<Path>) -> Result<AppMetadata> {
         }
     };
     Ok(AppMetadata {
+        ports: recipe.ports,
         name: recipe.name,
         version: recipe.version,
         source,
@@ -78,6 +82,12 @@ pub fn inspect(service_dir: impl AsRef<Path>) -> Result<AppMetadata> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageManifest {
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "config::unique_map"
+    )]
+    pub ports: crate::Ports,
     pub schema: u32,
     pub name: String,
     pub version: String,
@@ -163,6 +173,18 @@ pub fn unpack(
     }
     let manifest: PackageManifest =
         serde_yaml_ng::from_slice(&bytes).map_err(|_| bad("invalid manifest"))?;
+    if manifest.ports.len() > 128
+        || manifest.ports.iter().any(|(name, port)| {
+            name.is_empty()
+                || name.len() > 80
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                || port.port == 0
+        })
+    {
+        return Err(bad("invalid manifest ports"));
+    }
     if manifest.schema != 2 || manifest.os != "linux" || manifest.architecture != architecture {
         return Err(bad("unsupported manifest platform or schema"));
     }

@@ -90,6 +90,8 @@ pub fn router(state: Arc<Controller>) -> Router {
         .route("/v1/agents", post(register).get(agents))
         .route("/v1/agents/{id}", get(agent))
         .route("/v1/agents/{id}/connection", put(update_connection))
+        .route("/v1/agents/{id}/tags", put(crate::exposures::update_tags))
+        .route("/v1/agents/{id}/exposures", get(crate::exposures::list))
         .route(
             "/v1/agents/{id}/apps/{instance}/terminals",
             post(crate::terminal::create),
@@ -120,6 +122,8 @@ pub fn router(state: Arc<Controller>) -> Router {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BindingPatch {
+    #[serde(default)]
+    exposures: Option<crate::ExposureMap>,
     blueprint: String,
     #[serde(deserialize_with = "pier_protocol::unique_map")]
     variables: BTreeMap<String, Option<crate::BindingValue>>,
@@ -144,6 +148,9 @@ async fn patch_binding(
         .blueprints
         .get(&binding.blueprint)
         .ok_or_else(missing)?;
+    if let Some(exposures) = patch.exposures {
+        binding.exposures = exposures;
+    }
     for (key, value) in patch.variables {
         if !blueprint.variables.contains_key(&key) {
             return Err(bad("unknown blueprint variable"));
@@ -157,6 +164,7 @@ async fn patch_binding(
     state
         .resolve_binding(binding, blueprint)
         .map_err(|e| bad(&e.to_string()))?;
+    validate_exposures(&state, &id, binding, blueprint, catalog)?;
     let value = public_binding(&id, binding);
     state.store.put("blueprint_bindings", &id, &bindings)?;
     Ok(Json(value))
@@ -297,6 +305,7 @@ async fn register(
         "agents",
         &id,
         &AgentRecord {
+            tags: Vec::new(),
             proxy: None,
             connection: Default::default(),
             id: id.clone(),
@@ -310,7 +319,7 @@ async fn register(
     Ok(Json(json!({"id":id,"token":token})))
 }
 fn public_agent(state: &Controller, agent: AgentRecord) -> Value {
-    let mut value = json!({"id":agent.id,"name":agent.name,"info":agent.info,"last_seen":agent.last_seen,"report":agent.report,"online":state.sessions.lock().unwrap().contains_key(&agent.id)});
+    let mut value = json!({"id":agent.id,"name":agent.name,"tags":agent.tags,"info":agent.info,"last_seen":agent.last_seen,"report":agent.report,"online":state.sessions.lock().unwrap().contains_key(&agent.id)});
     value["connection"] = state.dialer.view(
         &agent.id,
         &agent.connection,
@@ -391,7 +400,26 @@ fn public_binding(agent: &str, binding: &Binding) -> Value {
         .iter()
         .filter_map(|(name, value)| value.reference().map(|reference| (name, reference)))
         .collect();
-    json!({"agent_id":agent,"id":pier_protocol::hash(&binding.blueprint),"blueprint":binding.blueprint,"variable_names":binding.variables.keys().collect::<Vec<_>>(),"variable_refs":refs})
+    json!({"agent_id":agent,"id":pier_protocol::hash(&binding.blueprint),"blueprint":binding.blueprint,"exposures":binding.exposures,"variable_names":binding.variables.keys().collect::<Vec<_>>(),"variable_refs":refs})
+}
+fn validate_exposures(
+    state: &Controller,
+    id: &str,
+    binding: &Binding,
+    blueprint: &crate::catalog::Blueprint,
+    catalog: &crate::catalog::Catalog,
+) -> Result<(), ApiError> {
+    let record: AgentRecord = state.store.get("agents", id)?.ok_or_else(missing)?;
+    let architecture = record
+        .info
+        .map_or(pier_pkg::Architecture::Amd64, |info| info.architecture);
+    let resolved = state
+        .resolve_binding(binding, blueprint)
+        .map_err(|e| bad(&e.to_string()))?;
+    let network = crate::exposures::resolve(binding, blueprint, &resolved, catalog, architecture)
+        .map_err(|e| bad(&e.to_string()))?;
+    crate::exposures::check_conflicts(state, Some((id, &binding.blueprint, &network)), None)
+        .map_err(|e| conflict(&e.to_string()))
 }
 fn binding_idle(state: &Controller, agent: &str, blueprint: &str) -> Result<(), ApiError> {
     if state
@@ -426,6 +454,7 @@ fn save_binding(state: &Controller, id: &str, binding: Binding, replace: bool) -
             .blueprints
             .get(&binding.blueprint)
             .ok_or_else(missing)?;
+        validate_exposures(state, id, &binding, blueprint, catalog)?;
         state
             .resolve_binding(&binding, blueprint)
             .map_err(|e| bad(&e.to_string()))?;
@@ -589,6 +618,7 @@ async fn deploy(
                 .ok_or_else(|| conflict("blueprint has not been deployed"))?;
             let id = pier_protocol::new_id();
             let job = Job {
+                network: Default::default(),
                 action: request.action,
                 id: id.clone(),
                 agent_id: request.agent_id.clone(),
@@ -635,6 +665,27 @@ async fn deploy(
         let resolved = state
             .resolve_binding(&binding, blueprint)
             .map_err(|e| bad(&e.to_string()))?;
+        let network =
+            crate::exposures::resolve(&binding, blueprint, &resolved, &catalog, info.architecture)
+                .map_err(|e| bad(&e.to_string()))?;
+        if network.ports.values().any(|ports| !ports.is_empty())
+            && state
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&request.agent_id)
+                .is_none_or(|s| s.forward.is_none())
+        {
+            return Err(conflict(
+                "app port declarations require agent capability port_forward_v1",
+            ));
+        }
+        crate::exposures::check_conflicts(
+            &state,
+            Some((&request.agent_id, &binding.blueprint, &network)),
+            None,
+        )
+        .map_err(|e| conflict(&e.to_string()))?;
         if request
             .images
             .keys()
@@ -653,6 +704,7 @@ async fn deploy(
         }
         id = pier_protocol::new_id();
         let job = Job {
+            network,
             action: request.action,
             id: id.clone(),
             agent_id: request.agent_id,
@@ -778,6 +830,7 @@ mod tests {
         };
         let state = Controller::open(config).unwrap();
         let owner = AgentRecord {
+            tags: Vec::new(),
             proxy: None,
             connection: Default::default(),
             id: "owner".into(),
@@ -796,6 +849,7 @@ mod tests {
                 "jobs",
                 "job",
                 &Job {
+                    network: Default::default(),
                     action: pier_protocol::DeploymentAction::Deploy,
                     id: "job".into(),
                     agent_id: "owner".into(),

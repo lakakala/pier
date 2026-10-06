@@ -137,6 +137,8 @@ files:
 
 服务 `command[0]` 必须指向包内可执行文件，路径相对包根目录；`working_dir` 同样相对包根目录，默认 `.`。这些是供调用方启动服务时使用的元数据，库不会安装或启动服务。
 
+App 可用顶层 `ports` 声明命名 TCP/UDP 端口，例如 `ports: {http: {protocol: tcp, port: "{{ PORT }}"}}`。在 Controller Web 中为 agent 标记标签，并在蓝图绑定中选择入口标签和对外端口。转发直接复用现有 agent–Controller 加密连接；使用方式和生效规则见 [按标签暴露端口](docs/services.md#按-agent-标签暴露应用端口)。
+
 ## 变量和配置模板
 
 变量同时用于 **YML 的字符串字段**和 `configs/` 的文本内容，使用 `{{ NAME }}`。例如 `version: "{{ VERSION }}"`、`source.ref: "v{{ VERSION }}"`、下载 URL、构建命令、文件映射路径、服务参数和环境值均支持替换。YML 先解析再渲染各字段，因此包含引号、冒号和换行的变量仍然是一个字符串。映射键、布尔值、枚举选择字段（如 `source.type`、`build.language`、`format`）保持字面值。

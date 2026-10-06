@@ -7,6 +7,7 @@ pub mod catalog;
 mod connection;
 mod dialer;
 mod enrollment;
+mod exposures;
 mod proxy;
 mod runtime;
 mod settings;
@@ -14,6 +15,7 @@ mod terminal;
 mod upgrades;
 mod variables;
 mod web;
+pub use exposures::{Exposure, ExposureMap};
 pub use runtime::RuntimeSettings;
 pub use variables::BindingValue;
 
@@ -100,6 +102,8 @@ pub struct Config {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) proxy: Option<proxy::Proxy>,
     #[serde(default)]
@@ -115,6 +119,8 @@ pub struct AgentRecord {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
+    #[serde(default, deserialize_with = "pier_protocol::unique_map")]
+    pub exposures: ExposureMap,
     pub blueprint: String,
     #[serde(default, deserialize_with = "pier_protocol::unique_map")]
     pub variables: BTreeMap<String, BindingValue>,
@@ -126,6 +132,8 @@ struct ResolvedBinding {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
+    #[serde(default)]
+    pub network: exposures::Deployment,
     #[serde(default)]
     pub action: pier_protocol::DeploymentAction,
     pub id: String,
@@ -147,6 +155,7 @@ impl Job {
     }
 }
 struct Session {
+    forward: Option<pier_protocol::forward::Mux>,
     id: String,
     sender: mpsc::Sender<Message>,
     terminal: bool,
@@ -154,6 +163,7 @@ struct Session {
     cancelled: tokio_util::sync::CancellationToken,
 }
 pub struct Controller {
+    forwarding: exposures::Registry,
     dialer: dialer::Registry,
     terminals: terminal::Registry,
     _lock: fs::File,
@@ -199,6 +209,7 @@ impl Controller {
             }
         }
         Ok(Arc::new(Self {
+            forwarding: exposures::Registry::default(),
             dialer: dialer::Registry::default(),
             terminals: terminal::Registry::default(),
             _lock: lock,

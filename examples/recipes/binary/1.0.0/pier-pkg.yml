@@ -7,6 +7,10 @@ variables:
   PORT: {default: "8080"}
 proxy:
   enabled: false
+ports:
+  http:
+    protocol: tcp
+    port: "{{ PORT }}"
 source:
   type: binary
   url: https://example.com/releases/demo-binary/{{ VERSION }}/linux-{{ PIER_ARCH }}.tar.gz

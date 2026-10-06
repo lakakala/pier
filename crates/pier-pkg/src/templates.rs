@@ -37,6 +37,10 @@ pub(crate) fn render_recipe(
         *value = text.into();
         Ok(())
     };
+    let ports = crate::resolve_ports(&recipe.ports, variables)?;
+    for (name, value) in ports {
+        recipe.ports.get_mut(&name).unwrap().port = crate::PortValue::Number(value.port);
+    }
     render(&mut recipe.name)?;
     render(&mut recipe.version)?;
     match &mut recipe.source {

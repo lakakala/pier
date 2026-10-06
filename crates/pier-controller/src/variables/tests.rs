@@ -48,7 +48,24 @@ impl Fixture {
         *state.catalog.write().unwrap() = Some(Catalog {
             root: root.path().into(),
             commit: "commit".into(),
-            apps: BTreeMap::new(),
+            apps: BTreeMap::from([(
+                "recipe".into(),
+                pier_pkg::AppMetadata {
+                    name: "recipe".into(),
+                    version: "1".into(),
+                    source: pier_pkg::SourceKind::Binary,
+                    ports: Default::default(),
+                    variables: BTreeMap::from([
+                        ("VALUE".into(), VariableDefinition { default: None }),
+                        (
+                            "PORT".into(),
+                            VariableDefinition {
+                                default: Some("8080".into()),
+                            },
+                        ),
+                    ]),
+                },
+            )]),
             blueprints: BTreeMap::from([("web".into(), blueprint), ("worker".into(), other)]),
         });
         for id in ["a", "b"] {
@@ -58,6 +75,7 @@ impl Fixture {
                     "agents",
                     id,
                     &AgentRecord {
+                        tags: Vec::new(),
                         id: id.into(),
                         name: format!("server-{id}"),
                         token_hash: pier_protocol::hash(id),
@@ -437,6 +455,7 @@ async fn queued_deployment_builds_with_captured_values_and_next_deployment_uses_
     fixture.state.sessions.lock().unwrap().insert(
         "a".into(),
         crate::Session {
+            forward: None,
             id: "test".into(),
             sender,
             terminal: false,

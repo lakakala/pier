@@ -185,7 +185,7 @@ fn inspect_declarations_and_verified_unpack_are_usable_by_services() {
     update(
         root.path(),
         "source:",
-        "variables:\n  REQUIRED: {}\n  OPTIONAL: {default: 'value'}\nsource:",
+        "variables:\n  REQUIRED: {}\n  OPTIONAL: {default: 'value'}\n  PORT: {default: '8080'}\nports:\n  http: {port: '{{ PORT }}'}\n  dns: {protocol: udp, port: 53}\nsource:",
     );
     let metadata = pier_pkg::inspect(root.path()).unwrap();
     assert_eq!(metadata.source, pier_pkg::SourceKind::Binary);
@@ -202,6 +202,8 @@ fn inspect_declarations_and_verified_unpack_are_usable_by_services() {
     let manifest =
         pier_pkg::unpack(&artifact.path, &dest, &artifact.sha256, Architecture::Amd64).unwrap();
     assert_eq!(manifest.service.command, ["bin/demo"]);
+    assert_eq!(manifest.ports["http"].port, 8080);
+    assert_eq!(manifest.ports["dns"].protocol, pier_pkg::PortProtocol::Udp);
     assert!(dest.join("bin/demo").is_file());
     assert!(
         pier_pkg::unpack(&artifact.path, &dest, &artifact.sha256, Architecture::Amd64).is_err()

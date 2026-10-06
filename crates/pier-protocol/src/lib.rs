@@ -1,5 +1,6 @@
 pub mod connection;
 pub mod enrollment;
+pub mod forward;
 pub mod secure;
 pub mod store;
 pub mod terminal;
@@ -107,6 +108,15 @@ pub struct DeploymentResult {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
+    Forward {
+        frame: forward::Frame,
+    },
+    PortConfig {
+        listeners: Vec<forward::Listener>,
+    },
+    PortStatus {
+        statuses: Vec<forward::ListenerStatus>,
+    },
     Session {
         id: String,
     },

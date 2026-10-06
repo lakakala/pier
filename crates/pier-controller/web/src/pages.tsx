@@ -45,6 +45,7 @@ import {
 } from './api';
 import { ErrorBox, Heading, Loading, StateTag, useLoad, Variables } from './components';
 import type { RuntimeView } from './runtime-settings';
+import { AppPorts, AgentTags, BindingPorts, Exposures, initialPorts } from './ports';
 import { AppTerminal } from './terminal';
 
 type RepositoryInfo = {
@@ -315,6 +316,7 @@ export function Definitions({ kind }: { kind: 'apps' | 'blueprints' }) {
             <Typography.Paragraph code>{selected}</Typography.Paragraph>
             <Typography.Title level={4}>变量声明</Typography.Title>
             <Variables variables={definition.variables} />
+            {kind === 'apps' && <AppPorts ports={catalog.data?.apps[selected!]?.ports} />}
             {kind === 'blueprints' &&
               (definition as Blueprint).apps.map((app) => (
                 <Card key={app.id} title={app.id} className="block-gap">
@@ -323,6 +325,7 @@ export function Definitions({ kind }: { kind: 'apps' | 'blueprints' }) {
                   <pre>{JSON.stringify(app.variables, null, 2)}</pre>
                   <Typography.Text type="secondary">应用全部变量</Typography.Text>
                   <Variables variables={catalog.data?.apps[app.app]?.variables ?? {}} />
+                  <AppPorts ports={catalog.data?.apps[app.app]?.ports} />
                 </Card>
               ))}
           </>
@@ -371,6 +374,10 @@ export function Agents() {
               render: (v: boolean) => (
                 <Tag color={v ? 'success' : 'default'}>{v ? '在线' : '离线'}</Tag>
               ),
+            },
+            {
+              title: '标签',
+              render: (_, a) => (a.tags ?? []).map((tag: string) => <Tag key={tag}>{tag}</Tag>),
             },
             { title: '连接方式', render: (_, a) => connectionLabel(a) },
             { title: '主机', render: (_, a) => a.info?.hostname ?? '—' },
@@ -457,6 +464,7 @@ function BindingForm({ agent }: { agent: Agent }) {
   const bindings = useLoad<{ bindings: Binding[] }>(`/v1/agents/${agent.id}/bindings`);
   const catalog = useLoad<Catalog>('/v1/blueprints');
   const globals = useLoad<{ variables: GlobalVariable[] }>('/v1/variables');
+  const agents = useLoad<{ agents: Agent[] }>('/v1/agents');
   const [selected, setSelected] = useState('');
   const [replace, setReplace] = useState(false);
   const binding = {
@@ -477,9 +485,21 @@ function BindingForm({ agent }: { agent: Agent }) {
   const blueprint = catalog.data?.blueprints[selected];
   const editing = selected === binding.data?.blueprint && !replace;
   const variables = Object.entries(blueprint?.variables ?? {});
+  const ports = useMemo(
+    () =>
+      (blueprint?.apps ?? []).flatMap((app) =>
+        Object.entries(catalog.data?.apps[app.app]?.ports ?? {}).map(([name, definition]) => ({
+          app: app.id,
+          name,
+          definition,
+        })),
+      ),
+    [blueprint, catalog.data],
+  );
   useEffect(() => {
     form.resetFields();
     form.setFieldsValue({
+      ports: initialPorts(ports, binding.data?.exposures),
       items: Object.keys(blueprint?.variables ?? {}).map((name) => ({
         ref: editing ? binding.data?.variable_refs?.[name] : undefined,
       })),
@@ -495,7 +515,7 @@ function BindingForm({ agent }: { agent: Agent }) {
               : 'set',
       ),
     );
-  }, [blueprint, editing, binding.data, form]);
+  }, [blueprint, editing, binding.data, form, ports]);
   const failedBinding = binding.error?.status !== 404 ? binding.error : undefined;
   return (
     <Card title="Blueprint 绑定" className="block-gap">
@@ -537,7 +557,7 @@ function BindingForm({ agent }: { agent: Agent }) {
                       setReplace(false);
                     }}
                   >
-                    编辑变量
+                    编辑绑定
                   </Button>
                   <Button
                     disabled={!available || !deployed || deployed.state === 'stopped' || pending}
@@ -615,6 +635,28 @@ function BindingForm({ agent }: { agent: Agent }) {
               {
                 blueprint: selected,
                 variables: updates,
+                exposures: Object.fromEntries(
+                  (blueprint.apps ?? [])
+                    .map((app) => [
+                      app.id,
+                      Object.fromEntries(
+                        ports.flatMap((port, index) =>
+                          port.app === app.id && values.ports?.[index]?.enabled
+                            ? [
+                                [
+                                  port.name,
+                                  {
+                                    tag: values.ports[index].tag.trim(),
+                                    port: values.ports[index].port,
+                                  },
+                                ],
+                              ]
+                            : [],
+                        ),
+                      ),
+                    ])
+                    .filter(([, entries]) => Object.keys(entries).length > 0),
+                ),
               },
             );
             void message.success('绑定已保存，创建部署后应用到服务器');
@@ -725,6 +767,12 @@ function BindingForm({ agent }: { agent: Agent }) {
         {blueprint && !variables.length && (
           <Typography.Paragraph type="secondary">此 blueprint 无需填写变量。</Typography.Paragraph>
         )}
+        <BindingPorts
+          ports={ports}
+          tags={[
+            ...new Set((agents.data?.agents ?? []).flatMap((agent) => agent.tags ?? [])),
+          ].sort()}
+        />
         <Button
           htmlType="submit"
           type="primary"
@@ -913,6 +961,7 @@ export function AgentDetail() {
             { key: 'os', label: '发行信息', children: <pre>{value.info?.os_release ?? '—'}</pre> },
           ]}
         />
+        <AgentTags agent={value} refresh={agent.refresh} />
         <AgentConnection key={value.connection?.endpoint} agent={value} refresh={agent.refresh} />
         {upgrading(value) && (
           <Alert
@@ -995,6 +1044,7 @@ export function AgentDetail() {
         )}
       </Card>
       <BindingForm key={value.id} agent={value} />
+      <Exposures id={value.id} />
       <Card title="部署记录" className="block-gap">
         <AgentJobs id={value.id} />
       </Card>
